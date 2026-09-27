@@ -20,5 +20,5 @@ New instruction or memory files must be included in path validation; new duplica
 
 ## Links
 
-- Tracker [#268](https://github.com/open-astro/AlpacaBridge/issues/268); blocking-getter history [#315](https://github.com/open-astro/AlpacaBridge/issues/315), [#381](https://github.com/open-astro/AlpacaBridge/issues/381), [#407](https://github.com/open-astro/AlpacaBridge/issues/407); TSan pairing [#341](https://github.com/open-astro/AlpacaBridge/issues/341), [#455](https://github.com/open-astro/AlpacaBridge/issues/455); path checks [#457](https://github.com/open-astro/AlpacaBridge/issues/457).
+- Tracker [#268](https://github.com/open-astro/AlpacaBridge/issues/268); blocking-getter history [#315](https://github.com/open-astro/AlpacaBridge/issues/315), [#381](https://github.com/open-astro/AlpacaBridge/issues/381), [#407](https://github.com/open-astro/AlpacaBridge/issues/407); TSan pairing [#341](https://github.com/open-astro/AlpacaBridge/issues/341), [#455](https://github.com/open-astro/AlpacaBridge/issues/455); path checks [#457](https://github.com/open-astro/AlpacaBridge/issues/457); README headline counts [#684](https://github.com/open-astro/AlpacaBridge/issues/684).
 - Gate and regression fixtures: `scripts/check_docs_drift.py` (`--self-test`), invoked by `scripts/ci_preflight.sh` and `.github/workflows/ci.yml`.

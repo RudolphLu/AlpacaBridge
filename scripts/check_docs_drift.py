@@ -101,6 +101,19 @@ Checks:
      in Release and flaky under load. A construction with no `static` in its
      statement, or an unnamed temporary, is a finding, and so is finding no
      construction at all (the extractor is stale or the regexes moved).
+ 15. The README headline ("N validated devices. <Word> brands. One server."
+     plus the brand list) agrees with SUPPORTED-DRIVERS.md (issue #684). N is
+     recomputed with the /bump-release Step 2.4 row filter (table rows that
+     are not a separator, a header or a `| Source` row, counted when they
+     carry a check mark); the spelled-out brand word must equal the number
+     of items in the README list; and every `### ` vendor heading in
+     SUPPORTED-DRIVERS.md must map, through the explicit table
+     SUPPORTED_HEADING_TO_README_BRAND, onto an item in that list, with
+     README_BRANDS_WITHOUT_HEADING declaring the items that have no heading
+     (the Unihedron SQM-LE is a sensor the WeeWX driver reads through the
+     feed's sqm fields; it has no row or heading of its own). Only check 4 gated
+     the README, and it compares the version badge alone, so the headline
+     was three releases stale at 4.0.0 and moved by hand again at 4.1.0.
 """
 
 import glob
@@ -1519,6 +1532,175 @@ def _static_regex_findings(text, path="AlpacaHTTP/src/http/router.cpp"):
 def check_router_regexes_static(root=ROOT):
     return _static_regex_findings(read("AlpacaHTTP/src/http/router.cpp", root))
 
+# --- check 15: README headline counts vs SUPPORTED-DRIVERS.md (issue #684) --
+#
+# README.md carries "- **N validated devices. <Word> brands. One server.**
+# <brand list>". Check 4 gates only the version badge, so this line was three
+# releases stale at 4.0.0 and was moved by hand on the 4.1.0 release PR. N is
+# the /bump-release Step 2.4 recount ported from its grep chain. The brand
+# count is not the heading count: two SUPPORTED-DRIVERS.md headings collapse
+# into "Sky-Watcher" and one README item (the Unihedron SQM-LE, a sensor read
+# through the WeeWX driver) has no heading, so the mapping is declared here
+# rather than inferred. A new
+# `### ` heading with no entry in the map is a finding, which is what a new
+# vendor landing without a README mention looks like.
+
+SUPPORTED_HEADING_TO_README_BRAND = {
+    "Astroasis": "Astroasis",
+    "Celestron": "Celestron",
+    "Gemini": "Gemini",
+    "GPhoto": "Canon and Nikon DSLRs (via libgphoto2)",
+    "iOptron": "iOptron",
+    "OnStep": "OnStep",
+    "Player One": "Player One Astronomy",
+    "QHY": "QHY",
+    "Sky-Watcher Direct Motor Controller": "Sky-Watcher",
+    "SynScan V3/V4": "Sky-Watcher",
+    "SVBONY": "SVBONY",
+    "ToupTek": "ToupTek Astro",
+    "WandererAstro": "WandererAstro",
+    "WeeWX": "WeeWX",
+    "ZWO": "ZWO",
+}
+
+# README brand-list items that are not a SUPPORTED-DRIVERS.md heading, each
+# with the reason. An item in neither this table nor the map above is drift.
+# The reason must be true of the repo as it is: the review of #685 caught the
+# first entry claiming a table row that does not exist.
+README_BRANDS_WITHOUT_HEADING = {
+    "Unihedron SQM-LE (WeeWX plugin)": (
+        "a sky-quality sensor the WeeWX ObservingConditions driver reads through the feed's "
+        "sqm/sqmTemp fields (SkyQuality/SkyTemperature); it has no driver, table row or heading "
+        "of its own in SUPPORTED-DRIVERS.md, and the WeeWX table's only row is the feed itself"),
+}
+
+README_HEADLINE_RE = re.compile(
+    r"^- \*\*(\d+) validated devices\. ([A-Za-z-]+) brands\. One server\.\*\* (.+?)\.?\s*$",
+    re.MULTILINE,
+)
+# Every `### ` heading in SUPPORTED-DRIVERS.md is a vendor today, and this treats
+# them all as one deliberately: a new heading that is NOT a vendor (a `### Notes`
+# or `### Legend` subsection) fails the gate demanding a map entry. That is the
+# strictness the gate is for, not a false drift; give such a heading a different
+# level, or add a declared exemption here, rather than loosening the regex.
+SUPPORTED_VENDOR_HEADING_RE = re.compile(r"^### (.+?)\s*$", re.MULTILINE)
+
+_ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+         "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+         "nineteen"]
+_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+
+def _number_word_to_int(word):
+    """'Fifteen' -> 15, 'twenty-one' -> 21; None when it is not a number word."""
+    w = word.strip().lower()
+    if w in _ONES:
+        return _ONES.index(w)
+    tens, _, ones = w.partition("-")
+    if tens in _TENS[2:] and (ones == "" or ones in _ONES[1:10]):
+        return _TENS.index(tens) * 10 + (_ONES.index(ones) if ones else 0)
+    return None
+
+
+def count_validated_device_rows(supported):
+    """The /bump-release Step 2.4 recount: table rows that are not a separator,
+    a header ('Model Series' / 'Device Type') or a '| Source' row, counted when
+    they carry a check mark."""
+    n = 0
+    for line in supported.splitlines():
+        if not line.startswith("| "):
+            continue
+        if re.match(r"^\| *-", line) or "Model Series" in line or "Device Type" in line or line.startswith("| Source"):
+            continue
+        if "\u2713" in line:
+            n += 1
+    return n
+
+
+def _split_readme_brand_list(text):
+    """Split on commas only. A brand item that itself contains a comma (a future
+    "Canon, Nikon and Sony DSLRs (via libgphoto2)") would become two items and
+    the gate would report a brand-word mismatch plus two unaccounted items, not
+    the real cause; word such an item without a comma ("Canon, Nikon and Sony"
+    -> "Canon/Nikon/Sony") if that day comes."""
+    items = [i.strip() for i in text.split(",")]
+    items = [i for i in items if i]
+    if items and items[-1].lower().startswith("and "):
+        items[-1] = items[-1][4:].strip()
+    return items
+
+
+def _readme_headline_findings(readme, supported, heading_map=None, extras=None):
+    """Check 15 over the two files' text. Pure, so --self-test can drive it."""
+    if heading_map is None:
+        heading_map = SUPPORTED_HEADING_TO_README_BRAND
+    if extras is None:
+        extras = README_BRANDS_WITHOUT_HEADING
+    failures = []
+
+    m = README_HEADLINE_RE.search(readme)
+    if not m:
+        return ["could not find the '- **N validated devices. <Word> brands. One server.** ...' headline in README.md"]
+    readme_devices = int(m.group(1))
+    brand_word = m.group(2)
+    items = _split_readme_brand_list(m.group(3))
+
+    expected_devices = count_validated_device_rows(supported)
+    if expected_devices == 0:
+        failures.append("SUPPORTED-DRIVERS.md has no validated model rows by the Step 2.4 filter -- the row filter "
+                        "is stale or the tables changed shape; check 15 cannot count anything")
+    elif readme_devices != expected_devices:
+        failures.append("README.md says %d validated devices but SUPPORTED-DRIVERS.md has %d validated model rows"
+                        % (readme_devices, expected_devices))
+
+    brand_count = _number_word_to_int(brand_word)
+    if brand_count is None:
+        failures.append("README.md brand count %r is not a number word this check knows (spell it out, e.g. 'Fifteen')"
+                        % brand_word)
+    elif brand_count != len(items):
+        failures.append("README.md says %s (%d) brands but its brand list has %d items"
+                        % (brand_word, brand_count, len(items)))
+    if len(set(items)) != len(items):
+        failures.append("README.md brand list repeats an item: %s"
+                        % ", ".join(sorted({i for i in items if items.count(i) > 1})))
+
+    headings = []
+    for h in SUPPORTED_VENDOR_HEADING_RE.findall(supported):
+        if h not in headings:
+            headings.append(h)
+    if not headings:
+        failures.append("SUPPORTED-DRIVERS.md has no '### ' vendor headings -- the heading extractor is stale")
+    for h in headings:
+        if h not in heading_map:
+            failures.append("SUPPORTED-DRIVERS.md heading '### %s' has no entry in SUPPORTED_HEADING_TO_README_BRAND "
+                            "(scripts/check_docs_drift.py): a new brand needs its README list item and a map entry" % h)
+    for h in heading_map:
+        if h not in headings:
+            failures.append("SUPPORTED_HEADING_TO_README_BRAND names '### %s' but SUPPORTED-DRIVERS.md has no such "
+                            "heading -- remove or rename the map entry" % h)
+
+    # Only the brands of headings that still exist count as accounted for, so a
+    # dropped vendor reports its stale map entry AND its orphaned README item in
+    # one run rather than two.
+    mapped = {brand for h, brand in heading_map.items() if h in headings}
+    for h, brand in heading_map.items():
+        if h in headings and brand not in items:
+            failures.append("README.md brand list does not name %r (SUPPORTED-DRIVERS.md heading '### %s')" % (brand, h))
+    for brand in extras:
+        if brand not in items:
+            failures.append("README_BRANDS_WITHOUT_HEADING names %r but the README.md brand list does not -- "
+                            "remove the entry or restore the item" % brand)
+    for item in items:
+        if item not in mapped and item not in extras:
+            failures.append("README.md brand list item %r matches no SUPPORTED-DRIVERS.md heading and is not declared "
+                            "in README_BRANDS_WITHOUT_HEADING" % item)
+    return failures
+
+
+def check_readme_headline_counts(root=ROOT):
+    return _readme_headline_findings(read("README.md", root), read("SUPPORTED-DRIVERS.md", root))
+
+
 
 CHECKS = [
     ("Instruction discovery and Claude adapters", check_instruction_structure),
@@ -1536,6 +1718,7 @@ CHECKS = [
     ("GPhoto STATUS paragraph names every validated body", check_gphoto_status_names_validated_bodies),
     ("Fake-connectable roster matches the fakes on disk", check_fake_roster_matches_disk),
     ("Every std::regex in router.cpp is built once (static)", check_router_regexes_static),
+    ("README headline counts match SUPPORTED-DRIVERS.md", check_readme_headline_counts),
 ]
 
 
@@ -1979,6 +2162,63 @@ def self_test():
     check("static regex: no construction at all is a floor finding, not a pass",
           len(f) == 1 and "extractor is stale" in f[0])
 
+    # check 15: README headline vs SUPPORTED-DRIVERS.md (issue #684).
+    hl_map = {"Alpha": "Alpha", "Beta Motor": "Beta", "Beta Handset": "Beta", "GPhoto": "DSLRs (via libgphoto2)"}
+    hl_extras = {"Gamma (Alpha plugin)": "a row in the Alpha table"}
+    hl_readme = ("intro\n- **3 validated devices. Four brands. One server.** Alpha, DSLRs (via libgphoto2), "
+                 "Beta, and Gamma (Alpha plugin).\n- **Other.** text\n")
+    hl_supported = ("### Alpha\n\n| Model Series | Connection | Linux | Status |\n|---|---|---|---|\n"
+                    "| A1 | USB | \u2713 | ok |\n| A2 | USB |  | pending |\n\n### Beta Motor\n\n"
+                    "| Model Series | Connection | Linux | Status |\n|---|---|---|---|\n| B1 | USB | \u2713 | ok |\n\n"
+                    "### Beta Handset\n\n| Model Series | Connection | Linux | Status |\n|---|---|---|---|\n"
+                    "| B2 | USB | \u2713 | ok |\n\n### GPhoto\n\n| Source | Connection | Linux | Status |\n"
+                    "|---|---|---|---|\n")
+    check("readme headline: baseline fixtures produce no finding",
+          _readme_headline_findings(hl_readme, hl_supported, hl_map, hl_extras) == [])
+    check("readme headline: the row filter counts check marks and skips separators, headers and '| Source' rows",
+          count_validated_device_rows(hl_supported + "| Model Series \u2713 |\n| Source \u2713 |\n|-- \u2713 |\n") == 3)
+    f = _readme_headline_findings(sub(hl_readme, "**3 validated", "**4 validated"), hl_supported, hl_map, hl_extras)
+    check("readme headline: a device count that disagrees with the validated rows is flagged",
+          len(f) == 1 and "says 4 validated devices but SUPPORTED-DRIVERS.md has 3" in f[0])
+    f = _readme_headline_findings(hl_readme, hl_supported + "### Delta\n\n| Model Series | C | L | S |\n|--|--|--|--|\n| D1 | USB | \u2713 | ok |\n", hl_map, hl_extras)
+    check("readme headline: a validated row added without a README edit is a device-count finding",
+          any("says 3 validated devices but SUPPORTED-DRIVERS.md has 4" in x for x in f))
+    check("readme headline: a new vendor heading with no map entry is flagged",
+          any("heading '### Delta' has no entry in SUPPORTED_HEADING_TO_README_BRAND" in x for x in f))
+    f = _readme_headline_findings(sub(hl_readme, "Four brands", "Five brands"), hl_supported, hl_map, hl_extras)
+    check("readme headline: a brand word that disagrees with the list length is flagged",
+          len(f) == 1 and "says Five (5) brands but its brand list has 4 items" in f[0])
+    f = _readme_headline_findings(sub(hl_readme, "Four brands", "Several brands"), hl_supported, hl_map, hl_extras)
+    check("readme headline: a brand count that is not a number word is flagged",
+          len(f) == 1 and "not a number word" in f[0])
+    check("readme headline: number words parse ('twenty-one' -> 21, 'Fifteen' -> 15, 'ninety' -> 90)",
+          (_number_word_to_int("twenty-one"), _number_word_to_int("Fifteen"), _number_word_to_int("ninety")) == (21, 15, 90))
+    f = _readme_headline_findings(sub(hl_readme, "Alpha, DSLRs", "Alpha, Alpha, DSLRs").replace("Four brands", "Five brands"), hl_supported, hl_map, hl_extras)
+    check("readme headline: a repeated list item is flagged",
+          len(f) == 1 and "repeats an item: Alpha" in f[0])
+    f = _readme_headline_findings(sub(hl_readme, "Beta, and Gamma", "and Gamma").replace("Four brands", "Three brands"), hl_supported, hl_map, hl_extras)
+    check("readme headline: a mapped brand missing from the README list is flagged for each heading that maps to it",
+          len(f) == 2 and all("does not name 'Beta'" in x for x in f))
+    f = _readme_headline_findings(sub(hl_readme, "Beta, and Gamma", "Beta, Omega, and Gamma").replace("Four brands", "Five brands"), hl_supported, hl_map, hl_extras)
+    check("readme headline: a README list item with no heading and no declared reason is flagged",
+          len(f) == 1 and "'Omega' matches no SUPPORTED-DRIVERS.md heading" in f[0])
+    f = _readme_headline_findings(hl_readme, hl_supported.split("### GPhoto")[0], hl_map, hl_extras)
+    check("readme headline: a dropped vendor reports the stale map entry and the orphaned README item in one run",
+          len(f) == 2 and any("names '### GPhoto' but SUPPORTED-DRIVERS.md has no such heading" in x for x in f)
+          and any("'DSLRs (via libgphoto2)' matches no SUPPORTED-DRIVERS.md heading" in x for x in f))
+    f = _readme_headline_findings(hl_readme, sub(hl_supported, "### Beta Handset", "### Beta Wireless"), hl_map, hl_extras)
+    check("readme headline: a renamed heading is both a stale map entry and an unmapped heading",
+          any("names '### Beta Handset' but SUPPORTED-DRIVERS.md has no such heading" in x for x in f)
+          and any("heading '### Beta Wireless' has no entry" in x for x in f))
+    f = _readme_headline_findings(sub(hl_readme, ", and Gamma (Alpha plugin)", "").replace("Four brands", "Three brands"), hl_supported, hl_map, hl_extras)
+    check("readme headline: a declared no-heading brand missing from the list is a stale-table finding",
+          len(f) == 1 and "README_BRANDS_WITHOUT_HEADING names 'Gamma (Alpha plugin)'" in f[0])
+    f = _readme_headline_findings(hl_readme.replace("\u2713", ""), hl_supported.replace("\u2713", ""), hl_map, hl_extras)
+    check("readme headline: no validated rows at all is a floor finding, not a pass",
+          any("cannot count anything" in x for x in f))
+    f = _readme_headline_findings("- **Other.** text\n", hl_supported, hl_map, hl_extras)
+    check("readme headline: a missing headline is a finding",
+          len(f) == 1 and "could not find" in f[0])
     from check_instruction_structure import self_test as instruction_self_test
     instruction_self_test()
 
