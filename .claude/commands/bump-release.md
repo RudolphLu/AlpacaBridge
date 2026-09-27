@@ -61,6 +61,14 @@ Today's date in `YYYY-MM-DD` (UTC is fine). Then:
    spelled the way the README already spells them; a new heading is a new brand. Spell the count
    out in words (`Fifteen brands`) as the line already does.
 
+   Since issue #684, `scripts/check_docs_drift.py` check 15 enforces this line: it recounts N with
+   the same row filter, requires the brand word to equal the number of items in the README list, and
+   maps every `### ` heading in `SUPPORTED-DRIVERS.md` onto a README item through
+   `SUPPORTED_HEADING_TO_README_BRAND` in the script (the two Sky-Watcher headings share one item,
+   and `README_BRANDS_WITHOUT_HEADING` covers the Unihedron SQM-LE row). A heading the map does not
+   know fails the gate, so a new brand needs its README item and a map entry together. The check
+   below tells you what is stale; fix it rather than working around it.
+
 Verify with `python3 scripts/check_docs_drift.py` before moving on.
 
 ## Step 3 — Write the plain-language release notes
