@@ -5167,7 +5167,7 @@ int main() {
         // CSRF guard (issue #298): this endpoint sets the system clock and,
         // since #291, marks the host client-stepped, so it takes the same
         // Origin check the wifi endpoints use. A cross-origin mutating
-        // request is rejected with 403 before the body is even parsed.
+        // request is rejected with 403 before the body is acted on.
         {
             const std::string body = "{\"Epoch\": 100}";
             std::ostringstream raw;
@@ -5606,6 +5606,32 @@ int main() {
         }
 
         registry.unregister_device(alpacacore::DeviceType::Telescope, 9804);
+    }
+
+    // Issue #509: the 403 also echoes a ClientTransactionID that arrives only
+    // in the JSON body.
+    {
+        alpacahttp::Router router;
+        for (const char* path : {"/management/v1/description", "/management/v1/loglevel", "/management/v1/synctime"}) {
+            for (const char* method : {"PUT", "POST"}) {
+                const std::string body = R"({"ClientTransactionID": 4242})";
+                std::ostringstream raw;
+                raw << method << " " << path << " HTTP/1.1\r\n"
+                    << "Host: localhost\r\n"
+                    << "Origin: http://evil.example\r\n"
+                    << "Content-Type: application/json\r\n"
+                    << "Content-Length: " << body.size() << "\r\n\r\n"
+                    << body;
+                alpacahttp::Request request;
+                EXPECT(request.parse(raw.str()));
+                const auto response = router.route(request, 1);
+                EXPECT(response.status_code() == 403);
+                const auto json = nlohmann::json::parse(response.body(), nullptr, false);
+                EXPECT(!json.is_discarded());
+                EXPECT(json.value("ClientTransactionID", 0U) == 4242U);
+                EXPECT(json.value("ErrorMessage", "").find("Cross-origin") != std::string::npos);
+            }
+        }
     }
 
 #ifdef ALPACACORE_ENABLE_SKYWATCHER

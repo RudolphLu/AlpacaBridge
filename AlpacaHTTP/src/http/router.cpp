@@ -7233,6 +7233,15 @@ std::optional<Response> reject_cross_origin_request(const Request& request, std:
     if (!host.empty() && origin_host == host) {
         return std::nullopt;
     }
+    // Issue #509: the ID may arrive only in the JSON body, which the handlers
+    // have not read yet when they call this guard. Precedence: a non-zero
+    // query-string ID wins over the body here, whereas handle_description()
+    // and handle_log_level() let a non-zero body ID override the query one.
+    if (client_tx_id == 0 && !request.body().empty()) {
+        if (auto json_opt = parse_json(request.body())) {
+            client_tx_id = extract_client_transaction_id(*json_opt);
+        }
+    }
     AlpacaResponse alpaca_response =
         make_error_response(client_tx_id, server_tx_id, util::ErrorCode::INVALID_VALUE,
                             std::string("Cross-origin ") + what + " requests are not allowed");
