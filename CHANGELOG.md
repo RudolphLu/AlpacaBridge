@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 AlpacaBridge is a workspace that combines [AlpacaCore](AlpacaCore/README.md) and [AlpacaHTTP](AlpacaHTTP/README.md).
 
-## [4.1.0] - UNRELEASED
+## [4.1.0] - 2026-09-27
 
 ### Changed
 - **The router test suites are hardened** (tests and tooling, issue #657): `test_route_table` now reads the accepted device-type names from `AlpacaHTTP/tests/fixtures/device_type_names.txt` instead of a literal list and fails in both directions when that fixture and `is_known_device_type_name()` disagree, checks A and C assert they sent at least one request so an emptied loop can no longer pass, and the wall-clock request-cost check is deleted in favour of docs-drift check 14, which requires every `std::regex` in `router.cpp` to be static. `test_routing`'s persisted-config round trip now runs in a scratch working directory, so a failed `EXPECT` (which aborts without unwinding) can no longer leave an entry in `config/registered_devices.json` for the next local run. No production code changes.
