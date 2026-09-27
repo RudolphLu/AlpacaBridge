@@ -295,6 +295,12 @@ For **every** Defect, in this order:
      vendors-ON build -- which is exactly why this is not worth reasoning about case by case.)
      Never infer what is in `AlpacaCore/build`: build your own.
    The full `ci_preflight.sh` is for branches that change runtime C++ across vendors.
+5b. **After a rename, grep the old name across the whole tree before pushing.** PR #695
+   round 2 renamed `MIN_README_RELATIVE_LINKS` to a dict and pushed with a comment in the
+   *other* script still naming the deleted constant; the bot's next round was that one
+   Defect. `git grep -n <old name>` must return nothing (or only history) before the push.
+   The same goes for a number restated in prose (a floor, a count, a line number): grep
+   the digits too, or write the prose without them.
 6. **One commit per Defect, one push per round** (this `⚠️ Issues found` path only). Commits
    stay atomic so a wrong one can be reverted alone; the push stays batched because every push
    costs a full review. A cleanup round after an approval is different: its notes are small and
