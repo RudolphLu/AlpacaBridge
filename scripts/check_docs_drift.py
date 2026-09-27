@@ -11,6 +11,11 @@ Self-test (no repo state): python3 scripts/check_docs_drift.py --self-test
   -- drives check 8's pairing and job-scoping helpers over literal fixtures,
   one per mutation the check exists to catch, so an extractor that stops
   matching fails here instead of degrading the gate to its floor (#455).
+Counts (check 15's numbers): python3 scripts/check_docs_drift.py --counts
+  -- prints the validated-device count, the brand count and its spelled-out
+  word, the brand list and a paste-ready README headline, all computed by
+  the same functions check 15 gates with, so the /bump-release recount step
+  has one command and no second copy of the row filter (#689).
 
 Checks:
   1. Every ALPACACORE_ENABLE_* CMake option is documented in the
@@ -103,9 +108,11 @@ Checks:
      construction at all (the extractor is stale or the regexes moved).
  15. The README headline ("N validated devices. <Word> brands. One server."
      plus the brand list) agrees with SUPPORTED-DRIVERS.md (issue #684). N is
-     recomputed with the /bump-release Step 2.4 row filter (table rows that
-     are not a separator, a header or a `| Source` row, counted when they
-     carry a check mark); the spelled-out brand word must equal the number
+     recomputed with the row filter this script owns, count_validated_device_rows
+     (table rows that are not a separator, a header or a `| Source` row,
+     counted when they carry a check mark; /bump-release Step 2.4 reads it
+     through --counts instead of restating it, issue #689); the spelled-out
+     brand word must equal the number
      of items in the README list; and every `### ` vendor heading in
      SUPPORTED-DRIVERS.md must map, through the explicit table
      SUPPORTED_HEADING_TO_README_BRAND, onto an item in that list, with
@@ -1537,7 +1544,9 @@ def check_router_regexes_static(root=ROOT):
 # README.md carries "- **N validated devices. <Word> brands. One server.**
 # <brand list>". Check 4 gates only the version badge, so this line was three
 # releases stale at 4.0.0 and was moved by hand on the 4.1.0 release PR. N is
-# the /bump-release Step 2.4 recount ported from its grep chain. The brand
+# the recount /bump-release Step 2.4 once spelled out as a grep chain; the
+# script owns it now and the release recipe reads it through --counts, so
+# there is one encoding of the row filter (issue #689). The brand
 # count is not the heading count: two SUPPORTED-DRIVERS.md headings collapse
 # into "Sky-Watcher" and one README item (the Unihedron SQM-LE, a sensor read
 # through the WeeWX driver) has no heading, so the mapping is declared here
@@ -1603,9 +1612,10 @@ def _number_word_to_int(word):
 
 
 def count_validated_device_rows(supported):
-    """The /bump-release Step 2.4 recount: table rows that are not a separator,
-    a header ('Model Series' / 'Device Type') or a '| Source' row, counted when
-    they carry a check mark."""
+    """The validated-model recount (the only copy of the rule, issue #689):
+    table rows that are not a separator, a header ('Model Series' /
+    'Device Type') or a '| Source' row, counted when they carry a check mark.
+    /bump-release Step 2.4 gets the number from --counts."""
     n = 0
     for line in supported.splitlines():
         if not line.startswith("| "):
@@ -1615,6 +1625,18 @@ def count_validated_device_rows(supported):
         if "\u2713" in line:
             n += 1
     return n
+
+
+def _int_to_number_word(n):
+    """15 -> 'fifteen', 21 -> 'twenty-one'; None above 99 (check 15's parser
+    stops there too, so a three-digit brand count needs a wider vocabulary in
+    both directions, not a digit string)."""
+    if not 0 <= n <= 99:
+        return None
+    if n < 20:
+        return _ONES[n]
+    tens, ones = divmod(n, 10)
+    return _TENS[tens] + ("-" + _ONES[ones] if ones else "")
 
 
 def _split_readme_brand_list(text):
@@ -1647,8 +1669,8 @@ def _readme_headline_findings(readme, supported, heading_map=None, extras=None):
 
     expected_devices = count_validated_device_rows(supported)
     if expected_devices == 0:
-        failures.append("SUPPORTED-DRIVERS.md has no validated model rows by the Step 2.4 filter -- the row filter "
-                        "is stale or the tables changed shape; check 15 cannot count anything")
+        failures.append("SUPPORTED-DRIVERS.md has no validated model rows by count_validated_device_rows -- the row "
+                        "filter is stale or the tables changed shape; check 15 cannot count anything")
     elif readme_devices != expected_devices:
         failures.append("README.md says %d validated devices but SUPPORTED-DRIVERS.md has %d validated model rows"
                         % (readme_devices, expected_devices))
@@ -1699,6 +1721,69 @@ def _readme_headline_findings(readme, supported, heading_map=None, extras=None):
 
 def check_readme_headline_counts(root=ROOT):
     return _readme_headline_findings(read("README.md", root), read("SUPPORTED-DRIVERS.md", root))
+
+
+def _expected_readme_brands(supported, heading_map, extras):
+    """The README brand items check 15 accounts for: one per mapped heading
+    that exists in SUPPORTED-DRIVERS.md, in heading order and de-duplicated,
+    then the declared no-heading items."""
+    brands = []
+    for h in SUPPORTED_VENDOR_HEADING_RE.findall(supported):
+        brand = heading_map.get(h)
+        if brand is not None and brand not in brands:
+            brands.append(brand)
+    for brand in extras:
+        if brand not in brands:
+            brands.append(brand)
+    return brands
+
+
+def readme_headline_counts_summary(readme, supported, heading_map=None, extras=None):
+    """The --counts report: check 15's numbers computed by check 15's own
+    functions, plus a paste-ready headline. Pure, so --self-test drives it.
+
+    The headline keeps the README's current item order for items that stay
+    and appends new ones at the end, so a release diff shows the additions
+    and not a reorder. A heading with no map entry, and a map entry whose
+    heading is gone, are each named rather than silently left out of the
+    list: the full check fails on both, so a pasted headline that hid either
+    would still leave check 15 red (review of #694)."""
+    if heading_map is None:
+        heading_map = SUPPORTED_HEADING_TO_README_BRAND
+    if extras is None:
+        extras = README_BRANDS_WITHOUT_HEADING
+    devices = count_validated_device_rows(supported)
+    expected = _expected_readme_brands(supported, heading_map, extras)
+    m = README_HEADLINE_RE.search(readme)
+    current = [i for i in _split_readme_brand_list(m.group(3)) if i in expected] if m else []
+    ordered = current + [b for b in expected if b not in current]
+    word = _int_to_number_word(len(ordered))
+    word_shown = word.capitalize() if word else "%d (no number word for this count)" % len(ordered)
+    if len(ordered) > 1:
+        listed = ", ".join(ordered[:-1]) + ", and " + ordered[-1]
+    else:
+        listed = ", ".join(ordered)
+    lines = [
+        "validated devices: %d" % devices,
+        "brands: %d (%s)" % (len(ordered), word_shown),
+        "brand list: %s" % ", ".join(ordered),
+        "headline: - **%d validated devices. %s brands. One server.** %s." % (devices, word_shown, listed),
+        "README.md now: %s" % (m.group(0).strip() if m else "(headline not found)"),
+    ]
+    headings = SUPPORTED_VENDOR_HEADING_RE.findall(supported)
+    for h in dict.fromkeys(h for h in headings if h not in heading_map):
+        lines.append("unmapped heading '### %s': add it to SUPPORTED_HEADING_TO_README_BRAND and to the README list" % h)
+    for h in heading_map:
+        if h not in headings:
+            lines.append("stale map entry '### %s': SUPPORTED-DRIVERS.md has no such heading; remove or rename it in "
+                         "SUPPORTED_HEADING_TO_README_BRAND (check 15 fails on it)" % h)
+    return lines
+
+
+def print_counts(root=ROOT):
+    for line in readme_headline_counts_summary(read("README.md", root), read("SUPPORTED-DRIVERS.md", root)):
+        print(line)
+    return 0
 
 
 
@@ -2219,6 +2304,38 @@ def self_test():
     f = _readme_headline_findings("- **Other.** text\n", hl_supported, hl_map, hl_extras)
     check("readme headline: a missing headline is a finding",
           len(f) == 1 and "could not find" in f[0])
+    # --counts (issue #689): the release recipe's numbers come from the same
+    # functions the gate uses, so the summary must agree with a clean baseline
+    # and its number words must round-trip through the gate's parser.
+    check("counts: every number word 0..99 round-trips through the check 15 parser",
+          all(_number_word_to_int(_int_to_number_word(n)) == n for n in range(100))
+          and _int_to_number_word(100) is None)
+    lines = readme_headline_counts_summary(hl_readme, hl_supported, hl_map, hl_extras)
+    check("counts: the summary reports the baseline's device count, brand count and word",
+          lines[0] == "validated devices: 3" and lines[1] == "brands: 4 (Four)")
+    check("counts: the paste-ready headline for a clean baseline is the README's own line",
+          lines[3] == "headline: " + hl_readme.splitlines()[1])
+    check("counts: the summary names no unmapped heading on a clean baseline",
+          not any(x.startswith("unmapped heading") for x in lines))
+    lines = readme_headline_counts_summary(
+        hl_readme, hl_supported + "### Delta\n\n| Model Series | C | L | S |\n|--|--|--|--|\n| D1 | USB | \u2713 | ok |\n",
+        dict(hl_map, Delta="Delta"), hl_extras)
+    check("counts: a new mapped heading raises the counts and is appended after the README's existing order",
+          lines[0] == "validated devices: 4" and lines[1] == "brands: 5 (Five)"
+          and lines[3].endswith("Beta, Gamma (Alpha plugin), and Delta."))
+    lines = readme_headline_counts_summary(
+        hl_readme, hl_supported + "### Delta\n\n| Model Series | C | L | S |\n|--|--|--|--|\n| D1 | USB | \u2713 | ok |\n",
+        hl_map, hl_extras)
+    check("counts: a heading with no map entry is named, not silently dropped from the list",
+          lines[1] == "brands: 4 (Four)" and any("unmapped heading '### Delta'" in x for x in lines))
+    lines = readme_headline_counts_summary(hl_readme, hl_supported, dict(hl_map, Epsilon="Epsilon"), hl_extras)
+    check("counts: a map entry whose heading is gone is named, and its brand is not suggested (review of #694)",
+          lines[1] == "brands: 4 (Four)" and "Epsilon" not in lines[3]
+          and any(x.startswith("stale map entry '### Epsilon'") for x in lines))
+    lines = readme_headline_counts_summary("- **Other.** text\n", hl_supported, hl_map, hl_extras)
+    check("counts: with no README headline the list is the map's own order and the current line is reported missing",
+          lines[2] == "brand list: Alpha, Beta, DSLRs (via libgphoto2), Gamma (Alpha plugin)"
+          and lines[4] == "README.md now: (headline not found)")
     from check_instruction_structure import self_test as instruction_self_test
     instruction_self_test()
 
@@ -2235,4 +2352,6 @@ def self_test():
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
         sys.exit(self_test())
+    if "--counts" in sys.argv:
+        sys.exit(print_counts())
     sys.exit(main())

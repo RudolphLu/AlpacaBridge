@@ -50,25 +50,27 @@ Today's date in `YYYY-MM-DD` (UTC is fine). Then:
    the section into `<details>`; the newest release stays expanded, and the next `UNRELEASED`
    section is what collapses it later.
 4. README headline count: `- **N validated devices. M brands. One server.** <brand list>`.
-   Recount rather than trust the old number — the line was three releases stale at 4.0.0:
+   Recount rather than trust the old number — the line was three releases stale at 4.0.0. The
+   script that gates the line (check 15, issue #684) also prints its numbers, so there is one
+   command and one copy of the row filter (issue #689):
 
    ```bash
-   grep -E '^\| ' SUPPORTED-DRIVERS.md | grep -v -E '^\| *-|Model Series|Device Type|^\| Source' | grep -c '✓'
-   grep '^### ' SUPPORTED-DRIVERS.md | sort -u
+   python3 scripts/check_docs_drift.py --counts
    ```
 
-   The first command is N (validated model rows). The brand list is the distinct vendor headings,
-   spelled the way the README already spells them; a new heading is a new brand. Spell the count
-   out in words (`Fifteen brands`) as the line already does.
+   It prints N (validated model rows), the brand count with its spelled-out word, the brand list,
+   a paste-ready `headline:` line and the README's current line. Replace the README line with the
+   `headline:` one when they differ. The list keeps the README's existing item order and appends
+   new brands at the end; reorder by hand if you want to. Do not restate the row filter here or
+   anywhere else: `count_validated_device_rows` in the script owns it, and the failure message of
+   the full check names the numbers.
 
-   Since issue #684, `scripts/check_docs_drift.py` check 15 enforces this line: it recounts N with
-   the same row filter, requires the brand word to equal the number of items in the README list, and
-   maps every `### ` heading in `SUPPORTED-DRIVERS.md` onto a README item through
-   `SUPPORTED_HEADING_TO_README_BRAND` in the script (the two Sky-Watcher headings share one item,
-   and `README_BRANDS_WITHOUT_HEADING` covers the Unihedron SQM-LE item, a sensor read through the
-   WeeWX driver with no row of its own). A heading the map does not
-   know fails the gate, so a new brand needs its README item and a map entry together. The check
-   below tells you what is stale; fix it rather than working around it.
+   The brand list is not the heading list: the script maps every `### ` heading in
+   `SUPPORTED-DRIVERS.md` onto a README item through `SUPPORTED_HEADING_TO_README_BRAND` (the two
+   Sky-Watcher headings share one item, and `README_BRANDS_WITHOUT_HEADING` covers the Unihedron
+   SQM-LE item, a sensor read through the WeeWX driver with no row of its own). A heading the map
+   does not know fails the gate, and `--counts` names it as `unmapped heading`, so a new brand needs
+   its README item and a map entry together. Fix what the check reports rather than working around it.
 
 Verify with `python3 scripts/check_docs_drift.py` before moving on.
 
