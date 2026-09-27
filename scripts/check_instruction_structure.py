@@ -254,7 +254,7 @@ def self_test():
         root = Path(tmp)
         (root / 'AlpacaCore/src/vendors').mkdir(parents=True)
         assert any('floor' in f for f in check(root)), 'An empty documents set escaped the floor'
-    print('Instruction structure: glob assertions, 4 negative fixtures, link path, root document links and 4 floors passed')
+    print('Instruction structure: glob assertions, negative fixtures, link path, root document links and floors passed')
 
 
 if __name__ == '__main__':
