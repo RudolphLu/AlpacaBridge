@@ -695,7 +695,7 @@ These three test cases catch the bugs that cause ConformU failures. They run wit
      - SVBONY: `CameraState` got stuck after SDK hangs
 
 8. **Unsupported method error codes** `"<Vendor> <Device> Driver - Unsupported methods"` `[<vendor>][<device>][unit]`
-   - Methods the device doesn't support must throw `AlpacaException` with `AlpacaError::MethodNotImplemented` (or `PropertyNotImplemented` for a property, both 0x400), NOT a generic `DriverException`. `InvalidOperation` (0x40B) is for a supported member called in a state where it can't currently run, not for a member the hardware lacks — see AGENTS.md's ASCOM exception vocabulary table.
+   - Methods the device doesn't support must throw `AlpacaException` with `AlpacaError::MethodNotImplemented` (or `PropertyNotImplemented` for a property, both 0x400), NOT a generic `DriverException`. `InvalidOperation` (0x40B) is for a supported member called in a state where it can't currently run, not for a member the hardware lacks — see AGENTS.md's ASCOM exception vocabulary table. `Action()` called with a name not in `SupportedActions` throws `ActionNotImplemented` (0x40C) instead — a distinct code, not `MethodNotImplemented`.
    - ConformU distinguishes between "not implemented" and "driver error" — the wrong error code fails validation.
    - Examples:
      - Telescope without `CanSyncAltAz`: `SyncToAltAz` must throw with correct code
