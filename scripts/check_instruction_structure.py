@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import re
 import sys
+from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parents[1]
 # Tripwire for a renamed documents directory, not a target count: the tree has
@@ -14,12 +15,23 @@ MIN_LINKED_DOCUMENTS = 20
 # inside the aggregate floor's margin, so a renamed `.claude/skills` would scan
 # nothing and still clear MIN_LINKED_DOCUMENTS. Tripwire, not a target count.
 MIN_SKILL_DOCUMENTS = 5
-# README.md is scanned by name (issue #693) and is the most-read file in the
-# repo; it carries 9 relative link/src targets today (LICENSE, CHANGELOG.md,
-# SUPPORTED-DRIVERS.md, docs/development.md, docs/image/ab.png). A count below
-# this means the link extractor regressed or the file was gutted. Tripwire, not
-# a target count: lower it if the README legitimately loses links.
-MIN_README_RELATIVE_LINKS = 5
+# Root documents scanned by name (issue #693), each with a floor on its DISTINCT
+# relative link/src targets: README.md is the most-read file in the repo and
+# names 5 distinct targets today (LICENSE, CHANGELOG.md, SUPPORTED-DRIVERS.md,
+# docs/development.md, docs/image/ab.png); SUPPORTED-DRIVERS.md links every
+# validated model to its ConformU report directory (about 90 distinct targets).
+# Distinct, not occurrences: three links to one file are one target, so a
+# regression that drops every link to that file cannot hide behind repeats. A
+# count below the floor means the extractor regressed or the file was gutted.
+# Tripwires, not target counts: lower one if a file legitimately loses links.
+# CHANGELOG.md is scanned with no floor; its links are incidental.
+ROOT_DOCUMENT_LINK_FLOORS = {'README.md': 5, 'SUPPORTED-DRIVERS.md': 40, 'CHANGELOG.md': 0}
+# A Markdown link target may contain one level of balanced parentheses
+# (`AlpacaCore/conformu/ZWO/ASIair%20Plus%20(Pi%20CM4)/`); a plain `[^)]+`
+# stops at the first `)` and reports a truncated path that does not exist.
+MARKDOWN_LINK_TARGET_RE = re.compile(r'\]\(((?:[^\s()]|\([^\s()]*\))+)\)')
+# HTML image/embed sources: the logo is `<img src="docs/image/ab.png">`.
+HTML_SRC_TARGET_RE = re.compile(r'\bsrc="([^"\s]+)"')
 
 
 def matches(path, pattern):
@@ -84,7 +96,8 @@ def check(root=ROOT):
                 '%s: HTTP startup is not covered' % name)
     # Resolve relocated Markdown links relative to their actual owning files.
     documents = canonical + [root / 'docs/agent-instructions.md', root / 'CONTEXT.md',
-                             root / 'docs/architecture.md', root / 'README.md']
+                             root / 'docs/architecture.md']
+    documents += [root / name for name in ROOT_DOCUMENT_LINK_FLOORS]
     documents += list((root / 'docs/failures').glob('*.md'))
     documents += list((root / 'docs/decisions').glob('*.md'))
     skill_documents = [path for path in (root / '.claude/skills').rglob('*.md') if path.is_file()]
@@ -96,23 +109,27 @@ def check(root=ROOT):
     require(len(documents) >= MIN_LINKED_DOCUMENTS,
             'only %d Markdown document(s) found for the link check (floor %d): a document '
             'directory was renamed or a glob regressed' % (len(documents), MIN_LINKED_DOCUMENTS))
-    readme_relative_links = 0
+    distinct_targets = {name: set() for name in ROOT_DOCUMENT_LINK_FLOORS}
     for path in documents:
-        # Markdown links plus HTML src attributes: the README and the driver
-        # matrix embed the logo as `<img src="docs/image/ab.png">` (issue #693).
+        # Markdown links plus HTML src attributes: README.md, SUPPORTED-DRIVERS.md
+        # and CHANGELOG.md all embed the logo as `<img src="docs/image/ab.png">`
+        # (issue #693). Targets are percent-decoded before the existence check:
+        # the driver matrix links its ConformU report directories with `%20`
+        # for the spaces in model names.
         text = path.read_text(encoding="utf-8", errors="replace")
-        targets = re.findall(r'\]\(([^\s)]+)\)', text) + re.findall(r'\bsrc="([^"\s]+)"', text)
+        targets = MARKDOWN_LINK_TARGET_RE.findall(text) + HTML_SRC_TARGET_RE.findall(text)
         for target in targets:
             if target.startswith(('#', 'http:', 'https:', 'mailto:')):
                 continue
-            if path.name == 'README.md' and path.parent == root:
-                readme_relative_links += 1
-            file = target.split('#', 1)[0]
+            file = unquote(target.split('#', 1)[0])
+            if path.parent == root and path.name in distinct_targets:
+                distinct_targets[path.name].add(file)
             require((path.parent / file).exists(), '%s: broken relative link %s'
                     % (path.relative_to(root).as_posix(), target))
-    require(readme_relative_links >= MIN_README_RELATIVE_LINKS,
-            'only %d relative link/src target(s) found in README.md (floor %d): the file is missing, '
-            'was gutted, or the link extractor regressed' % (readme_relative_links, MIN_README_RELATIVE_LINKS))
+    for name, floor in ROOT_DOCUMENT_LINK_FLOORS.items():
+        require(len(distinct_targets[name]) >= floor,
+                'only %d distinct relative link/src target(s) found in %s (floor %d): the file is missing, '
+                'was gutted, or the link extractor regressed' % (len(distinct_targets[name]), name, floor))
     return failures
 
 
@@ -129,7 +146,8 @@ def self_test():
                           'AlpacaCore/include/alpacacore/vendor', 'AlpacaCore/tests',
                           '.claude/skills'):
             shutil.copytree(ROOT / directory, root / directory)
-        for file in ('CLAUDE.md', 'AGENTS.md', 'CONTEXT.md', 'README.md'):
+        for file in ('CLAUDE.md', 'AGENTS.md', 'CONTEXT.md', 'README.md', 'SUPPORTED-DRIVERS.md',
+                     'CHANGELOG.md'):
             shutil.copy(ROOT / file, root / file)
         # Link targets outside the small fixture are intentionally absent; compare
         # new diagnostics against the fixture baseline instead of hiding failures.
@@ -179,7 +197,38 @@ def self_test():
         new_findings = set(check(root)) - baseline
         page.write_text(original)
         assert any('README.md' in f and 'floor' in f for f in new_findings), \
-            'A README.md with no relative links escaped MIN_README_RELATIVE_LINKS'
+            'A README.md with no relative links escaped its ROOT_DOCUMENT_LINK_FLOORS entry'
+        # The floor counts DISTINCT targets: a README that repeats one link five
+        # times has one target and must trip the floor.
+        page.write_text('# repeats\n' + '[a](CONTEXT.md) ' * 5 + '\n')
+        new_findings = set(check(root)) - baseline
+        page.write_text(original)
+        assert any('README.md' in f and 'only 1 distinct' in f for f in new_findings), \
+            'Repeated links to one target were counted as distinct'
+        # Percent-encoded targets and one level of parentheses resolve (the
+        # driver matrix links `AlpacaCore/conformu/ZWO/ASIair%20Plus%20(Pi%20CM4)/`);
+        # an encoded link to a missing directory is still reported, decoded or not.
+        (root / 'docs/fixture dir (x)').mkdir()
+        (root / 'docs/fixture dir (x)/r.txt').write_text('r\n')
+        page.write_text(original + '\n[ok](docs/fixture%20dir%20(x)/) [gone](docs/fixture%20dir%20(y)/)\n')
+        new_findings = set(check(root)) - baseline
+        page.write_text(original)
+        assert not any('fixture%20dir%20(x)' in f for f in new_findings), \
+            'A percent-encoded link with parentheses to an existing directory was reported as broken'
+        assert any('README.md' in f and 'fixture%20dir%20(y)' in f for f in new_findings), \
+            'A percent-encoded link to a missing directory escaped the link check'
+        # SUPPORTED-DRIVERS.md is scanned by name with its own floor.
+        matrix = root / 'SUPPORTED-DRIVERS.md'
+        original_matrix = matrix.read_text(encoding="utf-8", errors="replace")
+        matrix.write_text(original_matrix + '\n[gone](AlpacaCore/conformu/Nope/Model%20X/)\n')
+        new_findings = set(check(root)) - baseline
+        matrix.write_text('# gutted\n')
+        floor_findings = set(check(root)) - baseline
+        matrix.write_text(original_matrix)
+        assert any('SUPPORTED-DRIVERS.md' in f and 'Nope/Model%20X' in f for f in new_findings), \
+            'A broken link in SUPPORTED-DRIVERS.md escaped the link check'
+        assert any('SUPPORTED-DRIVERS.md' in f and 'floor' in f for f in floor_findings), \
+            'A gutted SUPPORTED-DRIVERS.md escaped its ROOT_DOCUMENT_LINK_FLOORS entry'
         # A renamed skills tree loses ~10 documents, which fits inside the
         # aggregate floor's margin: only the per-source floor catches it.
         skills = root / '.claude/skills'
@@ -194,7 +243,7 @@ def self_test():
         root = Path(tmp)
         (root / 'AlpacaCore/src/vendors').mkdir(parents=True)
         assert any('floor' in f for f in check(root)), 'An empty documents set escaped the floor'
-    print('Instruction structure: glob assertions, 4 negative fixtures, link path, README links and 3 floors passed')
+    print('Instruction structure: glob assertions, 4 negative fixtures, link path, root document links and 4 floors passed')
 
 
 if __name__ == '__main__':
