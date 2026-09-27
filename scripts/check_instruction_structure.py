@@ -35,6 +35,10 @@ ROOT_DOCUMENT_LINK_FLOORS = {'README.md': 4, 'SUPPORTED-DRIVERS.md': 40, 'CHANGE
 MARKDOWN_LINK_TARGET_RE = re.compile(r'\]\(((?:[^\s()]|\([^\s()]*\))+)\)')
 # HTML image/embed sources: the logo is `<img src="docs/image/ab.png">`.
 HTML_SRC_TARGET_RE = re.compile(r'\bsrc="([^"\s]+)"')
+# Fenced code blocks are removed before either scan (the same rule as check 7
+# in check_docs_drift.py): a skill doc that illustrates `<img src="...">` or a
+# link in a fence is showing an example, not naming a repo file.
+FENCED_BLOCK_RE = re.compile(r'^[ \t]*(`{3,}|~{3,}).*?^[ \t]*\1[ \t]*$', re.S | re.M)
 
 
 def matches(path, pattern):
@@ -119,7 +123,7 @@ def check(root=ROOT):
         # (issue #693). Targets are percent-decoded before the existence check:
         # the driver matrix links its ConformU report directories with `%20`
         # for the spaces in model names.
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = FENCED_BLOCK_RE.sub('', path.read_text(encoding="utf-8", errors="replace"))
         targets = MARKDOWN_LINK_TARGET_RE.findall(text) + HTML_SRC_TARGET_RE.findall(text)
         for target in targets:
             if target.startswith(('#', 'http:', 'https:', 'mailto:')):
@@ -196,6 +200,12 @@ def self_test():
             'A broken Markdown link in README.md escaped the link check'
         assert any('README.md' in f and 'docs/image/missing.png' in f for f in new_findings), \
             'A broken <img src> in README.md escaped the link check'
+        # Inside a fenced code block the same two targets are examples, not links.
+        page.write_text(original + '\n```html\n[gone](missing-target.md)\n<img src="docs/image/missing.png">\n```\n')
+        new_findings = set(check(root)) - baseline
+        page.write_text(original)
+        assert not any('missing-target.md' in f or 'docs/image/missing.png' in f for f in new_findings), \
+            'A link or src inside a fenced code block was validated as a repo path'
         page.write_text('# gutted\n')
         new_findings = set(check(root)) - baseline
         page.write_text(original)

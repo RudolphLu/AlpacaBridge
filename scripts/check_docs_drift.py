@@ -132,7 +132,9 @@ Checks:
      re-verifies the file (Step 2.4 recounts from it), so /bump-release sets
      the line to the release date and this gate holds it there; between
      releases it may run ahead (/conformu and /commit bump it) but never
-     behind. Pure, so it runs in pre-flight; no git state is consulted.
+     behind, and never more than MAX_UPDATED_DAYS_AHEAD past the badge, which
+     catches a typo'd year without consulting the clock. Pure, so it runs in
+     pre-flight; no git state is consulted.
 """
 
 import glob
@@ -1840,6 +1842,11 @@ def print_counts(root=ROOT):
 # --- check 16: SUPPORTED-DRIVERS.md Updated date vs README release date (#692)
 
 SUPPORTED_UPDATED_RE = re.compile(r"^## Updated (\S+)\s*$", re.MULTILINE)
+# How far past the badge date the Updated line may run. Releases are weeks
+# apart, so a real gap never approaches this; a typo'd year ("2126-09-27")
+# overshoots it at once. Relative to the badge, not to today, so the check
+# stays pure.
+MAX_UPDATED_DAYS_AHEAD = 366
 README_BADGE_DATE_RE = re.compile(r"^####\s*\[[0-9.]+\]\s*-\s*(\S+)\s*&middot;\s*\[Changelog\]", re.MULTILINE)
 
 
@@ -1873,6 +1880,10 @@ def _updated_date_findings(supported, readme):
     elif updated is not None and updated < released:
         failures.append("SUPPORTED-DRIVERS.md says '## Updated %s' but README.md was released %s: set the Updated "
                         "line to the release date (/bump-release Step 2.5) or later" % (m.group(1), b.group(1)))
+    elif updated is not None and (updated - released).days > MAX_UPDATED_DAYS_AHEAD:
+        failures.append("SUPPORTED-DRIVERS.md says '## Updated %s', more than %d days after the README.md release "
+                        "date %s: a mistyped year, or a release is long overdue"
+                        % (m.group(1), MAX_UPDATED_DAYS_AHEAD, b.group(1)))
     return failures
 
 
@@ -2476,6 +2487,11 @@ def self_test():
     f = _updated_date_findings(ud_supported.replace("09-27", "09-24"), ud_readme)
     check("updated date: an Updated line behind the release date is flagged with both dates",
           len(f) == 1 and "Updated 2026-09-24" in f[0] and "released 2026-09-27" in f[0])
+    f = _updated_date_findings(ud_supported.replace("2026-09-27", "2126-09-27"), ud_readme)
+    check("updated date: a mistyped year far ahead of the release date is flagged",
+          len(f) == 1 and "more than %d days after" % MAX_UPDATED_DAYS_AHEAD in f[0])
+    check("updated date: a year ahead exactly is still clean (the bound is loose by design)",
+          _updated_date_findings(ud_supported.replace("2026-09-27", "2027-09-27"), ud_readme) == [])
     f = _updated_date_findings(ud_supported.replace("2026-09-27", "2026-13-40"), ud_readme)
     check("updated date: a non-date Updated value is flagged",
           len(f) == 1 and "not a YYYY-MM-DD date" in f[0])
