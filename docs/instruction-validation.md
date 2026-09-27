@@ -5,8 +5,9 @@ Run `python3 scripts/check_docs_drift.py` and
 The drift gate checks the Claude entry point, agreement between GitHub and Claude
 path metadata, vendor source/header/test coverage, the instruction index, and
 relative links in scoped guidance, memory, `CONTEXT.md`, `docs/architecture.md`, `README.md`,
-`SUPPORTED-DRIVERS.md` and `CHANGELOG.md` (Markdown links and `<img src>` targets, percent-decoded,
-with a floor on distinct targets per root document), and the Claude skills under `.claude/skills/`. Its existing prose checks also scan
+`SUPPORTED-DRIVERS.md` and `CHANGELOG.md` (percent-decoded, with a floor on distinct targets per root
+document), and the Claude skills under `.claude/skills/`; `<img src>` targets are read in every scanned
+document. Its existing prose checks also scan
 the relocated instruction files. Negative fixtures check that removing the Claude
 entry point, changing an adapter's vendor, removing metadata, or breaking the index
 is detected.

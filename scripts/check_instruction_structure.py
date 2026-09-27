@@ -23,9 +23,12 @@ MIN_SKILL_DOCUMENTS = 5
 # Distinct, not occurrences: three links to one file are one target, so a
 # regression that drops every link to that file cannot hide behind repeats. A
 # count below the floor means the extractor regressed or the file was gutted.
-# Tripwires, not target counts: lower one if a file legitimately loses links.
-# CHANGELOG.md is scanned with no floor; its links are incidental.
-ROOT_DOCUMENT_LINK_FLOORS = {'README.md': 5, 'SUPPORTED-DRIVERS.md': 40, 'CHANGELOG.md': 0}
+# Tripwires, not target counts, each set one link below today's count so a
+# single deliberate removal is not misdiagnosed as a regression: lower one if
+# a file legitimately loses more. CHANGELOG.md has 3 distinct targets today
+# (the logo and the component READMEs) and a floor of 2 so a gutted or deleted
+# CHANGELOG.md is a finding like the other two.
+ROOT_DOCUMENT_LINK_FLOORS = {'README.md': 4, 'SUPPORTED-DRIVERS.md': 40, 'CHANGELOG.md': 2}
 # A Markdown link target may contain one level of balanced parentheses
 # (`AlpacaCore/conformu/ZWO/ASIair%20Plus%20(Pi%20CM4)/`); a plain `[^)]+`
 # stops at the first `)` and reports a truncated path that does not exist.
@@ -229,6 +232,14 @@ def self_test():
             'A broken link in SUPPORTED-DRIVERS.md escaped the link check'
         assert any('SUPPORTED-DRIVERS.md' in f and 'floor' in f for f in floor_findings), \
             'A gutted SUPPORTED-DRIVERS.md escaped its ROOT_DOCUMENT_LINK_FLOORS entry'
+        # CHANGELOG.md has a floor too, so a gutted changelog is a finding.
+        changelog = root / 'CHANGELOG.md'
+        original_changelog = changelog.read_text(encoding="utf-8", errors="replace")
+        changelog.write_text('# gutted\n')
+        floor_findings = set(check(root)) - baseline
+        changelog.write_text(original_changelog)
+        assert any('CHANGELOG.md' in f and 'floor' in f for f in floor_findings), \
+            'A gutted CHANGELOG.md escaped its ROOT_DOCUMENT_LINK_FLOORS entry'
         # A renamed skills tree loses ~10 documents, which fits inside the
         # aggregate floor's margin: only the per-source floor catches it.
         skills = root / '.claude/skills'
