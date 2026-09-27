@@ -65,7 +65,8 @@ Today's date in `YYYY-MM-DD` (UTC is fine). Then:
    the same row filter, requires the brand word to equal the number of items in the README list, and
    maps every `### ` heading in `SUPPORTED-DRIVERS.md` onto a README item through
    `SUPPORTED_HEADING_TO_README_BRAND` in the script (the two Sky-Watcher headings share one item,
-   and `README_BRANDS_WITHOUT_HEADING` covers the Unihedron SQM-LE row). A heading the map does not
+   and `README_BRANDS_WITHOUT_HEADING` covers the Unihedron SQM-LE item, a sensor read through the
+   WeeWX driver with no row of its own). A heading the map does not
    know fails the gate, so a new brand needs its README item and a map entry together. The check
    below tells you what is stale; fix it rather than working around it.
 

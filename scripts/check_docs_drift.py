@@ -110,7 +110,8 @@ Checks:
      SUPPORTED-DRIVERS.md must map, through the explicit table
      SUPPORTED_HEADING_TO_README_BRAND, onto an item in that list, with
      README_BRANDS_WITHOUT_HEADING declaring the items that have no heading
-     (the Unihedron SQM-LE row lives in the WeeWX table). Only check 4 gated
+     (the Unihedron SQM-LE is a sensor the WeeWX driver reads through the
+     feed's sqm fields; it has no row or heading of its own). Only check 4 gated
      the README, and it compares the version badge alone, so the headline
      was three releases stale at 4.0.0 and moved by hand again at 4.1.0.
 """
@@ -1538,8 +1539,9 @@ def check_router_regexes_static(root=ROOT):
 # releases stale at 4.0.0 and was moved by hand on the 4.1.0 release PR. N is
 # the /bump-release Step 2.4 recount ported from its grep chain. The brand
 # count is not the heading count: two SUPPORTED-DRIVERS.md headings collapse
-# into "Sky-Watcher" and one README item (the Unihedron SQM-LE, a WeeWX row)
-# has no heading, so the mapping is declared here rather than inferred. A new
+# into "Sky-Watcher" and one README item (the Unihedron SQM-LE, a sensor read
+# through the WeeWX driver) has no heading, so the mapping is declared here
+# rather than inferred. A new
 # `### ` heading with no entry in the map is a finding, which is what a new
 # vendor landing without a README mention looks like.
 
@@ -1563,14 +1565,24 @@ SUPPORTED_HEADING_TO_README_BRAND = {
 
 # README brand-list items that are not a SUPPORTED-DRIVERS.md heading, each
 # with the reason. An item in neither this table nor the map above is drift.
+# The reason must be true of the repo as it is: the review of #685 caught the
+# first entry claiming a table row that does not exist.
 README_BRANDS_WITHOUT_HEADING = {
-    "Unihedron SQM-LE (WeeWX plugin)": "a row in the WeeWX ObservingConditions table, not a vendor heading",
+    "Unihedron SQM-LE (WeeWX plugin)": (
+        "a sky-quality sensor the WeeWX ObservingConditions driver reads through the feed's "
+        "sqm/sqmTemp fields (SkyQuality/SkyTemperature); it has no driver, table row or heading "
+        "of its own in SUPPORTED-DRIVERS.md, and the WeeWX table's only row is the feed itself"),
 }
 
 README_HEADLINE_RE = re.compile(
     r"^- \*\*(\d+) validated devices\. ([A-Za-z-]+) brands\. One server\.\*\* (.+?)\.?\s*$",
     re.MULTILINE,
 )
+# Every `### ` heading in SUPPORTED-DRIVERS.md is a vendor today, and this treats
+# them all as one deliberately: a new heading that is NOT a vendor (a `### Notes`
+# or `### Legend` subsection) fails the gate demanding a map entry. That is the
+# strictness the gate is for, not a false drift; give such a heading a different
+# level, or add a declared exemption here, rather than loosening the regex.
 SUPPORTED_VENDOR_HEADING_RE = re.compile(r"^### (.+?)\s*$", re.MULTILINE)
 
 _ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
@@ -1606,6 +1618,11 @@ def count_validated_device_rows(supported):
 
 
 def _split_readme_brand_list(text):
+    """Split on commas only. A brand item that itself contains a comma (a future
+    "Canon, Nikon and Sony DSLRs (via libgphoto2)") would become two items and
+    the gate would report a brand-word mismatch plus two unaccounted items, not
+    the real cause; word such an item without a comma ("Canon, Nikon and Sony"
+    -> "Canon/Nikon/Sony") if that day comes."""
     items = [i.strip() for i in text.split(",")]
     items = [i for i in items if i]
     if items and items[-1].lower().startswith("and "):
@@ -1662,7 +1679,10 @@ def _readme_headline_findings(readme, supported, heading_map=None, extras=None):
             failures.append("SUPPORTED_HEADING_TO_README_BRAND names '### %s' but SUPPORTED-DRIVERS.md has no such "
                             "heading -- remove or rename the map entry" % h)
 
-    mapped = set(heading_map.values())
+    # Only the brands of headings that still exist count as accounted for, so a
+    # dropped vendor reports its stale map entry AND its orphaned README item in
+    # one run rather than two.
+    mapped = {brand for h, brand in heading_map.items() if h in headings}
     for h, brand in heading_map.items():
         if h in headings and brand not in items:
             failures.append("README.md brand list does not name %r (SUPPORTED-DRIVERS.md heading '### %s')" % (brand, h))
@@ -2182,6 +2202,10 @@ def self_test():
     f = _readme_headline_findings(sub(hl_readme, "Beta, and Gamma", "Beta, Omega, and Gamma").replace("Four brands", "Five brands"), hl_supported, hl_map, hl_extras)
     check("readme headline: a README list item with no heading and no declared reason is flagged",
           len(f) == 1 and "'Omega' matches no SUPPORTED-DRIVERS.md heading" in f[0])
+    f = _readme_headline_findings(hl_readme, hl_supported.split("### GPhoto")[0], hl_map, hl_extras)
+    check("readme headline: a dropped vendor reports the stale map entry and the orphaned README item in one run",
+          len(f) == 2 and any("names '### GPhoto' but SUPPORTED-DRIVERS.md has no such heading" in x for x in f)
+          and any("'DSLRs (via libgphoto2)' matches no SUPPORTED-DRIVERS.md heading" in x for x in f))
     f = _readme_headline_findings(hl_readme, sub(hl_supported, "### Beta Handset", "### Beta Wireless"), hl_map, hl_extras)
     check("readme headline: a renamed heading is both a stale map entry and an unmapped heading",
           any("names '### Beta Handset' but SUPPORTED-DRIVERS.md has no such heading" in x for x in f)
