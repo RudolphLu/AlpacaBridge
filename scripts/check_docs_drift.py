@@ -1744,8 +1744,10 @@ def readme_headline_counts_summary(readme, supported, heading_map=None, extras=N
 
     The headline keeps the README's current item order for items that stay
     and appends new ones at the end, so a release diff shows the additions
-    and not a reorder; a heading with no map entry is named rather than
-    silently dropped, since the full check would fail on it anyway."""
+    and not a reorder. A heading with no map entry, and a map entry whose
+    heading is gone, are each named rather than silently left out of the
+    list: the full check fails on both, so a pasted headline that hid either
+    would still leave check 15 red (review of #694)."""
     if heading_map is None:
         heading_map = SUPPORTED_HEADING_TO_README_BRAND
     if extras is None:
@@ -1768,9 +1770,13 @@ def readme_headline_counts_summary(readme, supported, heading_map=None, extras=N
         "headline: - **%d validated devices. %s brands. One server.** %s." % (devices, word_shown, listed),
         "README.md now: %s" % (m.group(0).strip() if m else "(headline not found)"),
     ]
-    unmapped = [h for h in SUPPORTED_VENDOR_HEADING_RE.findall(supported) if h not in heading_map]
-    for h in dict.fromkeys(unmapped):
+    headings = SUPPORTED_VENDOR_HEADING_RE.findall(supported)
+    for h in dict.fromkeys(h for h in headings if h not in heading_map):
         lines.append("unmapped heading '### %s': add it to SUPPORTED_HEADING_TO_README_BRAND and to the README list" % h)
+    for h in heading_map:
+        if h not in headings:
+            lines.append("stale map entry '### %s': SUPPORTED-DRIVERS.md has no such heading; remove or rename it in "
+                         "SUPPORTED_HEADING_TO_README_BRAND (check 15 fails on it)" % h)
     return lines
 
 
@@ -2322,6 +2328,10 @@ def self_test():
         hl_map, hl_extras)
     check("counts: a heading with no map entry is named, not silently dropped from the list",
           lines[1] == "brands: 4 (Four)" and any("unmapped heading '### Delta'" in x for x in lines))
+    lines = readme_headline_counts_summary(hl_readme, hl_supported, dict(hl_map, Epsilon="Epsilon"), hl_extras)
+    check("counts: a map entry whose heading is gone is named, and its brand is not suggested (review of #694)",
+          lines[1] == "brands: 4 (Four)" and "Epsilon" not in lines[3]
+          and any(x.startswith("stale map entry '### Epsilon'") for x in lines))
     lines = readme_headline_counts_summary("- **Other.** text\n", hl_supported, hl_map, hl_extras)
     check("counts: with no README headline the list is the map's own order and the current line is reported missing",
           lines[2] == "brand list: Alpha, Beta, DSLRs (via libgphoto2), Gamma (Alpha plugin)"
