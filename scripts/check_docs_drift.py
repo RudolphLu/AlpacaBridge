@@ -960,7 +960,8 @@ def check_agents_md_paths_exist(root=ROOT):
     failures.extend(context_failures)
     # README.md carries no path spans today, so the floor is 0 like CONTEXT.md;
     # the file itself must exist. Its relative links are the instruction-
-    # structure check's job (MIN_README_RELATIVE_LINKS there), issue #693.
+    # structure check's job (ROOT_DOCUMENT_LINK_FLOORS['README.md'] in
+    # scripts/check_instruction_structure.py), issue #693.
     readme_failures, _ = _check_doc_path_refs("README.md", 0, "README.md floor", root=root)
     failures.extend(readme_failures)
     instruction_dir = root / ".github/instructions"
