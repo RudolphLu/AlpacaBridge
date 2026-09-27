@@ -16,18 +16,18 @@ MIN_LINKED_DOCUMENTS = 20
 # nothing and still clear MIN_LINKED_DOCUMENTS. Tripwire, not a target count.
 MIN_SKILL_DOCUMENTS = 5
 # Root documents scanned by name (issue #693), each with a floor on its DISTINCT
-# relative link/src targets: README.md is the most-read file in the repo and
-# names 5 distinct targets today (LICENSE, CHANGELOG.md, SUPPORTED-DRIVERS.md,
-# docs/development.md, docs/image/ab.png); SUPPORTED-DRIVERS.md links every
-# validated model to its ConformU report directory (about 90 distinct targets).
-# Distinct, not occurrences: three links to one file are one target, so a
-# regression that drops every link to that file cannot hide behind repeats. A
-# count below the floor means the extractor regressed or the file was gutted.
-# Tripwires, not target counts, each set one link below today's count so a
-# single deliberate removal is not misdiagnosed as a regression: lower one if
-# a file legitimately loses more. CHANGELOG.md has 3 distinct targets today
-# (the logo and the component READMEs) and a floor of 2 so a gutted or deleted
-# CHANGELOG.md is a finding like the other two.
+# relative link/src targets. Distinct, not occurrences: three links to one file
+# are one target, so a regression that drops every link to that file cannot
+# hide behind repeats. Every floor is a tripwire for a gutted or deleted file
+# or a dead extractor, never a target count; a single broken link is its own
+# finding regardless of the floor. The two small files (README.md: the logo,
+# LICENSE, CHANGELOG.md, SUPPORTED-DRIVERS.md, docs/development.md;
+# CHANGELOG.md: the logo and the component READMEs) sit one link below today's
+# count so one deliberate removal is not misdiagnosed as a regression. The
+# driver matrix's floor is deliberately far below its count: its links are one
+# per validated model, rows come and go with validation work, and the floor
+# only has to catch the file being emptied, so do not raise it row by row.
+# Lower a floor only when a file legitimately loses links.
 ROOT_DOCUMENT_LINK_FLOORS = {'README.md': 4, 'SUPPORTED-DRIVERS.md': 40, 'CHANGELOG.md': 2}
 # A Markdown link target may contain one level of balanced parentheses
 # (`AlpacaCore/conformu/ZWO/ASIair%20Plus%20(Pi%20CM4)/`); a plain `[^)]+`
