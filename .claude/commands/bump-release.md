@@ -71,6 +71,11 @@ Today's date in `YYYY-MM-DD` (UTC is fine). Then:
    SQM-LE item, a sensor read through the WeeWX driver with no row of its own). A heading the map
    does not know fails the gate, and `--counts` names it as `unmapped heading`, so a new brand needs
    its README item and a map entry together. Fix what the check reports rather than working around it.
+5. `SUPPORTED-DRIVERS.md` line 5: `## Updated YYYY-MM-DD` → today's date. Every release re-verifies
+   the file (Step 2.4 recounts from it), and check 16 (issue #692) fails when the line is older than
+   the README badge date, so this is not optional: it read 2026-09-24 on the 2026-09-27 release.
+   Between releases `/conformu` and `/commit` move it forward; it may run ahead of the badge, never
+   behind.
 
 Verify with `python3 scripts/check_docs_drift.py` before moving on.
 

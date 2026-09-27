@@ -14,6 +14,12 @@ MIN_LINKED_DOCUMENTS = 20
 # inside the aggregate floor's margin, so a renamed `.claude/skills` would scan
 # nothing and still clear MIN_LINKED_DOCUMENTS. Tripwire, not a target count.
 MIN_SKILL_DOCUMENTS = 5
+# README.md is scanned by name (issue #693) and is the most-read file in the
+# repo; it carries 9 relative link/src targets today (LICENSE, CHANGELOG.md,
+# SUPPORTED-DRIVERS.md, docs/development.md, docs/image/ab.png). A count below
+# this means the link extractor regressed or the file was gutted. Tripwire, not
+# a target count: lower it if the README legitimately loses links.
+MIN_README_RELATIVE_LINKS = 5
 
 
 def matches(path, pattern):
@@ -78,7 +84,7 @@ def check(root=ROOT):
                 '%s: HTTP startup is not covered' % name)
     # Resolve relocated Markdown links relative to their actual owning files.
     documents = canonical + [root / 'docs/agent-instructions.md', root / 'CONTEXT.md',
-                             root / 'docs/architecture.md']
+                             root / 'docs/architecture.md', root / 'README.md']
     documents += list((root / 'docs/failures').glob('*.md'))
     documents += list((root / 'docs/decisions').glob('*.md'))
     skill_documents = [path for path in (root / '.claude/skills').rglob('*.md') if path.is_file()]
@@ -90,13 +96,23 @@ def check(root=ROOT):
     require(len(documents) >= MIN_LINKED_DOCUMENTS,
             'only %d Markdown document(s) found for the link check (floor %d): a document '
             'directory was renamed or a glob regressed' % (len(documents), MIN_LINKED_DOCUMENTS))
+    readme_relative_links = 0
     for path in documents:
-        for target in re.findall(r'\]\(([^\s)]+)\)', path.read_text(encoding="utf-8", errors="replace")):
+        # Markdown links plus HTML src attributes: the README and the driver
+        # matrix embed the logo as `<img src="docs/image/ab.png">` (issue #693).
+        text = path.read_text(encoding="utf-8", errors="replace")
+        targets = re.findall(r'\]\(([^\s)]+)\)', text) + re.findall(r'\bsrc="([^"\s]+)"', text)
+        for target in targets:
             if target.startswith(('#', 'http:', 'https:', 'mailto:')):
                 continue
+            if path.name == 'README.md' and path.parent == root:
+                readme_relative_links += 1
             file = target.split('#', 1)[0]
             require((path.parent / file).exists(), '%s: broken relative link %s'
                     % (path.relative_to(root).as_posix(), target))
+    require(readme_relative_links >= MIN_README_RELATIVE_LINKS,
+            'only %d relative link/src target(s) found in README.md (floor %d): the file is missing, '
+            'was gutted, or the link extractor regressed' % (readme_relative_links, MIN_README_RELATIVE_LINKS))
     return failures
 
 
@@ -113,7 +129,7 @@ def self_test():
                           'AlpacaCore/include/alpacacore/vendor', 'AlpacaCore/tests',
                           '.claude/skills'):
             shutil.copytree(ROOT / directory, root / directory)
-        for file in ('CLAUDE.md', 'AGENTS.md', 'CONTEXT.md'):
+        for file in ('CLAUDE.md', 'AGENTS.md', 'CONTEXT.md', 'README.md'):
             shutil.copy(ROOT / file, root / file)
         # Link targets outside the small fixture are intentionally absent; compare
         # new diagnostics against the fixture baseline instead of hiding failures.
@@ -148,6 +164,22 @@ def self_test():
             page.write_text(original)
             assert any(name in f and 'missing-target.md' in f for f in new_findings), \
                 'A broken link in %s escaped the link check' % name
+        # README.md (issue #693): a broken Markdown link and a broken <img src>
+        # are each reported, and a README with no relative targets trips its
+        # own floor instead of scanning nothing.
+        page = root / 'README.md'
+        original = page.read_text(encoding="utf-8", errors="replace")
+        page.write_text(original + '\n[gone](missing-target.md)\n<img src="docs/image/missing.png" alt="x">\n')
+        new_findings = set(check(root)) - baseline
+        assert any('README.md' in f and 'missing-target.md' in f for f in new_findings), \
+            'A broken Markdown link in README.md escaped the link check'
+        assert any('README.md' in f and 'docs/image/missing.png' in f for f in new_findings), \
+            'A broken <img src> in README.md escaped the link check'
+        page.write_text('# gutted\n')
+        new_findings = set(check(root)) - baseline
+        page.write_text(original)
+        assert any('README.md' in f and 'floor' in f for f in new_findings), \
+            'A README.md with no relative links escaped MIN_README_RELATIVE_LINKS'
         # A renamed skills tree loses ~10 documents, which fits inside the
         # aggregate floor's margin: only the per-source floor catches it.
         skills = root / '.claude/skills'
@@ -162,7 +194,7 @@ def self_test():
         root = Path(tmp)
         (root / 'AlpacaCore/src/vendors').mkdir(parents=True)
         assert any('floor' in f for f in check(root)), 'An empty documents set escaped the floor'
-    print('Instruction structure: glob assertions, 4 negative fixtures, link path and 2 floors passed')
+    print('Instruction structure: glob assertions, 4 negative fixtures, link path, README links and 3 floors passed')
 
 
 if __name__ == '__main__':

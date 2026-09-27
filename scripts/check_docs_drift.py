@@ -44,7 +44,8 @@ Checks:
      production's cancel skips the per-handle mutex so it can interrupt a
      download blocked on the same handle) -- and the forward sweep in
      test_qhy_fake_sdk.cpp drives all of them.
-  7. Every relative path referenced in AGENTS.md, CONTEXT.md, scoped instructions,
+  7. Every relative path referenced in AGENTS.md, CONTEXT.md, README.md (issue
+     #693: the most-read file in the repo was in no scan), scoped instructions,
      docs/agents/ agent-skills config, .claude/skills/ Claude skills, and
      docs/failures/ and docs/decisions/
      inline code spans (`` `AlpacaCore/...` ``, `` `scripts/...` ``,
@@ -121,6 +122,17 @@ Checks:
      feed's sqm fields; it has no row or heading of its own). Only check 4 gated
      the README, and it compares the version badge alone, so the headline
      was three releases stale at 4.0.0 and moved by hand again at 4.1.0.
+     Parse failures name the real cause (issue #690): a declared brand item
+     that contains a comma is consumed whole before the list is split, and a
+     multi-word brand count ("Twenty One") reaches the number-word message
+     instead of failing the headline regex as "headline not found".
+ 16. The hand-maintained `## Updated YYYY-MM-DD` line in SUPPORTED-DRIVERS.md
+     is a real date no older than the README badge's release date (issue
+     #692). It read 2026-09-24 on the 2026-09-27 release. Every release
+     re-verifies the file (Step 2.4 recounts from it), so /bump-release sets
+     the line to the release date and this gate holds it there; between
+     releases it may run ahead (/conformu and /commit bump it) but never
+     behind. Pure, so it runs in pre-flight; no git state is consulted.
 """
 
 import glob
@@ -946,6 +958,11 @@ def check_agents_md_paths_exist(root=ROOT):
     failures, _ = _check_doc_path_refs("AGENTS.md", MIN_AGENTS_MD_PATH_REFS, "MIN_AGENTS_MD_PATH_REFS", root=root)
     context_failures, _ = _check_doc_path_refs("CONTEXT.md", 0, "CONTEXT.md floor", root=root)
     failures.extend(context_failures)
+    # README.md carries no path spans today, so the floor is 0 like CONTEXT.md;
+    # the file itself must exist. Its relative links are the instruction-
+    # structure check's job (MIN_README_RELATIVE_LINKS there), issue #693.
+    readme_failures, _ = _check_doc_path_refs("README.md", 0, "README.md floor", root=root)
+    failures.extend(readme_failures)
     instruction_dir = root / ".github/instructions"
     files = sorted(instruction_dir.glob("*.instructions.md"))
     tracked = _run_git(["-c", "core.quotePath=false", "ls-files", ":(glob).github/instructions/*.instructions.md"], root=root).stdout.splitlines()
@@ -1558,7 +1575,7 @@ SUPPORTED_HEADING_TO_README_BRAND = {
     "Astroasis": "Astroasis",
     "Celestron": "Celestron",
     "Gemini": "Gemini",
-    "GPhoto": "Canon and Nikon DSLRs (via libgphoto2)",
+    "GPhoto": "Canon and Nikon DSLRs",  # no library name in user-facing text since 4.1.0 (issue #691)
     "iOptron": "iOptron",
     "OnStep": "OnStep",
     "Player One": "Player One Astronomy",
@@ -1583,8 +1600,12 @@ README_BRANDS_WITHOUT_HEADING = {
         "of its own in SUPPORTED-DRIVERS.md, and the WeeWX table's only row is the feed itself"),
 }
 
+# The brand-count group admits spaces on purpose (issue #690): a multi-word
+# count ("Twenty One brands") used to fail the whole regex and the gate said
+# "could not find the headline" instead of naming the count; now the line is
+# found and _number_word_to_int rejects the word with the specific message.
 README_HEADLINE_RE = re.compile(
-    r"^- \*\*(\d+) validated devices\. ([A-Za-z-]+) brands\. One server\.\*\* (.+?)\.?\s*$",
+    r"^- \*\*(\d+) validated devices\. ([A-Za-z][A-Za-z -]*) brands\. One server\.\*\* (.+?)\.?\s*$",
     re.MULTILINE,
 )
 # Every `### ` heading in SUPPORTED-DRIVERS.md is a vendor today, and this treats
@@ -1601,13 +1622,18 @@ _TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eigh
 
 
 def _number_word_to_int(word):
-    """'Fifteen' -> 15, 'twenty-one' -> 21; None when it is not a number word."""
+    """'Fifteen' -> 15, 'twenty-one' -> 21; None when it is not a number word.
+    Exactly the forms _int_to_number_word emits: a dangling hyphen ('twenty-')
+    and a spaced compound ('twenty one') are rejected, not rounded (#690)."""
     w = word.strip().lower()
     if w in _ONES:
         return _ONES.index(w)
-    tens, _, ones = w.partition("-")
-    if tens in _TENS[2:] and (ones == "" or ones in _ONES[1:10]):
-        return _TENS.index(tens) * 10 + (_ONES.index(ones) if ones else 0)
+    tens, sep, ones = w.partition("-")
+    if tens in _TENS[2:]:
+        if not sep:
+            return _TENS.index(tens) * 10
+        if ones in _ONES[1:10]:
+            return _TENS.index(tens) * 10 + _ONES.index(ones)
     return None
 
 
@@ -1639,16 +1665,39 @@ def _int_to_number_word(n):
     return _TENS[tens] + ("-" + _ONES[ones] if ones else "")
 
 
-def _split_readme_brand_list(text):
-    """Split on commas only. A brand item that itself contains a comma (a future
-    "Canon, Nikon and Sony DSLRs (via libgphoto2)") would become two items and
-    the gate would report a brand-word mismatch plus two unaccounted items, not
-    the real cause; word such an item without a comma ("Canon, Nikon and Sony"
-    -> "Canon/Nikon/Sony") if that day comes."""
-    items = [i.strip() for i in text.split(",")]
-    items = [i for i in items if i]
-    if items and items[-1].lower().startswith("and "):
-        items[-1] = items[-1][4:].strip()
+def _split_readme_brand_list(text, declared=()):
+    """Split the README brand list on commas, consuming a DECLARED item whole
+    even when it contains a comma (issue #690). `declared` is the set of brand
+    strings the gate accounts for (the map's values plus the no-heading table):
+    at each position the longest run of comma-separated tokens that spells a
+    declared item is taken as one item, so a future "Canon, Nikon and Sony
+    DSLRs" is one brand and not two unaccounted ones plus a brand-word
+    mismatch. An undeclared item with a comma still splits, and each half is
+    then reported as unaccounted, which points at the item itself. The "and "
+    that introduces the last item is stripped from the last item only."""
+    tokens = [t.strip() for t in text.split(",")]
+    tokens = [t for t in tokens if t]
+    declared = set(declared)
+
+    def candidate(run, is_last):
+        item = ", ".join(run)
+        if is_last and item.lower().startswith("and "):
+            item = item[4:].strip()
+        return item
+
+    items = []
+    i = 0
+    while i < len(tokens):
+        taken = None
+        for j in range(len(tokens), i + 1, -1):  # longest run first, single token last
+            item = candidate(tokens[i:j], j == len(tokens))
+            if item in declared:
+                taken = (item, j)
+                break
+        if taken is None:
+            taken = (candidate(tokens[i:i + 1], i + 1 == len(tokens)), i + 1)
+        items.append(taken[0])
+        i = taken[1]
     return items
 
 
@@ -1665,7 +1714,7 @@ def _readme_headline_findings(readme, supported, heading_map=None, extras=None):
         return ["could not find the '- **N validated devices. <Word> brands. One server.** ...' headline in README.md"]
     readme_devices = int(m.group(1))
     brand_word = m.group(2)
-    items = _split_readme_brand_list(m.group(3))
+    items = _split_readme_brand_list(m.group(3), set(heading_map.values()) | set(extras))
 
     expected_devices = count_validated_device_rows(supported)
     if expected_devices == 0:
@@ -1677,8 +1726,8 @@ def _readme_headline_findings(readme, supported, heading_map=None, extras=None):
 
     brand_count = _number_word_to_int(brand_word)
     if brand_count is None:
-        failures.append("README.md brand count %r is not a number word this check knows (spell it out, e.g. 'Fifteen')"
-                        % brand_word)
+        failures.append("README.md brand count %r is not a number word this check knows (spell it as one word or "
+                        "hyphenated, e.g. 'Fifteen' or 'Twenty-one')" % brand_word)
     elif brand_count != len(items):
         failures.append("README.md says %s (%d) brands but its brand list has %d items"
                         % (brand_word, brand_count, len(items)))
@@ -1755,7 +1804,7 @@ def readme_headline_counts_summary(readme, supported, heading_map=None, extras=N
     devices = count_validated_device_rows(supported)
     expected = _expected_readme_brands(supported, heading_map, extras)
     m = README_HEADLINE_RE.search(readme)
-    current = [i for i in _split_readme_brand_list(m.group(3)) if i in expected] if m else []
+    current = [i for i in _split_readme_brand_list(m.group(3), expected) if i in expected] if m else []
     ordered = current + [b for b in expected if b not in current]
     word = _int_to_number_word(len(ordered))
     word_shown = word.capitalize() if word else "%d (no number word for this count)" % len(ordered)
@@ -1787,6 +1836,49 @@ def print_counts(root=ROOT):
 
 
 
+# --- check 16: SUPPORTED-DRIVERS.md Updated date vs README release date (#692)
+
+SUPPORTED_UPDATED_RE = re.compile(r"^## Updated (\S+)\s*$", re.MULTILINE)
+README_BADGE_DATE_RE = re.compile(r"^####\s*\[[0-9.]+\]\s*-\s*(\S+)\s*&middot;\s*\[Changelog\]", re.MULTILINE)
+
+
+def _iso_date(text):
+    """datetime.date for a YYYY-MM-DD string, None for anything else."""
+    import datetime
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return None
+    try:
+        return datetime.date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _updated_date_findings(supported, readme):
+    """Check 16 over the two files' text. Pure, so --self-test can drive it."""
+    failures = []
+    m = SUPPORTED_UPDATED_RE.search(supported)
+    if not m:
+        return ["could not find the '## Updated YYYY-MM-DD' line in SUPPORTED-DRIVERS.md"]
+    updated = _iso_date(m.group(1))
+    if updated is None:
+        failures.append("SUPPORTED-DRIVERS.md '## Updated %s' is not a YYYY-MM-DD date" % m.group(1))
+    b = README_BADGE_DATE_RE.search(readme)
+    if not b:
+        failures.append("could not find the release date in the README.md version badge line")
+        return failures
+    released = _iso_date(b.group(1))
+    if released is None:
+        failures.append("README.md badge date %r is not a YYYY-MM-DD date" % b.group(1))
+    elif updated is not None and updated < released:
+        failures.append("SUPPORTED-DRIVERS.md says '## Updated %s' but README.md was released %s: set the Updated "
+                        "line to the release date (/bump-release Step 2.5) or later" % (m.group(1), b.group(1)))
+    return failures
+
+
+def check_supported_drivers_updated_date(root=ROOT):
+    return _updated_date_findings(read("SUPPORTED-DRIVERS.md", root), read("README.md", root))
+
+
 CHECKS = [
     ("Instruction discovery and Claude adapters", check_instruction_structure),
     ("CMake options documented in docs/development.md", check_cmake_options_documented),
@@ -1804,6 +1896,7 @@ CHECKS = [
     ("Fake-connectable roster matches the fakes on disk", check_fake_roster_matches_disk),
     ("Every std::regex in router.cpp is built once (static)", check_router_regexes_static),
     ("README headline counts match SUPPORTED-DRIVERS.md", check_readme_headline_counts),
+    ("SUPPORTED-DRIVERS.md Updated date is not behind the README release date", check_supported_drivers_updated_date),
 ]
 
 
@@ -2057,6 +2150,7 @@ def self_test():
         files = {
             "AGENTS.md": "".join("See `scripts/f%d.py`.\n" % (i % MIN_MEMORY_COMMENT_FILES) for i in range(MIN_AGENTS_MD_PATH_REFS + 2)),
             "CONTEXT.md": "# Context\n",
+            "README.md": "# Readme\n",
             ".github/instructions/a.instructions.md": "# a\n",
             ".claude/skills/s/SKILL.md": "# s\n",
             ".gitignore": "scripts/gen/\n",
@@ -2124,6 +2218,20 @@ def self_test():
             found = run_check(nocontext)
             check("agents md check: a missing CONTEXT.md is reported",
                   found is not None and any("CONTEXT.md" in f and "does not exist" in f for f in found))
+
+            # README.md is scanned by name too (issue #693): a drifted span and
+            # a missing file are each a finding, like CONTEXT.md.
+            readme = repo_fixture("readme")
+            with open(readme / "README.md", "a", encoding="utf-8") as f:
+                f.write("See `scripts/readme_nope.py`.\n")
+            found = run_check(readme)
+            check("agents md check: a drifted span in README.md is reported",
+                  found is not None and any("README.md" in f and "scripts/readme_nope.py" in f for f in found))
+            noreadme = repo_fixture("noreadme")
+            (noreadme / "README.md").unlink()
+            found = run_check(noreadme)
+            check("agents md check: a missing README.md is reported",
+                  found is not None and any("README.md" in f and "does not exist" in f for f in found))
 
             gone = repo_fixture("gone")
             (gone / ".github/instructions/a.instructions.md").unlink()
@@ -2336,6 +2444,47 @@ def self_test():
     check("counts: with no README headline the list is the map's own order and the current line is reported missing",
           lines[2] == "brand list: Alpha, Beta, DSLRs (via libgphoto2), Gamma (Alpha plugin)"
           and lines[4] == "README.md now: (headline not found)")
+    # issue #690: parse failures name the real cause.
+    f = _readme_headline_findings(sub(hl_readme, "Four brands", "Twenty One brands"), hl_supported, hl_map, hl_extras)
+    check("readme headline: a multi-word brand count reaches the number-word message, not 'headline not found'",
+          len(f) == 1 and "'Twenty One' is not a number word" in f[0])
+    check("readme headline: a dangling hyphen ('twenty-') and a spaced compound are rejected, not rounded",
+          _number_word_to_int("twenty-") is None and _number_word_to_int("twenty one") is None
+          and _number_word_to_int("twenty") == 20)
+    comma_map = dict(hl_map, GPhoto="Canon, Nikon and Sony DSLRs")
+    comma_readme = sub(hl_readme, "DSLRs (via libgphoto2)", "Canon, Nikon and Sony DSLRs")
+    check("readme headline: a declared brand item containing a comma is one item, not two unaccounted ones",
+          _readme_headline_findings(comma_readme, hl_supported, comma_map, hl_extras) == [])
+    check("readme headline: a declared comma item as the LAST entry (after 'and') is still consumed whole",
+          _split_readme_brand_list("Alpha, and Canon, Nikon and Sony DSLRs", {"Alpha", "Canon, Nikon and Sony DSLRs"})
+          == ["Alpha", "Canon, Nikon and Sony DSLRs"])
+    f = _readme_headline_findings(comma_readme, hl_supported, hl_map, hl_extras)
+    check("readme headline: an UNDECLARED comma item splits and each half is reported as unaccounted",
+          any("'Canon' matches no" in x for x in f) and any("'Nikon and Sony DSLRs' matches no" in x for x in f))
+    lines = readme_headline_counts_summary(comma_readme, hl_supported, comma_map, hl_extras)
+    check("counts: the summary keeps a declared comma item whole in the paste-ready headline",
+          lines[1] == "brands: 4 (Four)" and "Canon, Nikon and Sony DSLRs" in lines[3])
+
+    # check 16: SUPPORTED-DRIVERS.md Updated date vs README badge date (issue #692).
+    ud_supported = "# Supported\n\n## Updated 2026-09-27\nintro\n"
+    ud_readme = "#### [4.1.0] - 2026-09-27 &middot; [Changelog](CHANGELOG.md)\n"
+    check("updated date: an Updated line equal to the release date is clean",
+          _updated_date_findings(ud_supported, ud_readme) == [])
+    check("updated date: an Updated line after the release date is clean",
+          _updated_date_findings(ud_supported.replace("09-27", "10-02"), ud_readme) == [])
+    f = _updated_date_findings(ud_supported.replace("09-27", "09-24"), ud_readme)
+    check("updated date: an Updated line behind the release date is flagged with both dates",
+          len(f) == 1 and "Updated 2026-09-24" in f[0] and "released 2026-09-27" in f[0])
+    f = _updated_date_findings(ud_supported.replace("2026-09-27", "2026-13-40"), ud_readme)
+    check("updated date: a non-date Updated value is flagged",
+          len(f) == 1 and "not a YYYY-MM-DD date" in f[0])
+    f = _updated_date_findings("# Supported\nintro\n", ud_readme)
+    check("updated date: a missing Updated line is flagged",
+          len(f) == 1 and "could not find the '## Updated" in f[0])
+    f = _updated_date_findings(ud_supported, "# no badge\n")
+    check("updated date: a missing README badge is flagged rather than passing vacuously",
+          len(f) == 1 and "release date in the README.md version badge" in f[0])
+
     from check_instruction_structure import self_test as instruction_self_test
     instruction_self_test()
 
