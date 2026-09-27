@@ -1472,6 +1472,8 @@ void Router::set_host_clock_hooks(alpacacore::util::HostClock::IsSynchronizedFn 
     host_clock_.set_hooks(std::move(is_synchronized), std::move(set_time), std::move(has_rtc));
 }
 
+void Router::set_now_fn(NowFn now_fn) { now_fn_ = std::move(now_fn); }
+
 void Router::set_shutdown_callback(std::function<void()> callback) {
     shutdown_callback_ = callback;
 }
@@ -7254,6 +7256,11 @@ std::optional<Response> reject_cross_origin_request(const Request& request, std:
 
 }  // namespace
 
+namespace {
+constexpr std::int64_t kMinEpoch = 946684800;   // 2000-01-01T00:00:00Z
+constexpr std::int64_t kMaxEpoch = 4102444800;  // 2100-01-01T00:00:00Z
+}  // namespace
+
 Response Router::handle_sync_time(const Request& request, std::uint32_t server_tx_id) {
     // Note: like the restart/shutdown management endpoints, this is
     // intentionally unauthenticated — the web UI is served on the LAN and the
@@ -7283,10 +7290,18 @@ Response Router::handle_sync_time(const Request& request, std::uint32_t server_t
     // anything — the web UI polls this to display a live server clock and to
     // detect drift against the browser's clock.
     if (request.method() == HttpMethod::GET) {
+        const auto now_seconds = static_cast<std::int64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(now_fn_().time_since_epoch()).count());
+        // open-astro#670: report a clock POST would refuse to set as an error,
+        // not as a Value the UI would render as a year-1970 or year-2100+ time.
+        if (now_seconds < kMinEpoch || now_seconds > kMaxEpoch) {
+            response.set_body(make_error_response(
+                client_tx_id, server_tx_id, util::ErrorCode::INVALID_OPERATION,
+                "Host clock is outside 2000-01-01..2100-01-01 UTC; set the time with POST /management/v1/synctime."));
+            return response;
+        }
         AlpacaResponse alpaca_response(client_tx_id, server_tx_id);
-        alpaca_response.value = static_cast<std::int64_t>(
-            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
-                .count());
+        alpaca_response.value = now_seconds;
         response.set_body(alpaca_response);
         return response;
     }
@@ -7324,8 +7339,6 @@ Response Router::handle_sync_time(const Request& request, std::uint32_t server_t
     // Sanity range: 2000-01-01 .. 2100-01-01 UTC. Reject anything outside —
     // a bogus value (or a clock reset) would break Alpaca timestamps worse
     // than not syncing at all.
-    constexpr std::int64_t kMinEpoch = 946684800;   // 2000-01-01T00:00:00Z
-    constexpr std::int64_t kMaxEpoch = 4102444800;  // 2100-01-01T00:00:00Z
     if (epoch_seconds < kMinEpoch || epoch_seconds > kMaxEpoch) {
         AlpacaResponse alpaca_response =
             make_error_response(client_tx_id, server_tx_id, util::ErrorCode::INVALID_VALUE,

@@ -209,7 +209,8 @@ has no NTP, so the client's clock becomes the time source:
 
 - `GET /management/v1/synctime` — `Value` = the server's current Unix epoch
   (seconds, UTC). Poll it to show a live server clock or detect drift
-  against the client's clock.
+  against the client's clock. Outside the sanity range 2000-01-01..2100-01-01
+  UTC it answers ErrorCode `INVALID_OPERATION` with no `Value` field.
 - `POST/PUT /management/v1/synctime` with `{"Epoch": 1786298276}` (or
   `{"Value": …}`) — sets the SBC's system clock. Rejected outside the
   sanity range 2000-01-01..2100-01-01 UTC. Send the client's epoch captured

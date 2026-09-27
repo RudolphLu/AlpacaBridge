@@ -5127,6 +5127,34 @@ int main() {
         EXPECT(get_json["Value"].is_number_integer());
         EXPECT(get_json["Value"].get<std::int64_t>() > 1600000000);  // after 2020-09
 
+        // open-astro#670: GET answers through the NowFn seam and refuses a
+        // host clock outside the range POST accepts.
+        {
+            const auto at = [&](std::int64_t secs) {
+                router.set_now_fn([secs] { return std::chrono::system_clock::time_point(std::chrono::seconds(secs)); });
+                return nlohmann::json::parse(route_request(router, "GET", "/management/v1/synctime").body(), nullptr,
+                                             false);
+            };
+            const auto ok = at(1790467200);  // 2026-09-27T00:00:00Z
+            EXPECT(!ok.is_discarded() && ok.value("ErrorNumber", -1) == 0);
+            EXPECT(ok["Value"].get<std::int64_t>() == 1790467200);
+            for (const std::int64_t bad : {std::int64_t{10}, std::int64_t{4102444801}}) {
+                const auto j = at(bad);
+                EXPECT(!j.is_discarded());
+                EXPECT(j.value("ErrorNumber", 0) == static_cast<int>(alpacacore::AlpacaError::InvalidOperation));
+                EXPECT(j.value("ErrorMessage", "") ==
+                       "Host clock is outside 2000-01-01..2100-01-01 UTC; set the time with POST "
+                       "/management/v1/synctime.");
+                EXPECT(!j.contains("Value"));
+            }
+            for (const std::int64_t edge : {std::int64_t{946684800}, std::int64_t{4102444800}}) {
+                const auto j = at(edge);
+                EXPECT(j.value("ErrorNumber", -1) == 0);
+                EXPECT(j["Value"].get<std::int64_t>() == edge);
+            }
+            router.set_now_fn([] { return std::chrono::system_clock::now(); });
+        }
+
         // Out-of-range epochs are rejected without setting the clock. The
         // status check is not redundant with ErrorNumber: a 403 from the
         // cross-origin guard (issue #298) also carries a non-zero

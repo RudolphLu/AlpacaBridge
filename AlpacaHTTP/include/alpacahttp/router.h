@@ -105,6 +105,11 @@ public:
         alpacacore::util::HostClock::IsSynchronizedFn is_synchronized, alpacacore::util::HostClock::SetTimeFn set_time,
         alpacacore::util::HostClock::HasRtcFn has_rtc = [] { return false; });
 
+    // open-astro#670: test seam for the wall clock GET /management/v1/synctime
+    // reports. Production never sets it; the default is system_clock::now.
+    using NowFn = std::function<std::chrono::system_clock::time_point()>;
+    void set_now_fn(NowFn now_fn);
+
     // open-astro#314: re-run the hardware-RTC probe and cache the answer.
     // Called from the server's RTC probe thread, never from a request path
     // and never from the reactor: the
@@ -430,6 +435,7 @@ private:
     // const-propagation, which a unique_ptr silently drops: a const Router
     // method could reach a non-const HostClock through the pointer.
     alpacacore::util::HostClock host_clock_;
+    NowFn now_fn_ = [] { return std::chrono::system_clock::now(); };
 };
 
 } // namespace alpacahttp
