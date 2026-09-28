@@ -2,10 +2,12 @@
 """Layering gate: no new vendor headers in AlpacaHTTP or the catalog schema files.
 
 ADR 0004 (device-catalog) moves per-vendor knowledge out of AlpacaHTTP into
-vendor descriptors. AlpacaHTTP/src/http/router.cpp still includes 40
-`alpacacore/vendor/...` headers; each descriptor slice deletes some. Nothing
-counted them, so a PR could add a 41st, or a slice could forget to delete its
-includes, with no signal. The catalog schema files must include none, ever.
+vendor descriptors. AlpacaHTTP/src/http/router.cpp still includes
+`alpacacore/vendor/...` headers up to this file's
+MAX_ALPACAHTTP_VENDOR_INCLUDES baseline; each descriptor slice deletes some and
+lowers the baseline. Nothing counted them, so a PR could add one more, or a
+slice could forget to delete its includes, with no signal. The catalog schema
+files must include none, ever.
 
 Rules (baselines are the constants below, lowered by the PR that deletes the
 includes, never raised):
@@ -37,7 +39,7 @@ SOURCE_GLOBS = ("*.cpp", "*.h", "*.hpp")
 # Lowered by each vendor descriptor slice of ADR 0004 in the PR that deletes
 # that vendor's includes from AlpacaHTTP/src/http/router.cpp; the last slice
 # sets it to 0. Never raise it.
-MAX_ALPACAHTTP_VENDOR_INCLUDES = 40
+MAX_ALPACAHTTP_VENDOR_INCLUDES = 39
 # ADR 0004: <vendor>_schema.cpp compiles in every build and includes no vendor
 # header. Never rises.
 MAX_CATALOG_SCHEMA_VENDOR_INCLUDES = 0

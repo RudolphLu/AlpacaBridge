@@ -51,6 +51,8 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include "../core/catalog_json.h"
 #ifdef ALPACACORE_ENABLE_IOPTRON
 #include <alpacacore/vendor/ioptron/ioptron_filterwheel_driver.h>
 #include <alpacacore/vendor/ioptron/ioptron_ieaf_focuser_driver.h>
@@ -89,9 +91,6 @@
 #include <alpacacore/vendor/gemini/gemini_flatpanel_driver.h>
 #include <alpacacore/vendor/gemini/gemini_focuser_driver.h>
 #include <alpacacore/vendor/gemini/gemini_pdh_switch_driver.h>
-#endif
-#ifdef ALPACACORE_ENABLE_ASTROASIS
-#include <alpacacore/vendor/astroasis/astroasis_focuser_driver.h>
 #endif
 #ifdef ALPACACORE_ENABLE_WANDERERASTRO
 #include <alpacacore/vendor/wandererastro/wandererastro_box_switch_driver.h>
@@ -1401,7 +1400,14 @@ std::optional<Response> reject_cross_origin_request(const Request& request, std:
 
 }  // namespace
 
-Router::Router() {
+Router::Router() : Router(CatalogExtension{}) {}
+
+Router::Router(const CatalogExtension& extend_catalog) {
+    alpacacore::catalog::register_builtin_schemas(catalog_);
+    alpacacore::catalog::register_builtin_factories(catalog_);
+    if (extend_catalog) {
+        extend_catalog(catalog_);
+    }
     set_server_info("AlpacaHTTP", "AlpacaHTTP", alpacahttp::kVersion, "", "");
     load_persisted_devices();
 }
@@ -1577,6 +1583,11 @@ RouteMatch Router::parse_route(const std::string& path) {
         match.management_endpoint = "configureddevices";
         return match;
     }
+    if (path == "/management/v1/devicecatalog" || path == "/management/devicecatalog") {
+        match.is_management = true;
+        match.management_endpoint = "devicecatalog";
+        return match;
+    }
     if (path == "/management/v1/configuredevice" || path == "/management/configuredevice") {
         match.is_management = true;
         match.management_endpoint = "configuredevice";
@@ -1687,6 +1698,8 @@ Response Router::handle_management(const Request& request, const RouteMatch& mat
         return handle_build_info(request, server_tx_id);
     } else if (match.management_endpoint == "configureddevices") {
         return handle_configured_devices(request, server_tx_id);
+    } else if (match.management_endpoint == "devicecatalog") {
+        return handle_device_catalog(request, server_tx_id);
     } else if (match.management_endpoint == "configuredevice") {
         return handle_configure_device(request, server_tx_id);
     } else if (match.management_endpoint == "removedevice") {
@@ -6174,6 +6187,38 @@ Response Router::handle_build_info(const Request& request, std::uint32_t server_
     return response;
 }
 
+Response Router::handle_device_catalog(const Request& request, std::uint32_t server_tx_id) {
+    Response response;
+    response.set_content_type("application/json");
+
+    std::uint32_t client_tx_id = 0;
+    if (request.has_query_param("ClientTransactionID")) {
+        client_tx_id = parse_client_transaction_id(request.get_query_param("ClientTransactionID"));
+    }
+
+    if (request.method() != HttpMethod::GET) {
+        AlpacaResponse alpaca_response =
+            make_error_response(client_tx_id, server_tx_id, util::ErrorCode::INVALID_OPERATION,
+                                "Unsupported HTTP method for devicecatalog endpoint");
+        response.set_body(alpaca_response);
+        response.set_status(405, "Method Not Allowed");
+        return response;
+    }
+
+    try {
+        AlpacaResponse alpaca_response(client_tx_id, server_tx_id);
+        alpaca_response.value = catalog_json::describe_json(catalog_);
+        response.set_body(alpaca_response);
+    } catch (const std::exception& e) {
+        util::log_error("Error getting device catalog: " + std::string(e.what()));
+        AlpacaResponse alpaca_response = make_error_response(
+            client_tx_id, server_tx_id, util::exception_to_error_code(e), util::exception_to_error_message(e));
+        response.set_body(alpaca_response);
+    }
+
+    return response;
+}
+
 Response Router::handle_static_file(const Request& request) {
     Response response;
     std::string file_path = request.path();
@@ -7570,6 +7615,27 @@ namespace {
 std::string persisted_device_subject(const std::string& vendor, const std::string& device_type, int device_number) {
     return "Persisted " + vendor + " " + device_type + " " + std::to_string(device_number);
 }
+
+// open-astro#664: the catalog consult in register_device_from_config() below.
+// DeviceCatalog::find_schema is private, so the router can only ask
+// describe() for the DescriptorView of a key.
+std::optional<alpacacore::catalog::DescriptorView> find_descriptor(const alpacacore::catalog::DeviceCatalog& catalog,
+                                                                   const alpacacore::catalog::DeviceKey& key) {
+    for (const auto& view : catalog.describe()) {
+        if (view.key == key) return view;
+    }
+    return std::nullopt;
+}
+
+// "Astroasis Oasis Focuser" -> "Astroasis": the arm text this replaces spelled
+// the vendor as the first word of its display name. Assumption (open-astro#664
+// D1): true for every descriptor except "Player One", whose own slice must
+// either add a Schema::vendor_label or accept the text change.
+std::string vendor_label(const alpacacore::catalog::DescriptorView& view) {
+    const std::string name(view.display_name);
+    const auto space = name.find(' ');
+    return space == std::string::npos ? name : name.substr(0, space);
+}
 }  // namespace
 
 bool Router::reject_invalid_config(ConfigSource source, const char* reason, const std::string& vendor,
@@ -7616,6 +7682,61 @@ bool Router::register_device_from_config(const nlohmann::json& config, std::stri
     }
 
     auto& registry = alpacacore::management::DeviceRegistry::instance();
+
+    // open-astro#664: the catalog is consulted before the arm chain below. A
+    // device_type_str the catalog doesn't recognise (string_to_device_type()
+    // throws) just skips the consult -- the arm chain's final "not yet
+    // supported" message still answers, unchanged. Only that lookup is
+    // guarded: an AlpacaException out of config_from_json below must
+    // propagate like a config_get() failure does today, not be swallowed here.
+    std::optional<alpacacore::DeviceType> device_type_key;
+    try {
+        device_type_key = string_to_device_type(device_type_str);
+    } catch (const std::exception& ex) {
+        // Unknown device_type_str: fall through to the arm chain.
+        util::log_debug("register_device_from_config: device type \"" + device_type_str +
+                        "\" is not catalog-recognized (" + ex.what() + "); falling through to the arm chain");
+    }
+    if (device_type_key) {
+        const alpacacore::catalog::DeviceKey key{vendor, *device_type_key};
+        if (auto view = find_descriptor(catalog_, key)) {
+            const alpacacore::catalog::DeviceConfig typed = catalog_json::config_from_json(config, view->fields);
+            const auto result =
+                catalog_.normalize(key, typed,
+                                   source == ConfigSource::Api ? alpacacore::catalog::Source::Api
+                                                               : alpacacore::catalog::Source::Persisted);
+            if (source == ConfigSource::Api) {
+                if (result.rejection) {
+                    error_message = *result.rejection;
+                    return false;
+                }
+            } else {
+                // ALP-271: distinct from reject_invalid_config()'s "will refuse to
+                // connect" wording below, which is false here -- normalize() has
+                // already substituted a usable value (the field's default, or
+                // unset), so the device is not refusing to connect over this.
+                for (const auto& warning : result.warnings) {
+                    util::log_warning(persisted_device_subject(vendor, device_type_str, device_number) +
+                                      " config normalized: " + warning +
+                                      ". The saved value is not used: the field falls back to its default, or "
+                                      "stays unset if it has none. Registered so it stays listed and editable in "
+                                      "the web UI.");
+                }
+            }
+            if (!view->available) {
+                error_message = vendor_label(*view) + " support not enabled. Rebuild with -D" +
+                                std::string(view->build_option) + "=ON";
+                return false;
+            }
+            auto driver = catalog_.create(key, result.config, device_number);
+            if (registry.register_device(std::shared_ptr<alpacacore::AlpacaDriver>(std::move(driver)))) {
+                util::log_info("Registered " + vendor_label(*view) + " " + device_type_str);
+                return true;
+            }
+            error_message = "Failed to register device. Device may already exist.";
+            return false;
+        }
+    }
 
     if (vendor == "ioptron" && device_type_str == "telescope") {
 #ifdef ALPACACORE_ENABLE_IOPTRON
@@ -9164,31 +9285,6 @@ bool Router::register_device_from_config(const nlohmann::json& config, std::stri
 #endif
     }
 
-    if (vendor == "astroasis" && device_type_str == "focuser") {
-#ifdef ALPACACORE_ENABLE_ASTROASIS
-        std::string hid_path = config_get(config, "hidPath", "");
-
-        std::unique_ptr<alpacacore::FocuserDriver> focuser;
-        if (hid_path.empty()) {
-            int focuser_index = config_get(config, "focuserIndex", 0);
-            focuser = alpacacore::vendor::astroasis::create_astroasis_focuser_by_index(device_number, focuser_index);
-        } else {
-            focuser = alpacacore::vendor::astroasis::create_astroasis_focuser(device_number, hid_path);
-        }
-
-        if (registry.register_device(std::shared_ptr<alpacacore::AlpacaDriver>(std::move(focuser)))) {
-            util::log_info("Registered Astroasis focuser");
-            return true;
-        }
-
-        error_message = "Failed to register device. Device may already exist.";
-        return false;
-#else
-        error_message = "Astroasis support not enabled. Rebuild with -DALPACACORE_ENABLE_ASTROASIS=ON";
-        return false;
-#endif
-    }
-
     if (vendor == "gemini" && device_type_str == "covercalibrator") {
 #ifdef ALPACACORE_ENABLE_GEMINI
         std::string conn_type = config_get(config, "connectionType", "auto");
@@ -9477,6 +9573,34 @@ bool Router::register_device_from_config(const nlohmann::json& config, std::stri
     return false;
 }
 
+namespace {
+// open-astro#664: the catalog-driven half of Router::sanitize_device_config()
+// below. Every declared, non-secret, present-and-non-null field survives;
+// undeclared keys drop. A RecordList recurses element-wise so a nested
+// secret (or undeclared nested key) drops too; type checking a value is
+// DeviceCatalog::normalize's job, not this function's, so a RecordList field
+// holding something other than an array is copied through unexamined.
+nlohmann::json sanitize_fields_json(const nlohmann::json& config,
+                                    std::span<const alpacacore::catalog::FieldRef> fields) {
+    nlohmann::json out = nlohmann::json::object();
+    for (const auto& f : fields) {
+        if (f.role == alpacacore::catalog::Role::Secret) continue;
+        const auto it = config.find(f.key);
+        if (it == config.end() || it->is_null()) continue;
+        if (f.kind == alpacacore::catalog::FieldRef::Kind::RecordList && it->is_array()) {
+            nlohmann::json records = nlohmann::json::array();
+            for (const auto& elem : *it) {
+                records.push_back(elem.is_object() ? sanitize_fields_json(elem, f.record_fields) : elem);
+            }
+            out[f.key] = std::move(records);
+        } else {
+            out[f.key] = *it;
+        }
+    }
+    return out;
+}
+}  // namespace
+
 nlohmann::json Router::sanitize_device_config(const nlohmann::json& config) const {
     nlohmann::json sanitized = nlohmann::json::object();
 
@@ -9492,7 +9616,30 @@ nlohmann::json Router::sanitize_device_config(const nlohmann::json& config) cons
 
     std::string vendor = config_get(config, "vendor", "");
     std::string device_type = config_get(config, "deviceType", "");
-    if (vendor == "ioptron") {
+
+    // open-astro#664: a catalog-registered vendor/type is sanitized from its
+    // descriptor's own field list; the vendor-specific chain below is for
+    // arm-chain vendors only. Either way the vendor-agnostic keys at the end
+    // are kept, as they were through the deleted arm.
+    bool catalog_handled = false;
+    try {
+        const alpacacore::catalog::DeviceKey key{vendor, string_to_device_type(device_type)};
+        if (auto view = find_descriptor(catalog_, key)) {
+            const auto extra = sanitize_fields_json(config, view->fields);
+            for (const auto& [k, v] : extra.items()) {
+                sanitized[k] = v;
+            }
+            catalog_handled = true;
+        }
+    } catch (const std::exception& ex) {
+        // Unknown device_type: fall through to the vendor-specific chain.
+        util::log_debug("sanitize_device_config: device type \"" + device_type + "\" is not catalog-recognized (" +
+                        ex.what() + "); falling through to the vendor-specific chain");
+    }
+
+    if (catalog_handled) {
+        // Vendor-specific keys came from the descriptor above.
+    } else if (vendor == "ioptron") {
         if (device_type == "switch") {
             // iMate PowerBox: local GPIO. Persist the optional chip path plus
             // the PWM frequency and per-port PWM/name overrides so dimmable-port
@@ -9719,9 +9866,6 @@ nlohmann::json Router::sanitize_device_config(const nlohmann::json& config) cons
             copy_if_present("portPath");
             copy_if_present("baudRate");
         }
-    } else if (vendor == "astroasis") {
-        copy_if_present("focuserIndex");
-        copy_if_present("hidPath");
     } else if (vendor == "wandererastro") {
         copy_if_present("connectionType");
         copy_if_present("coverIndex");

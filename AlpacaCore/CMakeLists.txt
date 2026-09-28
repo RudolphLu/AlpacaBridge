@@ -79,6 +79,7 @@ set(ALPACACORE_CORE_SOURCES
     src/core/util/units.cpp
     src/catalog/device_config.cpp
     src/catalog/device_catalog.cpp
+    src/vendors/astroasis/astroasis_schema.cpp
 )
 
 # Driver sources
@@ -228,6 +229,11 @@ if(ALPACACORE_ENABLE_ASTROASIS)
     add_subdirectory(src/vendors/astroasis)
     if(TARGET alpacacore_astroasis)
         target_link_libraries(alpacacore PRIVATE alpacacore_astroasis)
+        # open-astro#664: register_builtin_factories() (src/catalog/device_catalog.cpp,
+        # compiled into alpacacore itself) guards its Astroasis factory registration
+        # behind this macro. Without it here the core lib never sees the macro and
+        # the registration compiles empty even though alpacacore_astroasis links fine.
+        target_compile_definitions(alpacacore PRIVATE ALPACACORE_ENABLE_ASTROASIS)
     endif()
 endif()
 

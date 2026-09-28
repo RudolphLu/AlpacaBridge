@@ -14,6 +14,7 @@
 
 #include <alpacacore/alpaca_defs.h>
 #include <alpacacore/camera_driver.h>
+#include <alpacacore/catalog/device_catalog.h>
 #include <alpacacore/covercalibrator_driver.h>
 #include <alpacacore/device_registry.h>
 #include <alpacacore/dome_driver.h>
@@ -67,6 +68,20 @@ class Router {
 public:
     Router();
     ~Router();
+
+    // open-astro#664: a hook that adds descriptors to the catalog before
+    // load_persisted_devices() runs, so a ConfigSource::Persisted device can
+    // see them. Router() (above) delegates to this with an empty hook;
+    // production never passes one -- only tests, which need a descriptor the
+    // built-in registration functions don't provide, use it.
+    using CatalogExtension = std::function<void(alpacacore::catalog::DeviceCatalog&)>;
+    explicit Router(const CatalogExtension& extend_catalog);
+
+    // The catalog this router consults before its arm chain
+    // (register_device_from_config()) and serves at GET
+    // /management/v1/devicecatalog. Non-const: tests add descriptors to it
+    // directly via alpacahttp::test_catalog helpers.
+    alpacacore::catalog::DeviceCatalog& catalog() { return catalog_; }
 
     // Set management driver (from AlpacaCore)
     void set_management_driver(std::shared_ptr<alpacacore::ManagementDriver> mgmt_driver);
@@ -150,6 +165,9 @@ public:
     Response route(const Request& request, std::uint32_t server_transaction_id);
 
 private:
+    // open-astro#664: populated in the constructor, before load_persisted_devices().
+    alpacacore::catalog::DeviceCatalog catalog_;
+
     std::shared_ptr<alpacacore::ManagementDriver> management_driver_;
     std::function<void()> shutdown_callback_;
     std::function<void()> restart_callback_;
@@ -180,6 +198,8 @@ private:
     Response handle_build_info(const Request& request, std::uint32_t server_tx_id);
     Response handle_configured_devices(const Request& request, std::uint32_t server_tx_id);
     Response handle_configure_device(const Request& request, std::uint32_t server_tx_id);
+    // open-astro#664: GET /management/v1/devicecatalog, serving catalog_json::describe_json(catalog_).
+    Response handle_device_catalog(const Request& request, std::uint32_t server_tx_id);
     Response handle_remove_device(const Request& request, std::uint32_t server_tx_id);
     Response handle_shutdown(const Request& request, std::uint32_t server_tx_id);
     Response handle_restart(const Request& request, std::uint32_t server_tx_id);

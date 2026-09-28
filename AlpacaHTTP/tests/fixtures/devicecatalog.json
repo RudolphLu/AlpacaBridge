@@ -1,0 +1,33 @@
+[
+  {
+    "vendor": "astroasis",
+    "deviceType": "focuser",
+    "displayName": "Astroasis Oasis Focuser",
+    "available": true,
+    "buildOption": "ALPACACORE_ENABLE_ASTROASIS",
+    "fields": [
+      {"key": "hidPath", "type": "string", "default": "", "required": false, "secret": false, "role": "PortPath"},
+      {"key": "focuserIndex", "type": "int", "default": 0, "required": false, "secret": false, "role": "EnumerationIndex"}
+    ]
+  },
+  {
+    "vendor": "zzz",
+    "deviceType": "focuser",
+    "displayName": "Test Focuser",
+    "available": false,
+    "buildOption": "ALPACACORE_ENABLE_ZZZ",
+    "fields": [
+      {"key": "enabled", "type": "bool", "default": false, "required": false, "secret": false, "role": "Plain"},
+      {"key": "count", "type": "int", "default": 1, "required": false, "secret": false, "role": "Plain", "range": {"min": 1, "max": 8}},
+      {"key": "ratio", "type": "double", "default": 1.5, "required": false, "secret": false, "role": "Plain", "range": {"min": 0.5}},
+      {"key": "mode", "type": "string", "default": "a", "required": false, "secret": false, "role": "Discriminator", "enum": ["a", "b"]},
+      {"key": "host", "type": "string", "default": "", "required": false, "secret": false, "role": "Host", "appliesWhen": {"key": "mode", "value": "b"}},
+      {"key": "token", "type": "string", "default": "", "required": false, "secret": true, "role": "Secret"},
+      {"key": "filterNames", "type": "stringList", "required": false, "secret": false, "role": "Plain"},
+      {"key": "ports", "type": "recordList", "required": false, "secret": false, "role": "Plain", "fields": [
+        {"key": "name", "type": "string", "default": "", "required": true, "secret": false, "role": "Plain"},
+        {"key": "pwm", "type": "bool", "default": false, "required": false, "secret": false, "role": "Plain"}
+      ]}
+    ]
+  }
+]
