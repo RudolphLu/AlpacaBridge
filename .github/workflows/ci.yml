@@ -465,6 +465,7 @@ jobs:
             local name="$1"
             shift
             gcovr --root . -j "$(nproc)" "$@" "${excludes[@]}" \
+              --gcov-ignore-parse-errors=all \
               --txt "coverage/${name}.txt" \
               --json-summary-pretty --json-summary "coverage/${name}.json" \
               AlpacaCore/build AlpacaHTTP/build
