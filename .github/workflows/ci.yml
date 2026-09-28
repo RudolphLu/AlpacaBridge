@@ -16,6 +16,9 @@
 #   sanitizers-tsan  build all-vendors under ThreadSanitizer + run the [stress]
 #                  connect/disconnect/operate concurrency suite (issue #101),
 #                  plus [stress-guard] (the harness's own self-tests, issue #322)
+#   coverage       informational gcovr line coverage, all vendors ON, per
+#                  component + combined in the job summary, HTML/JSON artifact
+#                  (no threshold, not a required check; bound 30 min)
 #   format         clang-format check, PR changed lines only
 #   clang-tidy     clang-tidy static analysis, PR changed lines only
 #   unicode        scan sources for Trojan-Source / invisible Unicode
@@ -43,9 +46,9 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Single source of truth for the vendored libgpiod build dependency — both the
-# build-vendors and clang-tidy jobs consume these, so a version bump can't
-# skew them (tarball + README in AlpacaCore/external/libgpiod/).
+# Single source of truth for the vendored libgpiod build dependency — the
+# build-vendors, sanitizers-tsan, coverage and clang-tidy jobs consume these,
+# so a version bump can't skew them (tarball + README in AlpacaCore/external/libgpiod/).
 env:
   LIBGPIOD_VER: "2.2.4"
   LIBGPIOD_SHA256: "13207176b0eb9b3e0f02552d5f49f5a6a449343ce47416158bb484d9d3019592"
@@ -360,6 +363,139 @@ jobs:
           # or dropped tag doesn't silently skip them either.
           ./AlpacaCore/build-tsan/tests/alpacacore_tests "[stress-guard]" | tee stress-guard-run.log
           grep -qE '^(All tests passed \([0-9]+ assertions? in [1-9][0-9]* test cases?\)|test cases: *[1-9])' stress-guard-run.log
+
+  coverage:
+    # Informational only: no --fail-under threshold and not a required check.
+    # A separate job so instrumentation adds no time to build-test or
+    # build-vendors; it runs in parallel with them.
+    name: Line coverage (gcovr, all vendors, arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        # Same set as build-vendors (libgpiod-dev omitted, built from source
+        # below; catch2 required, issue #586), plus gcovr for the report.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            g++ \
+            catch2 \
+            pkg-config \
+            libusb-1.0-0-dev \
+            libudev-dev \
+            libsystemd-dev \
+            libhidapi-dev \
+            libgphoto2-dev \
+            libraw-dev \
+            nlohmann-json3-dev \
+            zlib1g-dev \
+            libcurl4-openssl-dev \
+            gcovr
+
+      - name: Build libgpiod v2 from source
+        # Copied from build-vendors; see the comments there.
+        run: |
+          set -euo pipefail
+          cp "AlpacaCore/external/libgpiod/libgpiod-${LIBGPIOD_VER}.tar.xz" /tmp/libgpiod.tar.xz
+          echo "${LIBGPIOD_SHA256}  /tmp/libgpiod.tar.xz" \
+            | sha256sum -c -
+          mkdir -p /tmp/libgpiod
+          tar -xf /tmp/libgpiod.tar.xz -C /tmp/libgpiod --strip-components=1
+          cd /tmp/libgpiod
+          ./configure --prefix=/usr/local --enable-tools=no --enable-bindings-cxx=no
+          make -j"$(nproc)"
+          sudo make install
+          sudo ldconfig
+
+      - name: Stage vendor SDK shared libraries
+        # Copied from build-vendors; keep the two lists in step.
+        run: |
+          set -euo pipefail
+          core="AlpacaCore/external"
+          libs=(
+            "$core/ZWO/ASI_Camera_SDK/lib/linux/armv8/libASICamera2.so"
+            "$core/SVBONY/lib/armv8/libSVBCameraSDK.so"
+            "$core/ToupTek/toupcamsdk.20260128/linux/arm64/glibc/libtoupcam.so"
+            "$core/PlayerOne/PlayerOne_Camera_SDK_Linux_V3.10.0/lib/arm64/libPlayerOneCamera.so"
+            "$core/PlayerOne/PlayerOne_FilterWheel_SDK_Linux_V1.2.3/lib/arm64/libPlayerOnePW.so"
+            "$core/QHY/sdk_linux_arm64_26.06.04/usr/local/lib/libqhyccd.so"
+          )
+          for lib in "${libs[@]}"; do
+            if compgen -G "${lib}*" > /dev/null; then
+              echo "Staging $(basename "$lib")*"
+              sudo cp -a "${lib}"* /usr/local/lib/
+            else
+              echo "WARNING: ${lib}* not found — skipping"
+            fi
+          done
+          sudo ldconfig
+
+      - name: Build + run tests with coverage (all vendors)
+        # Same seeding as the sanitizers job: CMake takes CXXFLAGS / LDFLAGS
+        # on a fresh configure and run_all_tests.sh wipes build/ first.
+        # -fprofile-update=atomic because the [stress] cases are
+        # multi-threaded and plain counter updates would race.
+        env:
+          ALPACACORE_ENABLE_ALL_VENDORS: "ON"
+          CXXFLAGS: "--coverage -O0 -g -fprofile-update=atomic"
+          LDFLAGS: "--coverage"
+        run: ./run_all_tests.sh
+
+      - name: Generate coverage report
+        # One gcovr call per component plus a combined total, each over BOTH
+        # build dirs: AlpacaHTTP/build compiles AlpacaCore's sources again as
+        # a subdirectory, and gcovr merges the two per source file.
+        run: |
+          set -euo pipefail
+          mkdir -p coverage/html
+          excludes=(
+            --exclude '.*/tests/'
+            --exclude '.*/external/'
+            --exclude '.*/examples/'
+            --exclude '.*/build[^/]*/'
+          )
+          report() {
+            local name="$1"
+            shift
+            gcovr --root . -j "$(nproc)" "$@" "${excludes[@]}" \
+              --txt "coverage/${name}.txt" \
+              --json-summary-pretty --json-summary "coverage/${name}.json" \
+              AlpacaCore/build AlpacaHTTP/build
+          }
+          report alpacacore --filter 'AlpacaCore/(src|include)/'
+          report alpacahttp --filter 'AlpacaHTTP/(src|include)/'
+          report combined \
+            --filter 'AlpacaCore/(src|include)/' \
+            --filter 'AlpacaHTTP/(src|include)/' \
+            --html-details coverage/html/index.html
+          cat coverage/combined.txt
+          python3 - >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          rows = [("AlpacaCore", "alpacacore"), ("AlpacaHTTP", "alpacahttp"),
+                  ("Combined", "combined")]
+          print("## Line coverage (all vendors, arm64)\n")
+          print("| Component | Lines covered | Lines total | Line % |")
+          print("|---|---:|---:|---:|")
+          for label, name in rows:
+              with open(f"coverage/{name}.json") as f:
+                  s = json.load(f)
+              print(f"| {label} | {s['line_covered']} | {s['line_total']} "
+                    f"| {s['line_percent']:.1f} |")
+          PY
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: coverage
+          path: coverage/
+          if-no-files-found: error
 
   format:
     name: clang-format (changed lines)
