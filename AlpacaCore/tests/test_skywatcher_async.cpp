@@ -3444,4 +3444,63 @@ TEST_CASE("SkyWatcher async - a near-cancelled RA rate is not condemned by the p
     driver->set_connected(false);
 }
 
+TEST_CASE("SkyWatcher async - the EQ-AL55i Pro is not asked for the ':i' step-period readback (#686)",
+          "[skywatcher][async][al55i]") {
+    // open-astro#686: the EQ-AL55i Pro (0x09) answers ":i" with FFFFFF whatever
+    // ":I" stored, so comparing it logged a false "step period readback"
+    // WARN on every checked write. The driver turns the readback off for that
+    // board at connect; every other board keeps it. The writes below are the
+    // ones that ask for it: a tracking start and a North pulse (speed-mode
+    // starts) and a RightAscensionRate change (the live in-place ":I").
+    struct Case {
+        const char* name;
+        alpacacore::test::FakeMountProfile profile;
+        bool expect_readback;
+    };
+    const Case cases[] = {
+        {"EQ-AL55i Pro (0x09)", alpacacore::test::FakeMountProfile::eq_al55i(), false},
+        {"Wave 100i (0x44)", alpacacore::test::FakeMountProfile::wave_100i(), true},
+        {"EQM-35 Pro (0x32)", alpacacore::test::FakeMountProfile::eqm35_pro(), true},
+    };
+    for (const auto& c : cases) {
+        INFO(c.name);
+        // Declared before the guard so it outlives the sink that writes to it.
+        std::atomic<int> readback_warnings{0};
+        struct SinkGuard {
+            alpacacore::logging::LogSink previous = alpacacore::logging::get_log_sink();
+            ~SinkGuard() { alpacacore::logging::set_log_sink(previous); }
+        } sink_guard;
+        alpacacore::logging::set_log_sink(
+            [&](alpacacore::logging::LogLevel level, std::string_view, std::string_view message) {
+                if (level == alpacacore::logging::LogLevel::Warn &&
+                    message.find("step period readback") != std::string_view::npos) {
+                    readback_warnings.fetch_add(1);
+                }
+            });
+
+        FakeSkyWatcherMount mount(c.profile);
+        REQUIRE(mount.ok());
+        auto driver = connected_driver(mount);
+        driver->set_tracking(true);
+        REQUIRE(wait_until([&] { return mount.axis_running(1); }, 3000));
+        driver->set_right_ascension_rate(0.5);
+        driver->pulse_guide(0, 500);  // North
+        REQUIRE(wait_until([&] { return !driver->get_is_pulse_guiding(); }, 10000));
+
+        const int inquiries = mount.step_period_inquiry_count(1) + mount.step_period_inquiry_count(2);
+        if (c.expect_readback) {
+            CHECK(inquiries > 0);
+        } else {
+            CHECK(inquiries == 0);
+        }
+        // Only the 0x09 fake answers FFFFFF, so no profile may log a mismatch:
+        // the other boards read back what was written.
+        CHECK(readback_warnings.load() == 0);
+
+        driver->set_right_ascension_rate(0.0);
+        driver->set_tracking(false);
+        driver->set_connected(false);
+    }
+}
+
 #endif  // _WIN32

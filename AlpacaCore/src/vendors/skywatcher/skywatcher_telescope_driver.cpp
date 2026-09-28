@@ -93,6 +93,14 @@ constexpr int measured_dec_axis_sense(std::uint8_t mount_code) {
 // updating the Wi-Fi module's firmware, so 3.46 is not expected to differ.
 constexpr bool live_rate_change_needs_relatch(std::uint8_t mount_code) { return mount_code != 0x09; }
 
+// open-astro#686: whether the ":i" step-period readback after an ":I" write
+// means anything on this board. The EQ-AL55i Pro (0x09, MC 3.48) answers ":i"
+// with FFFFFF on both axes whatever ":I" stored, including while ":j" shows the
+// axis running at the written rate (2026-09-26), so every compared write
+// logged a false mismatch. Every other board keeps the diagnostic, as does a
+// board that could not be identified.
+constexpr bool step_period_readback_usable(std::uint8_t mount_code) { return mount_code != 0x09; }
+
 constexpr uint32_t kCountsMask = 0xFFFFFF;
 constexpr double kSiderealDegPerSec = 360.0 / 86164.0905;
 constexpr double kDefaultGuideRateDegPerSec = 0.5 * kSiderealDegPerSec;
@@ -437,6 +445,12 @@ public:
                                                   board.firmware_version);
                 dec_axis_sense_ = measured_dec_axis_sense(board.mount_code);  // open-astro#458
                 live_rate_relatch_ = live_rate_change_needs_relatch(board.mount_code);  // open-astro#666
+                if (!step_period_readback_usable(board.mount_code)) {                   // open-astro#686
+                    protocol.disable_step_period_readback();
+                    ALPACA_LOG_INFO("SkyWatcher",
+                                    "Step-period readback (':i') off for this board: it answers FFFFFF whatever was "
+                                    "written (open-astro#686)");
+                }
             } catch (...) {
                 // A board that will not answer ":e" is still usable, so never
                 // fail the connect over it -- but do not keep a previous

@@ -63,6 +63,10 @@ struct FakeMountProfile {
     // ":s" (steps per worm). nullopt: the board rejects ":s" with "!0".
     // A value, zero included, is answered as "=" + that value.
     std::optional<uint32_t> steps_per_worm;
+    // ":i" (read the step period) answers "=FFFFFF" whatever ":I" stored,
+    // instead of the stored preset. Off for every board that has been seen
+    // to read its preset back.
+    bool step_period_readback_all_ones = false;
 
     // Wave 100i, MC firmware 3.58, mount code 0x44 (.github/instructions/skywatcher.instructions.md capture).
     static FakeMountProfile wave_100i() { return FakeMountProfile{}; }
@@ -102,6 +106,9 @@ struct FakeMountProfile {
     // driver already reads a high-speed ratio of 0 as 1.
     // No HOME_INDEXER bit (0x04) -> find_home() takes the count-frame fallback
     // instead of AutoHome; get_can_find_home() stays true unconditionally.
+    // ":i1"/":i2" -> =FFFFFF on every read, whatever ":I" wrote, while ":j"
+    // showed the axis running at the written rate (same mount on MC 3.48,
+    // TRACE log 2026-09-26, open-astro#686).
     static FakeMountProfile eq_al55i() {
         FakeMountProfile p;
         p.cpr = 4032000;
@@ -111,6 +118,7 @@ struct FakeMountProfile {
         p.high_speed_ratio_reply = "01";
         p.features = 0x9000;
         p.steps_per_worm = 0;
+        p.step_period_readback_all_ones = true;
         return p;
     }
 };
@@ -199,6 +207,13 @@ public:
     int stop_count(int axis) {
         std::lock_guard<std::mutex> lock(mutex_);
         return ax(axis).stop_count;
+    }
+
+    /// Number of ":i" step-period inquiries received for an axis
+    /// (open-astro#686: a board whose ":i" is meaningless must not be asked).
+    int step_period_inquiry_count(int axis) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return ax(axis).step_period_inquiries;
     }
 
     bool axis_running(int axis) {
@@ -353,6 +368,7 @@ private:
         uint32_t indexer = 0;
         int start_count = 0;
         int stop_count = 0;
+        int step_period_inquiries = 0;
         int short_landings = 0;    // goto landings to report stopped early (test knob)
         int64_t short_counts = 0;  // how far short of the target to report it (test knob)
         int coast_ms = 0;          // how long the remainder takes to arrive (test knob)
@@ -559,6 +575,10 @@ private:
                 return "=";
             }
             case 'i':  // inquire the T1 step period last written with ":I"
+                ++a.step_period_inquiries;
+                if (profile_.step_period_readback_all_ones) {
+                    return "=" + u24(0xFFFFFF);
+                }
                 return "=" + u24(static_cast<uint32_t>(a.t1 & 0xFFFFFF));
             case 'J':
                 if (a.reject_starts > 0) {

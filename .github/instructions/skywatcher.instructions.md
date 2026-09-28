@@ -177,6 +177,14 @@ datagrams before each send so replies cannot get off-by-one.
 - `:f` status nibbles: char0 bit0 speed-mode/bit1 CCW/bit2 fast; char1 bit0 running/bit1
   blocked; char2 bit0 init-done/bit1 level switch. Slewing = running AND NOT speed-mode
   on either axis (a tracking axis is not slewing).
+- **The `:i` step-period readback is a diagnostic only** (`set_step_period()`): it WARNs
+  on a mismatch with what `:I` wrote and never resends or throws. It turns itself off for
+  the connection when a board rejects `:i` with `!0`, and **per board when `:i` answers but
+  means nothing** (`step_period_readback_usable()`, open-astro#686): the EQ-AL55i Pro (0x09,
+  MC 3.48) answers `=FFFFFF` on both axes whatever was written, including while `:j` shows
+  the axis at the written rate, which logged a false mismatch on every checked write. Add a
+  board only on the same evidence: `:i` disagreeing with `:I` while the axis runs at the
+  written rate.
 - Connect sequence: `:e` version, `:a`/`:b`/`:g` per axis, then `:F` init (with `:E` home
   stamp) ONLY when the status reports not-initialized — never re-stamp an aligned session.
 - **Wave USB port is STM32 CDC-ACM** (`0483:5740`, `/dev/ttyACM*`, by-id name
