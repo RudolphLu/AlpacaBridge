@@ -31,6 +31,7 @@ set(TEST_SOURCES
     test_fake_pty_write.cpp
     test_host_clock.cpp
     test_poll_settle.cpp
+    test_task_clock.cpp
     test_connection_resolver.cpp
     test_serial_by_id_scan.cpp
     test_stress_call_guard.cpp
