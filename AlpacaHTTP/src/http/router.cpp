@@ -1387,6 +1387,12 @@ std::string connect_failure_reason(const alpacacore::AlpacaDriver& device) {
     return reason.empty() ? std::string("Connection failed") : reason;
 }
 
+// open-astro#711: libstdc++ std::regex recurses once per repeated character,
+// so a long path segment overflowed the worker stack and killed the server.
+// route() refuses anything longer before a regex sees it. The longest valid
+// path today is under 100 bytes; 2048 stays far below the crash depth.
+constexpr std::size_t kMaxRequestPathBytes = 2048;
+
 // Defined further down with the management guards, but declared here because
 // every state-changing management handler needs it and handle_description()
 // is the first of them in file order. Also used by the four device setters
@@ -1511,6 +1517,22 @@ Response Router::route(const Request& request, std::uint32_t server_transaction_
     util::log_debug("HTTP " + method_str + " " + request.path());
 
     try {
+        // open-astro#711: before any regex, static file or setup handler. The
+        // message gives the lengths, never the path itself.
+        if (request.path().size() > kMaxRequestPathBytes) {
+            response.set_status(400, "Bad Request");
+            std::uint32_t client_tx_id = 0;
+            if (request.has_query_param("ClientTransactionID")) {
+                client_tx_id = parse_client_transaction_id(request.get_query_param("ClientTransactionID"));
+            }
+            AlpacaResponse alpaca_response =
+                make_error_response(client_tx_id, server_transaction_id, util::ErrorCode::INVALID_VALUE,
+                                    "Request path is " + std::to_string(request.path().size()) +
+                                        " bytes; the limit is " + std::to_string(kMaxRequestPathBytes) + " bytes");
+            response.set_body(alpaca_response);
+            return response;
+        }
+
         // Handle static file requests (web UI)
         if (request.path().find("/web/") == 0) {
             return handle_static_file(request);

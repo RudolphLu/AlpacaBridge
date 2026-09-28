@@ -747,6 +747,51 @@ int main() {
     std::cout << "Testing routing...\n";
 
     alpacahttp::Router router;
+
+    // open-astro#711: libstdc++ std::regex recurses once per repeated
+    // character, so a ~60,000-byte path segment overflowed the worker stack
+    // and killed the server. route() refuses a path over 2048 bytes with 400
+    // + InvalidValue before any regex, and never echoes the path back.
+    {
+        const auto length_refusal = [&](const std::string& path) {
+            const auto resp = route_request(router, "GET", path + "?ClientTransactionID=711");
+            const auto json = nlohmann::json::parse(resp.body(), nullptr, false);
+            EXPECT(!json.is_discarded());
+            const std::string message = json.value("ErrorMessage", std::string());
+            const bool refused = message.find("the limit is 2048 bytes") != std::string::npos;
+            if (refused) {
+                EXPECT(resp.status_code() == 400);
+                EXPECT(json.value("ErrorNumber", 0) == 0x401);
+                EXPECT(json.value("ClientTransactionID", 0) == 711);
+                EXPECT(message.find(std::to_string(path.size())) != std::string::npos);
+                EXPECT(message.find("aaaa") == std::string::npos);
+            }
+            return refused;
+        };
+        const std::string long_segment(60000, 'a');
+        EXPECT(length_refusal("/api/v1/" + long_segment + "/0/connected"));
+        EXPECT(length_refusal("/setup/v1/" + long_segment + "/0/setup"));
+        EXPECT(length_refusal("/management/v1/wifi/profiles/" + long_segment));
+        EXPECT(length_refusal("/management/v1/logfiles/" + long_segment));
+        EXPECT(length_refusal("/web/" + long_segment));
+
+        // Boundary: 2048 bytes still routes, 2049 bytes is refused.
+        const std::string prefix = "/api/v1/";
+        const std::string suffix = "/0/connected";
+        const std::string at_limit = prefix + std::string(2048 - prefix.size() - suffix.size(), 'a') + suffix;
+        EXPECT(at_limit.size() == 2048);
+        EXPECT(!length_refusal(at_limit));
+        const std::string over_limit = prefix + std::string(2049 - prefix.size() - suffix.size(), 'a') + suffix;
+        EXPECT(over_limit.size() == 2049);
+        EXPECT(length_refusal(over_limit));
+
+        // No regression on an ordinary device path: no device at 0 is still
+        // the handler's 400, not the length refusal.
+        EXPECT(!length_refusal("/api/v1/telescope/0/connected"));
+        const auto resp = route_request(router, "GET", "/api/v1/telescope/0/connected");
+        EXPECT(resp.status_code() == 400);
+        EXPECT(nlohmann::json::parse(resp.body()).value("ErrorNumber", 0) != 0);
+    }
     alpacahttp::Request request;
 
     // Test management endpoint parsing
