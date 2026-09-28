@@ -263,8 +263,10 @@ public:
     /// Swallow the re-latch of the next @p n ":J" on a RUNNING axis: the kick
     /// is acknowledged but the stored preset still is not applied. Combined
     /// with stall_live_rate_writes this is a stall that survives the driver's
-    /// unconditional ":I"+":J" and can only be recovered by the sampled
-    /// rate-applied check re-kicking (verify_live_rate_or_rekick).
+    /// ":I"+":J" and can only be recovered by the sampled rate-applied check
+    /// re-kicking (verify_live_rate_or_rekick). On a board that skips the
+    /// live-rate re-latch (EQ-AL55i Pro, 0x09, #666) there is no dispatch ":J"
+    /// to swallow, so only the verify resend's ":J" is affected.
     void ignore_start_relatches(int axis, int n) {
         std::lock_guard<std::mutex> lock(mutex_);
         ax(axis).ignore_start_relatches = n;

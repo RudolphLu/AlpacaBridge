@@ -1980,8 +1980,9 @@ TEST_CASE("SkyWatcher async - a live step-period change the board stores but nev
     // failed, and count-sampling on the mount showed the axis holding
     // exactly its old rate through the whole pulse. The wrapper now follows
     // every live in-place ":I" with a ":J" (matching INDI's skywatcherAPI.cpp
-    // recipe), and the driver double-checks by sampling the position across
-    // a short window and re-kicking if the axis didn't actually change speed.
+    // recipe) on every board except the EQ-AL55i Pro (0x09, #666), and the
+    // driver double-checks by sampling the position across a short window and
+    // re-kicking if the axis didn't actually change speed.
     FakeSkyWatcherMount mount;
     REQUIRE(mount.ok());
     auto driver = connected_driver(mount);
@@ -2115,6 +2116,151 @@ TEST_CASE("SkyWatcher async - a short RA guide pulse is not stretched by the rat
     // fails. Lower bound is loose (poll granularity only).
     REQUIRE(elapsed_ms >= 30.0);
     REQUIRE(elapsed_ms < 300.0);
+
+    driver->set_tracking(false);
+    driver->set_connected(false);
+}
+
+TEST_CASE("SkyWatcher async - an RA guide pulse sends no :J re-latch on the EQ-AL55i Pro (#666)",
+          "[skywatcher][async][pulseguide][al55i]") {
+    // open-astro#666: on the EQ-AL55i Pro (0x09) every ":J" on the tracking RA
+    // axis re-anchors the board's trajectory on the encoder and steps the
+    // position by the servo's following error (~2 counts, sign set by the
+    // mount's balance), and a bare ":I" is applied on its own. So an East/West
+    // pulse there changes the step period in place with no ":J" at dispatch or
+    // at restore. Every other board keeps both kicks.
+    // The eq_al55i() fixture reports MC firmware 3.46, read from the same mount
+    // before its update to 3.48, which is where the hardware evidence behind the
+    // gate comes from. The gate keys on the mount code alone, so the fixture's
+    // firmware does not change the rule.
+    struct Case {
+        const char* name;
+        alpacacore::test::FakeMountProfile profile;
+        int expected_starts;
+    };
+    const Case cases[] = {
+        {"EQ-AL55i Pro (0x09)", alpacacore::test::FakeMountProfile::eq_al55i(), 0},
+        {"Wave 100i (0x44)", alpacacore::test::FakeMountProfile::wave_100i(), 2},
+    };
+    for (const auto& c : cases) {
+        INFO(c.name);
+        FakeSkyWatcherMount mount(c.profile);
+        REQUIRE(mount.ok());
+        auto driver = connected_driver(mount);
+        driver->set_tracking(true);
+        REQUIRE(wait_until([&] { return mount.axis_running(1); }, 3000));
+        const uint32_t sidereal_preset = mount.step_period(1);
+        const int starts_before = mount.start_count(1);
+        const int stops_before = mount.stop_count(1);
+
+        driver->pulse_guide(2, 300);  // East, short: no rate-applied check
+        REQUIRE(wait_until([&] { return mount.step_period(1) != sidereal_preset; }, 3000));
+        REQUIRE(wait_until([&] { return mount.step_period(1) == sidereal_preset; }, 5000));
+        REQUIRE(wait_until([&] { return !driver->get_is_pulse_guiding(); }, 5000));
+
+        CHECK(mount.start_count(1) - starts_before == c.expected_starts);
+        CHECK(mount.stop_count(1) == stops_before);  // in place: the axis never stopped
+        CHECK(mount.axis_running(1));
+
+        driver->set_tracking(false);
+        driver->set_connected(false);
+    }
+}
+
+TEST_CASE("SkyWatcher async - a reconnect that fails to identify the EQ-AL55i Pro restores the :J re-latch (#666)",
+          "[skywatcher][async][pulseguide][al55i]") {
+    // The skip belongs to the board that answered ":e" on THIS connect. The
+    // same driver reconnected to a board that does not identify must fall
+    // back to the re-latch every other board gets, not keep the previous
+    // connection's 0x09 answer. Same shape as the #458 sense test in
+    // test_skywatcher_pointing.cpp.
+    FakeSkyWatcherMount mount(alpacacore::test::FakeMountProfile::eq_al55i());
+    REQUIRE(mount.ok());
+    auto driver = connected_driver(mount);
+
+    auto east_pulse_starts = [&] {
+        driver->set_tracking(true);
+        REQUIRE(wait_until([&] { return mount.axis_running(1); }, 3000));
+        const uint32_t sidereal_preset = mount.step_period(1);
+        const int starts_before = mount.start_count(1);
+        driver->pulse_guide(2, 300);  // East, short: no rate-applied check
+        REQUIRE(wait_until([&] { return mount.step_period(1) != sidereal_preset; }, 3000));
+        REQUIRE(wait_until([&] { return mount.step_period(1) == sidereal_preset; }, 5000));
+        REQUIRE(wait_until([&] { return !driver->get_is_pulse_guiding(); }, 5000));
+        const int starts = mount.start_count(1) - starts_before;
+        driver->set_tracking(false);
+        return starts;
+    };
+
+    CHECK(east_pulse_starts() == 0);  // identified as 0x09: no re-latch
+
+    driver->set_connected(false);
+    mount.set_garbled_version_replies(true);
+    driver->set_connected(true);
+    REQUIRE(driver->get_connected());
+
+    CHECK(east_pulse_starts() == 2);  // unidentified: dispatch and restore both re-latch
+
+    driver->set_connected(false);
+}
+
+TEST_CASE("SkyWatcher async - a RightAscensionRate write sends no :J re-latch on the EQ-AL55i Pro (#666)",
+          "[skywatcher][async][al55i]") {
+    // The setter path (apply_ra_tracking_rate_locked) makes the same live
+    // in-place change as a pulse, so it follows the same per-board rule.
+    // (Fixture firmware is MC 3.46, the same mount before its 3.48 update -- see above.)
+    struct Case {
+        const char* name;
+        alpacacore::test::FakeMountProfile profile;
+        int expected_starts;
+    };
+    const Case cases[] = {
+        {"EQ-AL55i Pro (0x09)", alpacacore::test::FakeMountProfile::eq_al55i(), 0},
+        {"Wave 100i (0x44)", alpacacore::test::FakeMountProfile::wave_100i(), 1},
+    };
+    for (const auto& c : cases) {
+        INFO(c.name);
+        FakeSkyWatcherMount mount(c.profile);
+        REQUIRE(mount.ok());
+        auto driver = connected_driver(mount);
+        driver->set_tracking(true);
+        REQUIRE(wait_until([&] { return mount.axis_running(1); }, 3000));
+        const uint32_t sidereal_preset = mount.step_period(1);
+        const int starts_before = mount.start_count(1);
+
+        driver->set_right_ascension_rate(0.5);  // continuous, same direction: live ":I"
+        REQUIRE(mount.step_period(1) != sidereal_preset);
+        // Let the background rate-applied check finish; the fake applies the
+        // bare ":I", so it must not resend.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+        CHECK(mount.start_count(1) - starts_before == c.expected_starts);
+        CHECK(mount.axis_running(1));
+
+        driver->set_right_ascension_rate(0.0);
+        driver->set_tracking(false);
+        driver->set_connected(false);
+    }
+}
+
+TEST_CASE("SkyWatcher async - a stalled bare :I on the EQ-AL55i Pro is still caught by the rate-applied check (#666)",
+          "[skywatcher][async][pulseguide][al55i]") {
+    // Dropping the ":J" re-latch on 0x09 leaves the sampled check as the only
+    // guard against a live ":I" that is stored but not applied. On a pulse long
+    // enough to run it, that check must still resend ":I"+":J".
+    // (Fixture firmware is MC 3.46, the same mount before its 3.48 update -- see above.)
+    FakeSkyWatcherMount mount(alpacacore::test::FakeMountProfile::eq_al55i());
+    REQUIRE(mount.ok());
+    auto driver = connected_driver(mount);
+    driver->set_tracking(true);
+    REQUIRE(wait_until([&] { return mount.axis_running(1); }, 3000));
+    const int starts_before = mount.start_count(1);
+
+    mount.stall_live_rate_writes(1, 1);  // the pulse-rate ":I" is stored, not applied
+    driver->pulse_guide(2, 2000);        // East, >= kMinPulseForRateVerifyMs: verified
+    REQUIRE(wait_until([&] { return mount.start_count(1) >= starts_before + 1; }, 3000));
+    REQUIRE(wait_until([&] { return !driver->get_is_pulse_guiding(); }, 8000));
+    // Exactly the check's resend: no dispatch kick and no restore kick.
+    CHECK(mount.start_count(1) - starts_before == 1);
 
     driver->set_tracking(false);
     driver->set_connected(false);

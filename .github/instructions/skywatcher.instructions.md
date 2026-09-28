@@ -147,14 +147,33 @@ datagrams before each send so replies cannot get off-by-one.
   2026-09-06): the board stores the preset (`:i` reads it back) but the motor keeps its old
   rate. Every live in-place `:I` is therefore followed by a `:J` re-latch (INDI does the
   same), and the driver sample-verifies the rate over ~450 ms (`verify_live_rate_or_rekick`)
-  and resends `:I`+`:J` if the axis did not change speed. Pulses ≥ 1.5 s verify inside the
-  pulse task (the window is deducted from the pulse; shorter pulses rely on the kick alone);
+  and resends `:I`+`:J` if the axis did not change speed. **Except on the EQ-AL55i Pro
+  (0x09, `live_rate_change_needs_relatch()`, open-astro#666):** there a bare `:I` applied
+  16 of 16 times, and the `:J` is not free: each one re-anchors the board's trajectory on
+  the encoder, stepping the tracking RA axis by the servo's following error (~2 counts,
+  sign set by the mount's balance), which put ConformU's 5 s E/W pulses outside tolerance.
+  That board skips the re-latch at every live-rate site (pulse dispatch and restore, the
+  rate setters, the dispatch-failure recovery); the verify and its `:I`+`:J` resend stay,
+  so 0x09 still sends a `:J` (and takes its ~2-count step) whenever the verify finds a
+  stalled `:I` -- up to twice on a long pulse (dispatch and post-stop).
+  Add a board to that exception only on the same evidence: bare `:I` applied on hardware
+  AND a measured `:J` position step. The measurements are from MC firmware 3.48; the
+  3.46 readings in `FakeMountProfile::eq_al55i()` are from the same mount before its
+  firmware update (see the EQ-AL55i Pro firmware release notes below). Pulses ≥ 1.5 s verify inside the
+  pulse task (the window is deducted from the pulse; shorter pulses rely on the kick alone,
+  or on 0x09 on the bare `:I`);
   the `RightAscensionRate`/`TrackingRate` setters cannot wait 450 ms inside a property call,
   so they spawn a one-shot background task (`rate_verify_thread_`, open-astro #248). That
   task never takes `mutex_`, which is what lets every RA-taking path reap it WITH `mutex_`
   held (setters, Tracking off, `stop_axis_and_wait_locked`, pulse dispatch, AbortSlew,
   disconnect) — a lock-free reap would leave a window for a setter to spawn one between an
   initiator's reap and its lock, and the resend would land mid-pulse or on a stopped axis.
+- **EQ-AL55i Pro motor-board firmware release notes** (Sky-Watcher's own changelog, copied
+  verbatim; append each new version here). Both versions on record ran on the same mount.
+  3.48 lists no motor-control change, so motor behaviour measured on either version is
+  taken to hold for both:
+  - **3.48**: "Support upgrading the Wi-Fi module's firmware." (the only change listed)
+  - **3.46**: the first version on record (`:e` -> `=032E09`, `FakeMountProfile::eq_al55i()`).
 - `:f` status nibbles: char0 bit0 speed-mode/bit1 CCW/bit2 fast; char1 bit0 running/bit1
   blocked; char2 bit0 init-done/bit1 level switch. Slewing = running AND NOT speed-mode
   on either axis (a tracking axis is not slewing).

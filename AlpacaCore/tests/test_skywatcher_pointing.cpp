@@ -252,7 +252,7 @@ TEST_CASE("SkyWatcher pointing - the model reproduces the positions measured on 
     // this oracle against itself, so it is not the evidence. No azimuth was
     // read that night (expect_az < 0), unlike rows 1 and 3.
     // Row 6 (open-astro#579): a Sky-Watcher EQ-AL55i Pro (mount code 0x09,
-    // firmware 3.46) belonging to a reporter none of us can reach, read on
+    // firmware 3.46, since updated to 3.48) on the owner's mount, read on
     // 2026-09-20 at about +40 (the site is rounded on purpose). Bare mount at
     // count home, tracking off, then a dec-only MoveAxis raised a2 by 893,663
     // counts = +89.37 deg on the board's own :a2 of 3,600,000. The owner read
