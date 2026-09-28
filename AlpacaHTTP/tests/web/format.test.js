@@ -296,3 +296,22 @@ test('isValidClockSeconds rejects non-finite and out-of-range Values (issue #511
         assert.equal(isValidClockSeconds(null), false);
     });
 });
+
+test('serverClockError surfaces a synctime ErrorMessage and nothing on success (issue #677)', () => {
+    withFormat(({ serverClockError }) => {
+        // The #670 refusal, verbatim, is what the clock must show.
+        const message = 'Host clock is outside 2000-01-01..2100-01-01 UTC; set the time with POST ' +
+            '/management/v1/synctime.';
+        assert.equal(serverClockError({ ErrorNumber: 1035, ErrorMessage: message }), message);
+        // A success reply, and anything that is not an Alpaca error reply, is no error.
+        assert.equal(serverClockError({ ErrorNumber: 0, ErrorMessage: '', Value: 1.7e9 }), '');
+        assert.equal(serverClockError(null), '');
+        assert.equal(serverClockError(undefined), '');
+        assert.equal(serverClockError({ Value: 1.7e9 }), '');
+        assert.equal(serverClockError({ ErrorNumber: '1035', ErrorMessage: message }), '');
+        // An error with no usable text still says so, with its number.
+        assert.equal(serverClockError({ ErrorNumber: 1035, ErrorMessage: '   ' }), 'Server clock error 1035');
+        assert.equal(serverClockError({ ErrorNumber: 1035 }), 'Server clock error 1035');
+        assert.equal(serverClockError({ ErrorNumber: 1035, ErrorMessage: 42 }), 'Server clock error 1035');
+    });
+});

@@ -27,6 +27,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -5276,6 +5277,97 @@ int main() {
             // A plausible epoch, so a served-but-empty reply cannot pass.
             EXPECT(json["Value"].is_number_integer() && json["Value"].get<std::int64_t>() > 1600000000);
         }
+
+        // open-astro#674: a ClientTransactionID sent only in the JSON body is
+        // echoed on every reply, not only on the cross-origin 403 (#509). A
+        // successful POST would set this machine's clock, which a unit test
+        // must never do (see above), so the success reply is the GET, served
+        // through the NowFn seam; the POST cases are the InvalidValue replies.
+        {
+            const auto echoed = [](const alpacahttp::Response& response) {
+                const auto json = nlohmann::json::parse(response.body(), nullptr, false);
+                EXPECT(!json.is_discarded());
+                return json.value("ClientTransactionID", 0U);
+            };
+            router.set_now_fn([] { return std::chrono::system_clock::time_point(std::chrono::seconds(1790467200)); });
+            const auto ok = route_request(router, "GET", "/management/v1/synctime", R"({"ClientTransactionID": 4242})");
+            EXPECT(nlohmann::json::parse(ok.body(), nullptr, false).value("ErrorNumber", -1) == 0);
+            EXPECT(echoed(ok) == 4242U);
+            router.set_now_fn([] { return std::chrono::system_clock::now(); });
+
+            for (const char* body :
+                 {R"({"Epoch": 100, "ClientTransactionID": 4242})", R"({"ClientTransactionID": 4242})"}) {
+                const auto response = route_request(router, "POST", "/management/v1/synctime", body);
+                const auto json = nlohmann::json::parse(response.body(), nullptr, false);
+                EXPECT(!json.is_discarded());
+                EXPECT(json.value("ErrorNumber", 0) == static_cast<int>(alpacacore::AlpacaError::InvalidValue));
+                EXPECT(echoed(response) == 4242U);
+            }
+
+            // Same precedence as the 403 path: a non-zero query-string ID wins.
+            const auto both = route_request(router, "POST", "/management/v1/synctime?ClientTransactionID=7",
+                                            R"({"Epoch": 100, "ClientTransactionID": 4242})");
+            EXPECT(echoed(both) == 7U);
+        }
+    }
+
+    // open-astro#675: set_now_fn() may replace the clock while a request
+    // thread is inside the previous one. The call in flight must keep its
+    // callable alive until it returns, the shape HostClock::set_hooks() has
+    // (#399); a plain std::function assignment destroys it under the reader.
+    {
+        alpacahttp::Router router;
+        // Function-local statics, not captures: on the unfixed code the
+        // callable is destroyed while it runs, and a body that reached its
+        // own captures after that would read freed memory before the check
+        // below could report it.
+        static std::mutex gate_mutex;
+        static std::condition_variable gate_cv;
+        static bool entered = false;
+        static bool release = false;
+        struct Token {
+            std::shared_ptr<std::atomic<bool>> destroyed;
+            ~Token() { destroyed->store(true); }
+        };
+        const auto destroyed = std::make_shared<std::atomic<bool>>(false);
+        auto token = std::make_shared<Token>();
+        token->destroyed = destroyed;
+        router.set_now_fn([token] {
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            entered = true;
+            gate_cv.notify_all();
+            gate_cv.wait(lock, [] { return release; });
+            return std::chrono::system_clock::time_point(std::chrono::seconds(1790467200));
+        });
+        token.reset();
+
+        nlohmann::json reply;
+        std::thread reader([&] {
+            reply =
+                nlohmann::json::parse(route_request(router, "GET", "/management/v1/synctime").body(), nullptr, false);
+        });
+        {
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            EXPECT(gate_cv.wait_for(lock, std::chrono::seconds(30), [] { return entered; }));
+        }
+        router.set_now_fn([] { return std::chrono::system_clock::now(); });
+        const bool alive_after_swap = !destroyed->load();
+        {
+            std::lock_guard<std::mutex> lock(gate_mutex);
+            release = true;
+        }
+        gate_cv.notify_all();
+        reader.join();
+        EXPECT(alive_after_swap);
+        // The in-flight call finished on the callable it started with...
+        EXPECT(reply.value("ErrorNumber", -1) == 0);
+        EXPECT(reply.value("Value", std::int64_t{0}) == 1790467200);
+        // ...which was released once it returned, not leaked...
+        EXPECT(destroyed->load());
+        // ...and the next request uses the replacement.
+        const auto next =
+            nlohmann::json::parse(route_request(router, "GET", "/management/v1/synctime").body(), nullptr, false);
+        EXPECT(next.value("Value", std::int64_t{0}) > 1600000000 && next.value("Value", std::int64_t{0}) != 1790467200);
     }
 
     // wifi management endpoints: routing + input validation. The happy paths

@@ -122,6 +122,11 @@ public:
 
     // open-astro#670: test seam for the wall clock GET /management/v1/synctime
     // reports. Production never sets it; the default is system_clock::now.
+    //
+    // open-astro#675: safe to call while requests are being served, like
+    // set_host_clock_hooks() (#399). The clock lives in an immutable snapshot
+    // that a request copies under a mutex and calls with the lock released, so
+    // a replacement never destroys the callable a request thread is inside.
     using NowFn = std::function<std::chrono::system_clock::time_point()>;
     void set_now_fn(NowFn now_fn);
 
@@ -204,6 +209,7 @@ private:
     Response handle_shutdown(const Request& request, std::uint32_t server_tx_id);
     Response handle_restart(const Request& request, std::uint32_t server_tx_id);
     Response handle_sync_time(const Request& request, std::uint32_t server_tx_id);
+    std::shared_ptr<const NowFn> current_now_fn() const;
     // WiFi manager (see docs/wifi-manager-design.md); match.method_name
     // carries the sub-endpoint (status/scan/profiles/connect/ap/country/radio)
     // and, for profile deletes, the UUID.
@@ -455,7 +461,11 @@ private:
     // const-propagation, which a unique_ptr silently drops: a const Router
     // method could reach a non-const HostClock through the pointer.
     alpacacore::util::HostClock host_clock_;
-    NowFn now_fn_ = [] { return std::chrono::system_clock::now(); };
+    // open-astro#675: replaced wholesale by set_now_fn(), never mutated; see
+    // current_now_fn().
+    std::shared_ptr<const NowFn> now_fn_ =
+        std::make_shared<const NowFn>([] { return std::chrono::system_clock::now(); });
+    mutable std::mutex now_fn_mutex_;
 };
 
 } // namespace alpacahttp

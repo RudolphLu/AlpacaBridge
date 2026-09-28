@@ -69,6 +69,18 @@ function isValidClockSeconds(value) {
     return Number.isFinite(value) && !Number.isNaN(new Date(value * 1000).getTime());
 }
 
+// The text the live server clock shows when GET /management/v1/synctime answers
+// with an Alpaca error, or '' when the reply is not one (issue #677). The #670
+// refusal of a host clock outside 2000..2100 UTC carries the fix in its
+// ErrorMessage, so the clock says it rather than keeping a stale time.
+function serverClockError(result) {
+    if (!result || typeof result.ErrorNumber !== 'number' || result.ErrorNumber === 0) {
+        return '';
+    }
+    const message = typeof result.ErrorMessage === 'string' ? result.ErrorMessage.trim() : '';
+    return message || 'Server clock error ' + result.ErrorNumber;
+}
+
 function formatServerClock(date, timeZone) {
     if (Number.isNaN(date.getTime())) {
         // No time to show; the UTC arm below would throw on toISOString().
@@ -196,5 +208,5 @@ function buildBadgeLabel(info) {
 // Browsers ignore this; `node --test` uses it. Guarded rather than a real
 // module so index.html can keep loading the file with a plain <script> tag.
 if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { isValidClockSeconds, localZoneLabel, formatServerClock, buildBadgeLabel };
+    module.exports = { isValidClockSeconds, serverClockError, localZoneLabel, formatServerClock, buildBadgeLabel };
 }

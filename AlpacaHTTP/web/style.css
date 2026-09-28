@@ -681,6 +681,12 @@ input[type="range"] {
     color: #f08a7a;
 }
 
+/* open-astro#677: set while the clock shows "clock error"; a tap shows why. */
+.server-clock[role="button"] {
+    cursor: pointer;
+    text-decoration: underline dotted;
+}
+
 /* Clock lives in the page header bar; the section-card margins don't apply there. */
 header > .server-clock {
     margin-right: 0;
