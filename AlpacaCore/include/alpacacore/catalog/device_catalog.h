@@ -73,9 +73,4 @@ private:
     std::vector<Factory> factories_;
 };
 
-// Register every vendor descriptor slice landed so far (Astroasis today); a factory is
-// registered only when its vendor is built. Pattern: docs/decisions/0004-device-catalog.md.
-void register_builtin_schemas(DeviceCatalog& catalog);
-void register_builtin_factories(DeviceCatalog& catalog);
-
 }  // namespace alpacacore::catalog

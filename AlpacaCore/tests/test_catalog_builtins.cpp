@@ -20,7 +20,7 @@
 // USB scan). Neither opens a real focuser: the path does not exist and the
 // index is far beyond any bus.
 
-#include <alpacacore/catalog/device_catalog.h>
+#include <alpacacore/catalog/builtin_catalog.h>
 #include <alpacacore/util/error_handling.h>
 
 #include <cstdint>

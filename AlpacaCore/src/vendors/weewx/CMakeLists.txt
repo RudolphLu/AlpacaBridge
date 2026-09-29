@@ -16,6 +16,10 @@ if(ALPACACORE_ENABLE_WEEWX)
         ${CMAKE_SOURCE_DIR}/include
     )
 
+    # Base drivers, logging and AsyncConnectable live in alpacacore; this vendor
+    # links down to it, never the reverse (open-astro#710).
+    target_link_libraries(alpacacore_weewx PRIVATE alpacacore)
+
     target_link_libraries(alpacacore_weewx PRIVATE CURL::libcurl)
 
     message(STATUS "WeeWX driver: HTTP JSON feed support enabled")

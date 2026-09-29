@@ -498,7 +498,7 @@ The Web UI (Step 6) should include a connection type selector matching this patt
 Update `AlpacaCore/CMakeLists.txt`:
 1. Add `option(ALPACACORE_ENABLE_<VENDOR> ...)`.
 2. Update `ALPACACORE_ENABLE_ALL_VENDORS` logic (if it exists).
-3. Add conditional `add_subdirectory(src/vendors/<vendor>)` + link.
+3. Add conditional `add_subdirectory(src/vendors/<vendor>)` + `target_link_libraries(alpacacore_builtins PRIVATE alpacacore_<vendor>)` (never link a vendor into `alpacacore`; the vendor's own CMakeLists links `alpacacore` PRIVATE, #710). A vendor whose descriptor factory `register_builtin_factories()` registers (`AlpacaCore/src/catalog/builtin_catalog.cpp`) also needs `target_compile_definitions(alpacacore_builtins PRIVATE ALPACACORE_ENABLE_<VENDOR>)` next to that link, or the registration compiles empty with no build error (see the Astroasis block in `AlpacaCore/CMakeLists.txt`).
 4. Add install rules for vendor target.
 
 Create `AlpacaCore/src/vendors/<vendor>/CMakeLists.txt` for the vendor target.

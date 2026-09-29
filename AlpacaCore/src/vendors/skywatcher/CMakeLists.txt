@@ -16,5 +16,9 @@ if(ALPACACORE_ENABLE_SKYWATCHER)
         ${CMAKE_SOURCE_DIR}/include
     )
 
+    # Base drivers, logging and AsyncConnectable live in alpacacore; this vendor
+    # links down to it, never the reverse (open-astro#710).
+    target_link_libraries(alpacacore_skywatcher PRIVATE alpacacore)
+
     message(STATUS "SkyWatcher driver: Serial and UDP (Wi-Fi) connection support enabled")
 endif()

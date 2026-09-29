@@ -16,5 +16,9 @@ if(ALPACACORE_ENABLE_BISQUE)
         ${CMAKE_SOURCE_DIR}/include
     )
 
+    # Base drivers, logging and AsyncConnectable live in alpacacore; this vendor
+    # links down to it, never the reverse (open-astro#710).
+    target_link_libraries(alpacacore_bisque PRIVATE alpacacore)
+
     message(STATUS "Bisque driver: TCP connection to TheSkyX enabled")
 endif()

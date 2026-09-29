@@ -37,6 +37,10 @@ if(ALPACACORE_ENABLE_SVBONY)
         ${SVB_SDK_INCLUDE}
     )
 
+    # Base drivers, logging and AsyncConnectable live in alpacacore; this vendor
+    # links down to it, never the reverse (open-astro#710).
+    target_link_libraries(alpacacore_svbony PRIVATE alpacacore)
+
     target_link_libraries(alpacacore_svbony PRIVATE ${SVB_LIB_PATH})
 
     if(UNIX)

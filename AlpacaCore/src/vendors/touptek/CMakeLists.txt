@@ -87,6 +87,10 @@ if(ALPACACORE_ENABLE_TOUPTEK)
         ${TOUPTEK_SDK_INCLUDE}
     )
 
+    # Base drivers, logging and AsyncConnectable live in alpacacore; this vendor
+    # links down to it, never the reverse (open-astro#710).
+    target_link_libraries(alpacacore_touptek PRIVATE alpacacore)
+
     # Link the shared library; RPATH covers both install paths used by the
     # workspace (/usr/local/lib via install_alpaca_service.sh) and the Debian
     # package (/usr/lib/alpacabridge via debian/rules).

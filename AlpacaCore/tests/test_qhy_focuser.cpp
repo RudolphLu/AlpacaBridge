@@ -14,9 +14,13 @@
 #include <alpacacore/vendor/qhy/qhy_focuser_driver.h>
 #include <alpacacore/vendor/qhy/qhy_qfocuser_protocol_wrapper.h>
 #include <alpacacore/version.h>
+#include <unistd.h>
 
 #include <chrono>
+#include <filesystem>
 #include <functional>
+#include <string>
+#include <system_error>
 #include <thread>
 
 #include "catch2_compat.h"
@@ -36,6 +40,34 @@ void require_alpaca_error(const std::function<void()>& fn, int expected_code) {
 
 // Never a real device path: a plausible /dev/ttyACM0 could be the actual focuser.
 constexpr const char* kAbsentPort = "/dev/qhy-qfocuser-absent";
+
+// A by-id style symlink to the fake's pty, for cases that unplug the focuser
+// and then expect a reconnect to fail. sever() empties the fake's own path,
+// but the driver keeps the /dev/pts/N it was built with, and once that index
+// is free devpts hands it to the next pty opened on the box: under ctest -j
+// that is often a neighbouring case's fake, which answers the handshake and
+// turns the expected NotConnected into a connect. A removed link is never
+// reissued, so the driver is given this path and unplug() removes it.
+struct UnpluggablePort {
+    alpacacore::test::FakeQhyQFocuser& fake;
+    std::filesystem::path path;
+    explicit UnpluggablePort(alpacacore::test::FakeQhyQFocuser& f) : fake(f) {
+        path = std::filesystem::temp_directory_path() /
+               ("alpacacore-qfocuser-" + std::to_string(::getpid()) + "-" +
+                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_symlink(fake.slave_path(), path);
+    }
+    void unplug() {
+        fake.sever();
+        std::filesystem::remove(path);
+    }
+    ~UnpluggablePort() {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+    UnpluggablePort(const UnpluggablePort&) = delete;
+    UnpluggablePort& operator=(const UnpluggablePort&) = delete;
+};
 
 }  // namespace
 
@@ -292,11 +324,12 @@ TEST_CASE("QHY Q-Focuser Driver - dead link fails fast, no busy-spin", "[qhy][fo
 // Connected=true must reconnect rather than take the idempotency early return.
 TEST_CASE("QHY Q-Focuser Driver - lost link drops Connected and reconnects", "[qhy][focuser][unit]") {
     alpacacore::test::FakeQhyQFocuser fake;
-    auto driver = alpacacore::vendor::qhy::create_qhy_focuser(0, fake.slave_path());
+    UnpluggablePort port(fake);
+    auto driver = alpacacore::vendor::qhy::create_qhy_focuser(0, port.path.string());
     REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
     CHECK(fake.connects() == 1);
 
-    fake.sever();
+    port.unplug();
     require_alpaca_error([&]() { driver->get_position(); }, alpacacore::AlpacaError::NotConnected);
     CHECK(driver->get_connected() == false);
     require_alpaca_error([&]() { driver->get_temperature(); }, alpacacore::AlpacaError::NotConnected);
@@ -305,7 +338,7 @@ TEST_CASE("QHY Q-Focuser Driver - lost link drops Connected and reconnects", "[q
     CHECK(driver->get_max_step() > 0);
 
     // Connected=true against the dead link is a reconnect attempt, not a
-    // no-op: the severed pty path is empty, so the open fails and throws.
+    // no-op: the unplugged port's link is gone, so the open fails and throws.
     require_alpaca_error([&]() { driver->set_connected(true); }, alpacacore::AlpacaError::NotConnected);
     CHECK(driver->get_connected() == false);
 
@@ -369,11 +402,12 @@ TEST_CASE("QHY Q-Focuser Driver - sync disconnect during sync connect is not dro
 // management endpoint renders without a Connected check.
 TEST_CASE("QHY Q-Focuser Driver - explicit disconnect after lost link clears state", "[qhy][focuser][unit]") {
     alpacacore::test::FakeQhyQFocuser fake;
-    auto driver = alpacacore::vendor::qhy::create_qhy_focuser(0, fake.slave_path());
+    UnpluggablePort port(fake);
+    auto driver = alpacacore::vendor::qhy::create_qhy_focuser(0, port.path.string());
     REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
     REQUIRE(driver->get_device_firmware().has_value());
 
-    fake.sever();
+    port.unplug();
     require_alpaca_error([&]() { driver->get_position(); }, alpacacore::AlpacaError::NotConnected);
     CHECK(driver->get_connected() == false);
 

@@ -309,6 +309,7 @@ target_link_libraries(alpacahttp
     PUBLIC
         nlohmann_json::nlohmann_json
         AlpacaCore::alpacacore
+        AlpacaCore::alpacacore_builtins
         ZLIB::ZLIB
         PkgConfig::SYSTEMD
 )

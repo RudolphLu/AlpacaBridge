@@ -15,8 +15,6 @@
 #include <stdexcept>
 #include <string>
 
-#include "builtin_descriptors.h"
-
 namespace alpacacore::catalog {
 
 namespace {
@@ -242,16 +240,6 @@ const Factory* DeviceCatalog::find_factory(const DeviceKey& key) const {
         if (f.key == key) return f.create ? &f : nullptr;
     }
     return nullptr;
-}
-
-void register_builtin_schemas(DeviceCatalog& catalog) { register_astroasis_schema(catalog); }
-
-void register_builtin_factories(DeviceCatalog& catalog) {
-#ifdef ALPACACORE_ENABLE_ASTROASIS
-    register_astroasis_factory(catalog);
-#else
-    (void)catalog;
-#endif
 }
 
 }  // namespace alpacacore::catalog

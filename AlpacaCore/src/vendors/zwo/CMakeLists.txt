@@ -81,6 +81,10 @@ if(ALPACACORE_ENABLE_ZWO)
         ${ALPACACORE_ROOT}/external/ZWO/asiair-plus
     )
 
+    # Base drivers, logging and AsyncConnectable live in alpacacore; this vendor
+    # links down to it, never the reverse (open-astro#710).
+    target_link_libraries(alpacacore_zwo PRIVATE alpacacore)
+
     target_link_libraries(alpacacore_zwo PRIVATE ${ZWO_LIB_PATH} ${ZWO_EAF_LIB_PATH} ${ZWO_EFW_LIB_PATH} ${ZWO_CAA_LIB_PATH})
 
     if(UNIX)

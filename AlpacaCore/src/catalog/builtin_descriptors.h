@@ -18,7 +18,8 @@
 // ever. register_astroasis_schema() is defined in astroasis_schema.cpp
 // (compiles in every build, also no vendor header); register_astroasis_factory()
 // is defined in astroasis_catalog.cpp (vendor header allowed, compiled only
-// under ALPACACORE_ENABLE_ASTROASIS).
+// under ALPACACORE_ENABLE_ASTROASIS). Both are called only from
+// builtin_catalog.cpp (the alpacacore_builtins library, open-astro#710).
 
 #include <alpacacore/catalog/device_catalog.h>
 

@@ -204,7 +204,7 @@ endif()
 
 # Create test executable
 add_executable(alpacacore_tests ${TEST_SOURCES})
-target_link_libraries(alpacacore_tests PRIVATE alpacacore ${CATCH2_MAIN_TARGET})
+target_link_libraries(alpacacore_tests PRIVATE alpacacore alpacacore_builtins ${CATCH2_MAIN_TARGET})
 if(TARGET alpacacore_zwo)
     target_link_libraries(alpacacore_tests PRIVATE alpacacore_zwo)
     # The registry in contract_sweep.h is guarded by this macro; the vendor
