@@ -15,8 +15,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <vector>
 
 #include "catch2_compat.h"
 
@@ -327,6 +330,126 @@ TEST_CASE("ZWO Telescope Driver - a far-off client UTCDate is logged once per co
     driver->set_utc_date(far);
     CHECK(warns.load() == 2);
     driver->set_connected(false);
+}
+
+// open-astro#714: pulse_guide() took pulse_mutex_ and then mutex_ to publish
+// the queue end together with the RA/Dec offsets, while the already-connected
+// Connected=true path took mutex_ and then pulse_mutex_ to clear the queue.
+// PHD2 pulsing while a second client sends Connect deadlocked the driver, and
+// every later call that takes mutex_ (IsPulseGuiding, RightAscension, the
+// poll thread) hung with it. The storm below races the two paths from worker
+// threads, then proves the driver still answers a mutex_-taking call from a
+// probe thread within 1 s (a flag polled from the main thread; never
+// std::async, whose future blocks in its destructor and bounds nothing) and
+// that the redundant Connected=true still drops the queued pulses (Rule 3).
+TEST_CASE(
+    "ZWO Telescope Driver - pulse guiding racing a redundant Connected=true neither deadlocks nor "
+    "survives the reconnect",
+    "[zwo][telescope][unit][pulseguide]") {
+    // :Ggr must answer a non-zero guide rate or pulse_guide() returns before
+    // it touches pulse_mutex_ and the inversion is never exercised (the same
+    // gap hid it from the [stress] case). :GAT "1#" passes the tracking gate,
+    // :SMTI "1#" acks the time sync the reconnect path sends (hash-terminated
+    // so the wrapper's idle-break wait does not add 100 ms to every refresh),
+    // and "0#" is a validly terminated reply for everything else.
+    alpacacore::test::FakeMountServer server([](const std::string& chunk) -> std::string {
+        if (chunk.find(":SMTI") != std::string::npos) {
+            return "1#";
+        }
+        if (chunk.find(":GAT") != std::string::npos) {
+            return "1#";
+        }
+        if (chunk.find(":Ggr") != std::string::npos) {
+            return "0.50#";
+        }
+        return "0#";
+    });
+    REQUIRE(server.ok());
+    alpacacore::vendor::zwo::ConnectionInfo conn;
+    conn.type = alpacacore::vendor::zwo::ConnectionType::Network;
+    conn.host = "127.0.0.1";
+    conn.tcp_port = server.port();
+    conn.response_timeout_ms = 250;
+    auto driver = alpacacore::vendor::zwo::create_zwo_telescope(0, conn);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(5)));
+
+    // The race: PHD2-style pulses from two threads against Connected=true
+    // refreshes from two more, for 3 s. The pulse loops are deliberately
+    // unthrottled: the inversion needs a pulse caller that has taken
+    // pulse_mutex_ and is parked on mutex_ at the instant a refresh wins
+    // mutex_ and then blocks on pulse_mutex_, and a caller that sleeps
+    // between pulses parks on one of the earlier, harmless mutex_ takes in
+    // pulse_guide() instead. Each refresh (~370 ms over the fake) is one
+    // roll of that dice; 3 s of them made the unfixed driver deadlock on
+    // every one of 36 measured runs, where 1.5 s still let 1 in 10 through.
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> workers;
+    for (int i = 0; i < 2; ++i) {
+        workers.emplace_back([&] {
+            while (!stop.load()) {
+                try {
+                    driver->pulse_guide(0, 500);
+                } catch (const std::exception&) {
+                }
+            }
+        });
+        workers.emplace_back([&] {
+            while (!stop.load()) {
+                try {
+                    driver->set_connected(true);
+                } catch (const std::exception&) {
+                }
+            }
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    stop.store(true);
+
+    // Bounded liveness probe: a second thread makes one mutex_-taking call
+    // (IsPulseGuiding) and one lock-free call (Connected) and raises a flag;
+    // the main thread polls the flag for at most 1 s. A deadlocked driver
+    // never raises it, and the REQUIRE below reports that instead of the
+    // process hanging on the join.
+    std::atomic<bool> answered{false};
+    std::atomic<bool> probe_connected{false};
+    std::thread probe([&] {
+        static_cast<void>(driver->get_is_pulse_guiding());
+        probe_connected.store(driver->get_connected());
+        answered.store(true);
+    });
+    const auto probe_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!answered.load() && std::chrono::steady_clock::now() < probe_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    INFO("driver stopped answering mutex_-taking calls while pulse guiding raced Connected=true");
+    REQUIRE(answered.load());
+    probe.join();
+    CHECK(probe_connected.load());
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    // Rule 3: a pulse queued before a redundant Connected=true does not
+    // survive it. Queue one more, refresh, and IsPulseGuiding must drop
+    // within one pulse duration plus the 500 ms hold (a task the pulse
+    // thread had already dequeued still runs its remaining 500 ms; a
+    // QUEUED one is dropped, so nothing follows it).
+    driver->pulse_guide(0, 500);
+    CHECK(driver->get_is_pulse_guiding());
+    driver->set_connected(true);
+    const auto clear_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+    bool cleared = false;
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (!driver->get_is_pulse_guiding()) {
+            cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(cleared);
+    CHECK(driver->get_connected());
+
+    CHECK(alpacacore::test::settle_connected(*driver, false));
 }
 
 #endif  // _WIN32

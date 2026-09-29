@@ -217,13 +217,22 @@ alpacacore::vendor::zwo::ConnectionInfo zwo_endpoint(int port) {
 }
 
 // LX200-flavored canned replies: report tracking ON so PulseGuide gets past
-// its tracking gate and actually queues work onto the pulse thread; default
-// "0#" is a validly-terminated reply for everything else (":MS#" -> "0" is a
-// GOTO accept, so the GOTO thread completes its protocol round-trip too).
+// its tracking gate and actually queues work onto the pulse thread; answer
+// the guide-rate query with a NON-ZERO rate (open-astro#714): with the
+// default "0#" the driver read a zero guide rate at connect and returned
+// from pulse_guide() before ever touching pulse_mutex_, so the storm never
+// exercised the pulse_mutex_ -> mutex_ acquisition that inverts the
+// connect path's mutex_ -> pulse_mutex_ order, and TSan had nothing to
+// report. Default "0#" is a validly-terminated reply for everything else
+// (":MS#" -> "0" is a GOTO accept, so the GOTO thread completes its protocol
+// round-trip too).
 alpacacore::test::FakeMountServer::Responder zwo_responder() {
     return [](const std::string& chunk) -> std::string {
         if (chunk.find(":GAT") != std::string::npos) {
             return "1#";
+        }
+        if (chunk.find(":Ggr") != std::string::npos) {
+            return "0.50#";
         }
         return "0#";
     };
@@ -260,6 +269,13 @@ TEST_CASE("ZWO mount - concurrent connect/disconnect/slew/pulse stress", "[zwo][
         // guiding (pulse thread queue) issued while other threads disconnect.
         guard([&] { scope.slew_to_coordinates_async(5.0, 20.0); });
         guard([&] { scope.pulse_guide(0, 50); });
+        // open-astro#714: Connected=true on an already-connected driver takes
+        // mutex_ and then pulse_mutex_ (the pulse-queue clear); pulse_guide()
+        // above takes them in the opposite order. Racing the two from the
+        // storm is what makes the sanitizers-tsan job report the
+        // lock-order-inversion (and what deadlocks a PHD2 guiding session
+        // against a client's Connect on hardware).
+        guard([&] { scope.set_connected(true); });
         guard([&] { scope.abort_slew(); });
     });
 
