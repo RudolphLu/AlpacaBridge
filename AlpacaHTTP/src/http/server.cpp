@@ -205,8 +205,8 @@ void Server::stop() {
         // live one. Between this `!running_` read and the lock inside, a
         // restart (handle_restart_request() stops then starts on a detached
         // thread) can install a running server -- adopting it hangs this
-        // caller forever, which for the example embedder is the process never
-        // exiting.
+        // caller forever, which for an embedder that also calls stop() is the
+        // process never exiting.
         join_server_thread(std::this_thread::get_id(), /*only_if_stopped=*/true);
         return;
     }
@@ -311,9 +311,9 @@ void Server::join_server_thread(std::thread::id current_id, bool only_if_stopped
     // Take sole ownership of the thread under server_thread_mutex_, then act
     // on it with the lock released. Whoever wins the move joins; every other
     // caller finds server_thread_ empty and returns, so exactly one join()
-    // ever runs on it. stop() is re-entrant from another thread (the shutdown
-    // endpoint's detached thread runs the shutdown callback, which can make
-    // the embedder's loop call stop() as well), and concurrent join() on one
+    // ever runs on it. stop() is re-entrant from another thread (the restart
+    // endpoint's detached thread stops the server, and an embedder that also
+    // calls stop() can run it at the same time), and concurrent join() on one
     // std::thread is UB -- in practice the second pthread_join throws
     // std::system_error that nothing catches, i.e. std::terminate().
     //
@@ -325,8 +325,8 @@ void Server::join_server_thread(std::thread::id current_id, bool only_if_stopped
     // matter:
     //
     //  - Exactly one caller may join. stop() is re-entrant from another thread
-    //    (the shutdown endpoint's detached thread runs the shutdown callback,
-    //    which can make the embedder's own loop call stop() too), and
+    //    (the restart endpoint's detached thread stops the server, and an
+    //    embedder that also calls stop() can run it at the same time), and
     //    concurrent join() on one std::thread is UB -- in practice the second
     //    pthread_join throws std::system_error that nothing catches.
     //
@@ -348,8 +348,8 @@ void Server::join_server_thread(std::thread::id current_id, bool only_if_stopped
         // releases the mutex, so by the time it wakes the winner may already
         // have finished its join, returned from stop() and called
         // start_async() again -- the restart path (handle_restart_request()
-        // stops and restarts while the embedder's loop, seeing is_running()
-        // false, calls stop() too) does exactly that. Re-reading
+        // stops and restarts, while an embedder that also calls stop() from
+        // its own thread can land in between) does exactly that. Re-reading
         // server_thread_ blind would then adopt the NEW server's thread and
         // join it, hanging stop() forever while the restarted server runs on.
         const std::uint64_t generation = server_thread_generation_;
@@ -1508,9 +1508,15 @@ void Server::handle_shutdown_request() {
         } catch (...) {
             util::log_error("Shutdown callback threw unknown exception");
         }
+        // The embedder asked to be told, so the embedder owns the stop: the
+        // example server's loop calls server.stop() once and that call returns
+        // only after every server thread is joined. A second stop() from here
+        // raced it (the concurrent-stop case in test_server_socket.cpp) and
+        // dropped is_running() before the embedder had acted (#713).
+        return;
     }
 
-    stop();
+    stop();  // no callback installed: the handler is the only thing that can stop the server
 }
 
 void Server::handle_restart_request() {
@@ -1539,8 +1545,15 @@ void Server::handle_restart_request() {
     }
 
     util::log_info("Restarting HTTP server");
+    // Made odd BEFORE stop() clears running_, even again only after
+    // start_async() has returned: is_running() never reads false across the
+    // join window. If run_server() then fails to bind, it clears running_
+    // itself and is_running() drops for real -- the embedder exits 1 and
+    // systemd respawns.
+    ++restart_epoch_;
     stop();
     start_async();
+    ++restart_epoch_;
     restart_requested_ = false;
 }
 
