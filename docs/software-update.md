@@ -47,12 +47,22 @@ through the upgrade. `debian/rules` passes only `alpacabridge.service` to
 snippets for the helper: an upgrade must not restart the updater from inside
 the updater.
 
-The helper writes its transcript to `/var/log/AlpacaBridge/update.log`
-(world-readable, truncated at the start of each run) and ends it with one of
+The helper writes its transcript to `/var/log/alpacabridge-update/update.log`
+(truncated at the start of each run, world-readable) and ends it with one of
 two markers, `=== RESULT: success` or `=== RESULT: failure`. The daemon reads
 the tail of that file for the UI and uses the marker as the durable record of
 the last run, because a finished oneshot unit is garbage-collected by systemd
 and reads as never-run afterwards.
+
+The transcript directory is the helper unit's own `LogsDirectory=`, created
+`root:root 0755`, and deliberately not the daemon's `/var/log/AlpacaBridge`:
+that directory belongs to the `alpacabridge` user, and a root process that
+truncates and `chmod`s a path there would follow a symlink the service user
+planted, turning the update button into a way to clobber any root-owned file.
+No check inside the script can close that race, only a directory the service
+user cannot write to. The path is fixed on both sides (`kUpdateLogPath` in
+`software_update.h`, `LOG=` in the script) and `test_software_update` fails if
+they disagree or if the daemon's unit claims the same directory.
 
 ## API
 
@@ -138,7 +148,7 @@ install.
 - The upgrade disconnects every Alpaca client for a few seconds when the
   service restarts. Do not start it mid-exposure or mid-slew. The
   confirmation dialog says so.
-- A failed run keeps its transcript in `/var/log/AlpacaBridge/update.log`, and
+- A failed run keeps its transcript in `/var/log/alpacabridge-update/update.log`, and
   `journalctl -u alpacabridge-update` has the same text.
 - On a host without `polkitd`, or where the rule file is missing, the install
   answers with a message naming both; the check still works, and

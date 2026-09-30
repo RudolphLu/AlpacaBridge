@@ -18,7 +18,10 @@
 #include <alpacahttp/software_update.h>
 #include <alpacahttp/util/error_mapping.h>
 
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
@@ -474,6 +477,34 @@ int main() {
         const std::string notes = status["ReleaseNotes"].get<std::string>();
         EXPECT(notes.size() < SoftwareUpdateManager::kReleaseNotesMaxBytes + 100);
         EXPECT(notes.find("(notes truncated)") != std::string::npos);
+    }
+
+    // --- the transcript path is fixed, root-owned, and the same on both
+    // sides (PR #745 review: a transcript in the daemon's own log directory
+    // let the root helper follow a symlink the service user planted).
+    {
+        using alpacahttp::util::kUpdateLogPath;
+        const std::string path = kUpdateLogPath;
+        EXPECT(path.rfind("/var/log/alpacabridge-update/", 0) == 0);
+        EXPECT(path.find("/var/log/AlpacaBridge/") == std::string::npos);
+
+        const std::filesystem::path repo = ALPACAHTTP_REPO_ROOT;
+        const auto read = [](const std::filesystem::path& p) {
+            std::ifstream in(p);
+            return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        };
+        const std::string script = read(repo / "debian" / "alpacabridge-software-update");
+        EXPECT(!script.empty());
+        EXPECT(script.find("LOG=" + path + "\n") != std::string::npos);
+        const std::string unit = read(repo / "debian" / "alpacabridge-update.service");
+        EXPECT(!unit.empty());
+        // The directory component must be the helper unit's own LogsDirectory=.
+        const std::string dir = std::filesystem::path(path).parent_path().filename().string();
+        EXPECT(unit.find("LogsDirectory=" + dir + "\n") != std::string::npos);
+        // And the daemon's own unit must not claim it.
+        const std::string daemon_unit = read(repo / "debian" / "alpacabridge.service");
+        EXPECT(!daemon_unit.empty());
+        EXPECT(daemon_unit.find("LogsDirectory=" + dir + "\n") == std::string::npos);
     }
 
     std::cout << "All software update tests passed!\n";

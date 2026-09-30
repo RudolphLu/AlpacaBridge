@@ -436,5 +436,9 @@ if(ALPACAHTTP_BUILD_TESTS)
     # manager's policy over a scripted backend (docs/software-update.md).
     add_executable(test_software_update tests/test_software_update.cpp)
     target_link_libraries(test_software_update alpacahttp)
+    # It reads debian/alpacabridge-software-update and the two unit files to
+    # pin the transcript path on both sides of the root helper.
+    target_compile_definitions(test_software_update PRIVATE
+        ALPACAHTTP_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/..")
     add_test(NAME test_software_update COMMAND test_software_update)
 endif()

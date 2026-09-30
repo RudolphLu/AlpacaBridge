@@ -471,41 +471,56 @@ nlohmann::json SoftwareUpdateManager::status() {
 }
 
 nlohmann::json SoftwareUpdateManager::check() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    // The fetches run WITHOUT mutex_: each can take up to kFetchTimeout, and
+    // a status poll from the page must not queue behind a slow mirror. The
+    // settings are immutable after construction, so they are read lock-free;
+    // only the cached result is written under the lock, and two concurrent
+    // checks simply race to store equivalent answers.
+    std::string index;
     try {
-        const std::string index = backend_->fetch_url(settings_.packages_url, kFetchTimeout);
-        const auto version = find_package_version(index, settings_.package);
-        if (!version) {
-            throw SoftwareUpdateError(ErrorCode::DRIVER_ERROR, "Update check failed: no '" + settings_.package +
-                                                                   "' package listed at " + settings_.packages_url);
-        }
-        latest_version_ = *version;
-        checked_at_ = std::chrono::system_clock::now();
-        check_error_.reset();
-        release_notes_.reset();
-        const bool available = update_available_locked();
-        log_info("Software update check: installed " + settings_.installed_version + ", repository " + *version +
-                 (available ? " (update available)" : " (up to date)"));
-        if (available && !settings_.release_notes_url_template.empty()) {
-            const std::string notes_url = expand_version_template(settings_.release_notes_url_template, *version);
-            try {
-                std::string notes = backend_->fetch_url(notes_url, kFetchTimeout);
-                if (notes.size() > kReleaseNotesMaxBytes) {
-                    notes.resize(kReleaseNotesMaxBytes);
-                    notes += "\n\n(notes truncated)\n";
-                }
-                release_notes_ = std::move(notes);
-            } catch (const SoftwareUpdateError& e) {
-                // Best effort: the release page still has them.
-                log_warning("Software update: release notes for " + *version + " not available (" + e.what() + ")");
-            }
-        }
+        index = backend_->fetch_url(settings_.packages_url, kFetchTimeout);
     } catch (const SoftwareUpdateError& e) {
+        std::lock_guard<std::mutex> lock(mutex_);
         checked_at_ = std::chrono::system_clock::now();
         check_error_ = e.what();
         log_warning(e.what());
         throw;
     }
+    const auto version = find_package_version(index, settings_.package);
+    if (!version) {
+        SoftwareUpdateError error(ErrorCode::DRIVER_ERROR, "Update check failed: no '" + settings_.package +
+                                                               "' package listed at " + settings_.packages_url);
+        std::lock_guard<std::mutex> lock(mutex_);
+        checked_at_ = std::chrono::system_clock::now();
+        check_error_ = error.what();
+        log_warning(error.what());
+        throw error;
+    }
+    const bool available = compare_debian_versions(*version, settings_.installed_version) > 0;
+    log_info("Software update check: installed " + settings_.installed_version + ", repository " + *version +
+             (available ? " (update available)" : " (up to date)"));
+
+    std::optional<std::string> notes;
+    if (available && !settings_.release_notes_url_template.empty()) {
+        const std::string notes_url = expand_version_template(settings_.release_notes_url_template, *version);
+        try {
+            std::string text = backend_->fetch_url(notes_url, kFetchTimeout);
+            if (text.size() > kReleaseNotesMaxBytes) {
+                text.resize(kReleaseNotesMaxBytes);
+                text += "\n\n(notes truncated)\n";
+            }
+            notes = std::move(text);
+        } catch (const SoftwareUpdateError& e) {
+            // Best effort: the release page still has them.
+            log_warning("Software update: release notes for " + *version + " not available (" + e.what() + ")");
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    latest_version_ = *version;
+    checked_at_ = std::chrono::system_clock::now();
+    check_error_.reset();
+    release_notes_ = std::move(notes);
     return status_locked();
 }
 

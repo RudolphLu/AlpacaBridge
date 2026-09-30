@@ -1169,6 +1169,13 @@ the operation needs, never add a fourth without a decision record:
     enable/start/restart snippets for EVERY non-template unit in the package,
     `[Install]` section or not, and the new postinst would restart the helper
     from inside the apt run the helper is executing.
+  - **A root helper never writes into a directory the service user owns.**
+    The transcript first went to the daemon's `LogsDirectory` (`/var/log/AlpacaBridge`,
+    owned by `alpacabridge`): root truncating and `chmod`-ing a path there
+    follows a symlink the service user planted, and no `[ -L ]` check in the
+    script closes the race (PR #745 review). Give the helper unit its own
+    `LogsDirectory=` (root:root 0755) and pin the path on both sides with a test
+    (`kUpdateLogPath` vs `LOG=` in the script).
   - **The helper's transcript is the durable record**, not systemd's state: a
     finished oneshot unit is garbage-collected and `LoadUnit` then reports it
     as never run. The helper ends its log with a result marker the daemon

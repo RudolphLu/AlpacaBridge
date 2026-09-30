@@ -54,13 +54,12 @@ Server::Server(const Config& config)
     router_.set_sync_system_clock_from_clients(config_.sync_system_clock_from_clients());
     router_.set_motion_watchdog_interval(std::chrono::seconds(config_.motion_watchdog_seconds()));
     // Software update (docs/software-update.md): the helper unit writes its
-    // transcript next to the daily logs, so the daemon reads it from the same
-    // directory it logs to.
+    // transcript to a root-owned directory of its own, never the daemon's log
+    // directory (software_update.h explains why), so the path is fixed.
     router_.set_software_update_manager(std::make_unique<util::SoftwareUpdateManager>(
         util::SoftwareUpdateSettings{alpacahttp::kVersion, config_.update_packages_url(), util::kDefaultPackageName,
                                      config_.update_release_notes_url(), config_.update_release_url()},
-        std::make_unique<util::SystemSoftwareUpdateBackend>(util::kDefaultInstallerUnit,
-                                                            config_.log_directory() + "/" + util::kUpdateLogFilename)));
+        std::make_unique<util::SystemSoftwareUpdateBackend>(util::kDefaultInstallerUnit, util::kUpdateLogPath)));
 
     // The reactor's wake pipe lives as long as the Server. Non-blocking on
     // both ends: a wake is one byte, and a full pipe already means a wake is

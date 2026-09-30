@@ -34,8 +34,13 @@
 //    arguments: what the helper installs is fixed in the unit file, and apt
 //    verifies the repository signature as it would for a manual upgrade.
 //
-// The helper writes its transcript to <log directory>/update.log, which the
-// daemon reads back for the web UI. The upgrade restarts alpacabridge.service
+// The helper writes its transcript to kUpdateLogPath, a file in a directory
+// that only root can write (the helper unit's own LogsDirectory=), and the
+// daemon reads it back for the web UI. It must never live in a directory the
+// service user can write, such as the daemon's own log directory: root
+// truncating and chmod-ing a path there would follow a symlink the service
+// user planted (PR #745 review), and no check in the script can close that
+// race. test_software_update pins the path against the packaging files. The upgrade restarts alpacabridge.service
 // from the new package's postinst, so the daemon reporting progress is the
 // one being replaced; the helper unit is not in its cgroup and survives.
 //
@@ -200,7 +205,10 @@ private:
 inline constexpr const char* kDefaultInstallerUnit = "alpacabridge-update.service";
 inline constexpr const char* kDefaultPackageName = "alpacabridge";
 inline constexpr const char* kDefaultPackagesUrl = "https://apt.openastro.net/dists/trixie/main/binary-arm64/Packages";
-inline constexpr const char* kUpdateLogFilename = "update.log";
+// Written by debian/alpacabridge-software-update under the helper unit's
+// LogsDirectory=alpacabridge-update (root:root 0755). Fixed, not derived from
+// the daemon's log directory: see the file comment above.
+inline constexpr const char* kUpdateLogPath = "/var/log/alpacabridge-update/update.log";
 // The plain-language notes /bump-release writes for every release, read at
 // the release tag; the GitHub Release body is built from the same file.
 inline constexpr const char* kDefaultReleaseNotesUrl =

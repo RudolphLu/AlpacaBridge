@@ -6,19 +6,24 @@
 # the one package this host already has installed from the apt sources the
 # host already trusts; nothing here is parameterised by the daemon.
 #
-# The transcript goes to /var/log/AlpacaBridge/update.log (world-readable, so
-# the non-root daemon can show it) and ends with one of two markers the daemon
-# parses:
+# The transcript goes to /var/log/alpacabridge-update/update.log, the helper
+# unit's own LogsDirectory= (root:root 0755, so the non-root daemon can read
+# it and nothing but root can write there). It must never move into
+# /var/log/AlpacaBridge: that directory is owned by the alpacabridge user, and
+# this script truncates and chmods LOG as root, which would follow a symlink
+# planted there (PR #745 review). The daemon reads the same fixed path
+# (kUpdateLogPath in AlpacaHTTP/include/alpacahttp/software_update.h) and
+# test_software_update checks the two agree. The transcript ends with one of
+# two markers the daemon parses:
 #   === RESULT: success ...
 #   === RESULT: failure ...
 # A transcript without a marker means the run was killed or the host rebooted
-# mid-upgrade. The daemon's log directory is /var/log/AlpacaBridge under the
-# packaged service; keep LOG in step with logging.directory if that ever moves.
+# mid-upgrade.
 
 set -u
 
 PACKAGE=alpacabridge
-LOG=/var/log/AlpacaBridge/update.log
+LOG=/var/log/alpacabridge-update/update.log
 APT_OPTS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::=--force-confold)
 
 export DEBIAN_FRONTEND=noninteractive
