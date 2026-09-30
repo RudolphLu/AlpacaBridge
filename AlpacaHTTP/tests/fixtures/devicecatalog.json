@@ -11,6 +11,18 @@
     ]
   },
   {
+    "vendor": "weewx",
+    "deviceType": "observingconditions",
+    "displayName": "WeeWX Observing Conditions",
+    "available": true,
+    "buildOption": "ALPACACORE_ENABLE_WEEWX",
+    "fields": [
+      {"key": "weewxUrl", "type": "string", "default": "", "required": false, "secret": false, "role": "Plain"},
+      {"key": "pollIntervalSeconds", "type": "int", "default": 900, "required": false, "secret": false, "role": "Plain"},
+      {"key": "timeoutMs", "type": "int", "default": 5000, "required": false, "secret": false, "role": "Plain"}
+    ]
+  },
+  {
     "vendor": "zzz",
     "deviceType": "focuser",
     "displayName": "Test Focuser",

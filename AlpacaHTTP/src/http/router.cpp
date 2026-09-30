@@ -85,9 +85,6 @@
 #include <alpacacore/vendor/qhy/qhy_filterwheel_driver.h>
 #include <alpacacore/vendor/qhy/qhy_focuser_driver.h>
 #endif
-#ifdef ALPACACORE_ENABLE_WEEWX
-#include <alpacacore/vendor/weewx/weewx_observingconditions_driver.h>
-#endif
 #ifdef ALPACACORE_ENABLE_GEMINI
 #include <alpacacore/vendor/gemini/gemini_flatpanel_driver.h>
 #include <alpacacore/vendor/gemini/gemini_focuser_driver.h>
@@ -8893,42 +8890,6 @@ bool Router::register_device_from_config(const nlohmann::json& config, std::stri
 #endif
     }
 
-    if (vendor == "weewx" && device_type_str == "observingconditions") {
-#ifdef ALPACACORE_ENABLE_WEEWX
-        alpacacore::vendor::weewx::WeeWxHttpConfig weewx_config;
-        weewx_config.url = config_get(config, "weewxUrl", "");
-        int poll_interval = config_get(config, "pollIntervalSeconds", 900);
-        int timeout_ms = config_get(config, "timeoutMs", 5000);
-        if (weewx_config.url.empty()) {
-            error_message = "WeeWX observing conditions requires weewxUrl";
-            return false;
-        }
-        if (poll_interval <= 0) {
-            error_message = "pollIntervalSeconds must be greater than 0";
-            return false;
-        }
-        if (timeout_ms <= 0) {
-            error_message = "timeoutMs must be greater than 0";
-            return false;
-        }
-        weewx_config.poll_interval = std::chrono::seconds(poll_interval);
-        weewx_config.timeout = std::chrono::milliseconds(timeout_ms);
-
-        auto observing = alpacacore::vendor::weewx::create_weewx_observingconditions(
-            device_number, weewx_config);
-        if (registry.register_device(std::shared_ptr<alpacacore::AlpacaDriver>(std::move(observing)))) {
-            util::log_info("Registered WeeWX observing conditions");
-            return true;
-        }
-
-        error_message = "Failed to register device. Device may already exist.";
-        return false;
-#else
-        error_message = "WeeWX support not enabled. Rebuild with -DALPACACORE_ENABLE_WEEWX=ON";
-        return false;
-#endif
-    }
-
     if (vendor == "qhy" && device_type_str == "camera") {
 #ifdef ALPACACORE_ENABLE_QHY
         std::string camera_id = config_get(config, "cameraId", "");
@@ -9949,10 +9910,6 @@ nlohmann::json Router::sanitize_device_config(const nlohmann::json& config) cons
             // Camera and the thermal switch both bind by camera index.
             copy_if_present("cameraIndex");
         }
-    } else if (vendor == "weewx") {
-        copy_if_present("weewxUrl");
-        copy_if_present("pollIntervalSeconds");
-        copy_if_present("timeoutMs");
     } else if (vendor == "celestron") {
         copy_if_present("connectionType");
         copy_if_present("mountIndex");

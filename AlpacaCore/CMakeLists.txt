@@ -125,6 +125,7 @@ add_library(AlpacaCore::alpacacore ALIAS alpacacore)
 add_library(alpacacore_builtins STATIC
     src/catalog/builtin_catalog.cpp
     src/vendors/astroasis/astroasis_schema.cpp
+    src/vendors/weewx/weewx_schema.cpp
 )
 target_link_libraries(alpacacore_builtins PUBLIC alpacacore)
 add_library(AlpacaCore::alpacacore_builtins ALIAS alpacacore_builtins)
@@ -178,6 +179,10 @@ if(ALPACACORE_ENABLE_WEEWX)
     add_subdirectory(src/vendors/weewx)
     if(TARGET alpacacore_weewx)
         target_link_libraries(alpacacore_builtins PRIVATE alpacacore_weewx)
+        # register_builtin_factories() (src/catalog/builtin_catalog.cpp) guards its
+        # WeeWX factory registration behind this macro. Without it the
+        # registration compiles empty even though alpacacore_weewx links fine.
+        target_compile_definitions(alpacacore_builtins PRIVATE ALPACACORE_ENABLE_WEEWX)
     endif()
 endif()
 

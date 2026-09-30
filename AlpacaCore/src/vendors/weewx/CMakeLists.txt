@@ -8,6 +8,7 @@ if(ALPACACORE_ENABLE_WEEWX)
 
     set(WEEWX_SOURCES
         weewx_observingconditions_driver.cpp
+        weewx_catalog.cpp
     )
 
     add_library(alpacacore_weewx STATIC ${WEEWX_SOURCES})

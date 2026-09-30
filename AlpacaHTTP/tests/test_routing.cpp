@@ -130,6 +130,7 @@ void remove_device(alpacahttp::Router& router, const std::string& vendor, const 
 struct ApiAttempt {
     bool ok = false;
     std::string message;
+    int error_number = 0;
     nlohmann::json config;
 };
 
@@ -175,7 +176,8 @@ ApiAttempt api_attempt(alpacahttp::Router& router, const nlohmann::json& posted,
         attempt.message = "<non-JSON response>";
         return attempt;
     }
-    if (response.value("ErrorNumber", -1) != 0) {
+    attempt.error_number = response.value("ErrorNumber", -1);
+    if (attempt.error_number != 0) {
         attempt.message = response.value("ErrorMessage", "");
         return attempt;
     }
@@ -6172,7 +6174,7 @@ int main() {
     // catalog in the management envelope. The shape is pinned by the committed
     // fixture tests/fixtures/devicecatalog.json (a fixture change is a
     // deliberate commit). The catalog under test holds the built-in Astroasis
-    // descriptor plus the "zzz" test descriptor, schema only, so its
+    // and WeeWX descriptors plus the "zzz" test descriptor, schema only, so its
     // `available` is false.
     {
         alpacahttp::Router router;
@@ -6183,14 +6185,21 @@ int main() {
         std::ifstream fixture_in(fixture_path);
         EXPECT(fixture_in.good());
         nlohmann::json fixture = nlohmann::json::parse(fixture_in, nullptr, false);
-        EXPECT(!fixture.is_discarded() && fixture.is_array() && fixture.size() == 2);
+        EXPECT(!fixture.is_discarded() && fixture.is_array() && fixture.size() == 3);
         // The fixture is written for the all-vendors build. `available` is the
         // one value that depends on the build (true with the vendor on, false
-        // with ALPACACORE_ENABLE_ASTROASIS=OFF), so it is set from this build
+        // with ALPACACORE_ENABLE_<VENDOR>=OFF), so it is set from this build
         // before the compare; every other byte must match.
         for (auto& entry : fixture) {
             if (entry.value("vendor", "") == "astroasis") {
 #ifdef ALPACACORE_ENABLE_ASTROASIS
+                entry["available"] = true;
+#else
+                entry["available"] = false;
+#endif
+            }
+            if (entry.value("vendor", "") == "weewx") {
+#ifdef ALPACACORE_ENABLE_WEEWX
                 entry["available"] = true;
 #else
                 entry["available"] = false;
@@ -6355,6 +6364,58 @@ int main() {
         EXPECT(!off.ok);
         EXPECT(off.message == "Astroasis support not enabled. Rebuild with -DALPACACORE_ENABLE_ASTROASIS=ON");
         EXPECT(listed_entry(router, "Focuser", 9257).is_null());
+    }
+#endif
+
+#ifdef ALPACACORE_ENABLE_WEEWX
+    // open-astro#731: the WeeWX refusals keep the router arm's exact text on
+    // the API path, and a persisted entry that breaks one is still not
+    // registered (listed as failed to load, so it stays editable). The first
+    // three rows were green before the arm moved into the catalog and pin the
+    // texts and outcome across it; the last two pin the factory's INT_MAX bound,
+    // which keeps the int domain the arm read both numbers in.
+    {
+        const char* const kBadConfigs[][2] = {
+            {R"({"pollIntervalSeconds":300,"timeoutMs":2500})", "WeeWX observing conditions requires weewxUrl"},
+            {R"({"weewxUrl":"http://weewx.test:8998/current.json","pollIntervalSeconds":0})",
+             "pollIntervalSeconds must be greater than 0"},
+            {R"({"weewxUrl":"http://weewx.test:8998/current.json","timeoutMs":0})", "timeoutMs must be greater than 0"},
+            {R"({"weewxUrl":"http://weewx.test:8998/current.json","pollIntervalSeconds":10000000000})",
+             "pollIntervalSeconds must be at most 2147483647"},
+            {R"({"weewxUrl":"http://weewx.test:8998/current.json","timeoutMs":10000000000})",
+             "timeoutMs must be at most 2147483647"},
+        };
+        int number = 9265;
+        for (const auto& bad : kBadConfigs) {
+            nlohmann::json entry = nlohmann::json::parse(bad[0]);
+            entry.update({{"vendor", "weewx"}, {"deviceType", "observingconditions"}, {"deviceNumber", ++number}});
+
+            alpacahttp::Router router;
+            const auto api = api_attempt(router, entry, "ObservingConditions");
+            EXPECT(!api.ok);
+            EXPECT(api.message == bad[1]);
+            EXPECT(api.error_number == 0x401);  // InvalidValue
+            EXPECT(listed_entry(router, "ObservingConditions", number).is_null());
+
+            const auto persisted = persisted_attempt(entry, "ObservingConditions");
+            EXPECT(!persisted.listed);
+            EXPECT(persisted.failed_listed);
+        }
+    }
+#else
+    // open-astro#731: with the vendor built out, the catalog path reports the
+    // deleted arm's exact text.
+    {
+        alpacahttp::Router router;
+        const auto off = api_attempt(
+            router,
+            nlohmann::json::parse(R"({"vendor":"weewx","deviceType":"observingconditions","deviceNumber":9264,)"
+                                  R"("weewxUrl":"http://weewx.test:8998/current.json"})"),
+            "ObservingConditions");
+        EXPECT(!off.ok);
+        EXPECT(off.message == "WeeWX support not enabled. Rebuild with -DALPACACORE_ENABLE_WEEWX=ON");
+        EXPECT(off.error_number == 0x400);  // NotImplemented
+        EXPECT(listed_entry(router, "ObservingConditions", 9264).is_null());
     }
 #endif
 
