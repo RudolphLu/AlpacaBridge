@@ -127,7 +127,15 @@ public:
                 if (!sdk_.is_control_available(id, control::CFWPORT)) {
                     throw AlpacaException("No CFW detected on this QHY camera", AlpacaError::NotConnected);
                 }
-                int slots = static_cast<int>(sdk_.get_param(id, control::CFWSLOTSNUM));
+                const double raw_slots = sdk_.get_param(id, control::CFWSLOTSNUM);
+                int slots = 0;
+                try {
+                    slots = param_to_int(raw_slots, "CFW slot count");
+                } catch (const AlpacaException&) {
+                    // Unreadable (the QHYCCD_ERROR sentinel, issue #510): refused
+                    // below with the same text as a zero count.
+                    slots = 0;
+                }
                 if (slots <= 0) {
                     throw AlpacaException("QHY CFW reported an invalid slot count", AlpacaError::DriverException);
                 }

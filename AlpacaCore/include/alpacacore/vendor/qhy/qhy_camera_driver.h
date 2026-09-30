@@ -15,6 +15,8 @@
 #include <alpacacore/camera_driver.h>
 #include <alpacacore/vendor/qhy/qhy_sdk_wrapper.h>
 
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -71,5 +73,24 @@ std::unique_ptr<CameraDriver> create_qhy_camera_by_index(int device_number, int 
  */
 std::unique_ptr<CameraDriver> create_qhy_camera(int device_number, const std::string& camera_id, QHYSDK& sdk);
 std::unique_ptr<CameraDriver> create_qhy_camera_by_index(int device_number, int camera_index, QHYSDK& sdk);
+
+/// The camera driver's two polling workers, as named to a QHYWorkerStartHook.
+enum class QHYWorker : std::uint8_t { Telemetry, TempControl };
+
+/**
+ * @brief Test-only hook, called by each worker start after the new thread is
+ * built and before it is stored in the driver (issue #510).
+ *
+ * A disconnect that lands in that window is what used to strand the worker
+ * for the life of the driver, and no SDK call runs there, so
+ * FakeQHYSDK::before_call cannot hold it open. The hook runs on the starting
+ * thread with only the driver's thread-start mutex held, and must not throw
+ * (the built thread is still unstored). A hook that blocks must be released
+ * before the driver is destroyed. Production passes none.
+ */
+using QHYWorkerStartHook = std::function<void(QHYWorker)>;
+
+std::unique_ptr<CameraDriver> create_qhy_camera(int device_number, const std::string& camera_id, QHYSDK& sdk,
+                                                QHYWorkerStartHook on_worker_start);
 
 } // namespace alpacacore::vendor::qhy

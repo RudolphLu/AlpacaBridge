@@ -15,7 +15,11 @@
 #include <alpacacore/version.h>
 
 #include <chrono>
+#include <cmath>
+#include <condition_variable>
 #include <functional>
+#include <limits>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -46,6 +50,80 @@ using alpacacore::test::LockedQHYSDK;
 // looks like had to be made in three places with nothing failing if it was
 // made in two.
 FakeQHYSDK make_fake(const std::string& id = "fake-qhy-0") { return FakeQHYSDK::with_one_camera(id); }
+
+using alpacacore::vendor::qhy::QHYWorker;
+
+// Holds the first start of one worker between building its thread and storing
+// it (issue #510), through the driver's test-only QHYWorkerStartHook. Declare
+// it before the driver: the destructor releases a held start, so a failing
+// case cannot leave the connector parked while the driver is destroyed.
+class WorkerStartGate {
+public:
+    explicit WorkerStartGate(QHYWorker which) : which_(which) {}
+    WorkerStartGate(const WorkerStartGate&) = delete;
+    WorkerStartGate& operator=(const WorkerStartGate&) = delete;
+    ~WorkerStartGate() { release(); }
+
+    alpacacore::vendor::qhy::QHYWorkerStartHook hook() {
+        return [this](QHYWorker worker) {
+            if (worker != which_) {
+                return;
+            }
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (held_) {
+                return;  // only the first start of this worker is held
+            }
+            held_ = true;
+            cv_.notify_all();
+            cv_.wait(lock, [this] { return released_; });
+        };
+    }
+
+    bool wait_until_held() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(5), [this] { return held_; });
+    }
+
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            released_ = true;
+        }
+        cv_.notify_all();
+    }
+
+private:
+    const QHYWorker which_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool held_ = false;
+    bool released_ = false;
+};
+
+// Joins a helper thread on every exit path, releasing the gate first so the
+// join cannot wait on a start the gate still holds.
+struct JoinOnExit {
+    WorkerStartGate& gate;
+    std::thread& thread;
+    ~JoinOnExit() {
+        gate.release();
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+};
+
+// Polls `done` for up to `timeout`; true as soon as it holds.
+bool eventually(const std::function<bool()>& done, std::chrono::milliseconds timeout = std::chrono::seconds(4)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (done()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return done();
+}
 
 } // namespace
 
@@ -249,6 +327,56 @@ TEST_CASE("QHY Camera Driver - Gain and offset round-trip while connected", "[qh
     CHECK(fake.underflow_closes == 0);
 }
 
+TEST_CASE("QHY Camera Driver - Gain and offset the SDK cannot read throw DriverException", "[qhy][camera][unit]") {
+    // Issue #510: get_param() answers the QHYCCD_ERROR sentinel (about 4.29e9)
+    // for an unsupported control or a failed read, and static_cast<int> of a
+    // double outside int's range is undefined behaviour -- in practice a
+    // garbage Gain/Offset handed to the client as if the camera reported it.
+    using alpacacore::vendor::qhy::control::GAIN;
+    using alpacacore::vendor::qhy::control::OFFSET;
+    auto fake = make_fake();
+    LockedQHYSDK sdk(fake);
+    auto driver = alpacacore::vendor::qhy::create_qhy_camera(0, "fake-qhy-0", sdk);
+    driver->set_connected(true);
+    REQUIRE(driver->get_connected());
+
+    // No worker threads run for an uncooled camera, so editing the fake
+    // directly here does not race the driver.
+    const auto require_driver_exception = [&](const std::function<int()>& read, const std::string& control_name) {
+        try {
+            const int value = read();
+            FAIL("Expected AlpacaException, got " << value);
+        } catch (const alpacacore::AlpacaException& ex) {
+            CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+            CHECK(std::string(ex.what()) == "QHY SDK returned no value for " + control_name);
+        }
+    };
+
+    fake.params.erase(GAIN);
+    fake.params.erase(OFFSET);
+    require_driver_exception([&]() { return driver->get_gain(); }, "Gain");
+    require_driver_exception([&]() { return driver->get_offset(); }, "Offset");
+
+    // Not only the sentinel: any value no int can hold is refused, and so is
+    // a non-finite one.
+    fake.params[GAIN] = 1e12;
+    fake.params[OFFSET] = -1e12;
+    require_driver_exception([&]() { return driver->get_gain(); }, "Gain");
+    require_driver_exception([&]() { return driver->get_offset(); }, "Offset");
+    fake.params[GAIN] = std::numeric_limits<double>::quiet_NaN();
+    fake.params[OFFSET] = std::numeric_limits<double>::infinity();
+    require_driver_exception([&]() { return driver->get_gain(); }, "Gain");
+    require_driver_exception([&]() { return driver->get_offset(); }, "Offset");
+
+    // A readable value still converts.
+    fake.params[GAIN] = 42.0;
+    fake.params[OFFSET] = 17.0;
+    CHECK(driver->get_gain() == 42);
+    CHECK(driver->get_offset() == 17);
+
+    driver->set_connected(false);
+}
+
 TEST_CASE("QHY Camera Driver - Connecting by index with no cameras detected fails", "[qhy][camera][unit]") {
     // The empty-enumeration branch of resolve_camera_id_locked() -- unreachable
     // by the by-id factory, only exercisable through _by_index.
@@ -374,4 +502,75 @@ TEST_CASE("QHY Camera Driver - disconnect does not wait out the temperature work
 
     REQUIRE_FALSE(driver->get_connected());
     CHECK(elapsed < std::chrono::milliseconds(600));
+}
+
+TEST_CASE("QHY Camera Driver - a disconnect inside a telemetry start does not strand telemetry",
+          "[qhy][camera][unit]") {
+    // Issue #510. start_telemetry_thread() publishes the new generation's stop
+    // flag under mutex_ but stores the thread only at the end. A disconnect in
+    // between moved out an empty telemetry_thread_ and stopped the generation;
+    // the start then stored a joinable thread whose worker had already exited,
+    // and every later start returned at the joinable() guard, so CCDTemperature
+    // never updated again for the life of the driver.
+    using alpacacore::vendor::qhy::control::CURTEMP;
+    auto fake = FakeQHYSDK::with_one_cooled_camera();
+    // The temp worker ramps CURTEMP toward the setpoint; a negligible step
+    // keeps the value this case plants readable.
+    fake.temp_settle_step_c = 1e-9;
+    LockedQHYSDK sdk(fake);
+    WorkerStartGate gate(QHYWorker::Telemetry);
+    auto driver = alpacacore::vendor::qhy::create_qhy_camera(0, "fake-qhy-0", sdk, gate.hook());
+
+    std::thread connector([&]() { driver->set_connected(true); });
+    JoinOnExit join_connector{gate, connector};
+    REQUIRE(gate.wait_until_held());
+    REQUIRE(driver->get_connected());  // connected_ is stored before the workers start
+
+    driver->set_connected(false);
+    gate.release();
+    connector.join();
+    REQUIRE_FALSE(driver->get_connected());
+
+    driver->set_connected(true);
+    REQUIRE(driver->get_connected());
+    // Planted after the reconnect, so only a worker of the new generation can
+    // report it: neither the setpoint fallback (0.0) nor the first
+    // generation's reading (-5.0) matches.
+    sdk.set_param("fake-qhy-0", CURTEMP, 12.5);
+    CHECK(eventually([&]() { return std::abs(driver->get_ccd_temperature() - 12.5) < 1e-3; }));
+
+    driver->set_connected(false);
+}
+
+TEST_CASE("QHY Camera Driver - a disconnect inside a temperature-worker start does not strand it",
+          "[qhy][camera][unit]") {
+    // Issue #510, the temp-control worker: same publish-then-store shape as
+    // telemetry (and the cooler-off worker moves temp_thread_ out too), so a
+    // stop landing in the window stranded cooler regulation the same way.
+    using alpacacore::vendor::qhy::control::CURTEMP;
+    auto fake = FakeQHYSDK::with_one_cooled_camera();
+    LockedQHYSDK sdk(fake);
+    WorkerStartGate gate(QHYWorker::TempControl);
+    auto driver = alpacacore::vendor::qhy::create_qhy_camera(0, "fake-qhy-0", sdk, gate.hook());
+
+    std::thread connector([&]() { driver->set_connected(true); });
+    JoinOnExit join_connector{gate, connector};
+    REQUIRE(gate.wait_until_held());
+    REQUIRE(driver->get_connected());
+
+    driver->set_connected(false);
+    gate.release();
+    connector.join();
+    REQUIRE_FALSE(driver->get_connected());
+
+    driver->set_connected(true);
+    REQUIRE(driver->get_connected());
+    REQUIRE(driver->get_cooler_on());
+    // Only the temp worker calls control_temp(), which steps CURTEMP toward
+    // the setpoint (0.0) on every call; nothing else writes it. A live worker
+    // moves the planted value within a second or so.
+    sdk.set_param("fake-qhy-0", CURTEMP, 10.0);
+    CHECK(eventually([&]() { return sdk.get_param("fake-qhy-0", CURTEMP) < 10.0; }));
+
+    driver->set_connected(false);
 }

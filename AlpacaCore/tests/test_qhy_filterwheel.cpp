@@ -210,6 +210,29 @@ TEST_CASE("QHY Filter Wheel Driver - An invalid slot count is refused", "[qhy][f
     CHECK(fake.ref_count("fake-qhy-0") == 0);
 }
 
+TEST_CASE("QHY Filter Wheel Driver - A slot count the SDK cannot read is refused", "[qhy][filterwheel][unit]") {
+    // Issue #510: get_param() answers the QHYCCD_ERROR sentinel (about 4.29e9)
+    // when the read fails, and static_cast<int> of a double outside int's
+    // range is undefined behaviour. x86_64 happens to produce INT_MIN, which
+    // the <= 0 check refused by luck; arm64 saturates to INT_MAX, a
+    // two-billion-slot wheel. The sentinel must be refused the same way as 0.
+    auto fake = make_fake();
+    fake.params.erase(alpacacore::vendor::qhy::control::CFWSLOTSNUM);
+    LockedQHYSDK sdk(fake);
+    auto driver = alpacacore::vendor::qhy::create_qhy_filterwheel(0, "fake-qhy-0", sdk);
+
+    try {
+        driver->set_connected(true);
+        FAIL("Expected AlpacaException");
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+        CHECK(std::string(ex.what()) == "QHY CFW reported an invalid slot count");
+    }
+    CHECK_FALSE(driver->get_connected());
+    CHECK(fake.physical_closes == 1);
+    CHECK(fake.ref_count("fake-qhy-0") == 0);
+}
+
 TEST_CASE("QHY Filter Wheel Driver - Connect seeds the position cache", "[qhy][filterwheel][unit]") {
     // The warm-up read exists so the first Position poll after Connect does not
     // pay the ~100-130ms hardware round trip (it blows ConformU's FAST target).

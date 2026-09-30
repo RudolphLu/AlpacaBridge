@@ -580,6 +580,20 @@ TEST_CASE("FakeQHYSDK - control_temp converges over calls instead of settling in
     CHECK(fake.get_param("fake-qhy-0", control::CURTEMP) == -30.0);
 }
 
+TEST_CASE("FakeQHYSDK - control_temp on a camera with no CURTEMP creates none", "[qhy][fake][unit]") {
+    // Issue #510: the ramp above took a reference through params[CURTEMP],
+    // which inserts the entry, so one control_temp() turned a camera modelled
+    // with no temperature sensor into one that reports a temperature.
+    auto fake = FakeQHYSDK::with_one_cooled_camera();
+    fake.open_camera("fake-qhy-0");
+    fake.params.erase(control::CURTEMP);
+
+    fake.control_temp("fake-qhy-0", -10.0);
+    CHECK(fake.last_temp_target == -10.0);
+    CHECK(fake.params.count(control::CURTEMP) == 0);
+    CHECK(fake.get_param("fake-qhy-0", control::CURTEMP) == FakeQHYSDK::kUnsupportedControl);
+}
+
 TEST_CASE("FakeQHYSDK - with_one_camera is the shared one-camera setup", "[qhy][fake][unit]") {
     // The helper the three QHY seam test files now share (issue #342). Pinned
     // here so a change to what a default test fake looks like is visible in

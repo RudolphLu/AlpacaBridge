@@ -89,9 +89,10 @@ public:
     ALPACA_EXPOSE_CONNECT_ERROR()
 
     QHYCameraDriver(int device_number, std::optional<std::string> camera_id, std::optional<int> camera_index,
-                    QHYSDK& sdk)
+                    QHYSDK& sdk, QHYWorkerStartHook on_worker_start = {})
         : AsyncConnectable("QHY"),
           sdk_(sdk),
+          on_worker_start_(std::move(on_worker_start)),
           device_number_(device_number),
           camera_id_(std::move(camera_id)),
           camera_index_(camera_index),
@@ -812,7 +813,7 @@ public:
 
     int get_gain() const override {
         ensure_connected();
-        return static_cast<int>(sdk_.get_param(camera_id_value(), control::GAIN));
+        return param_to_int(sdk_.get_param(camera_id_value(), control::GAIN), "Gain");
     }
 
     void set_gain(int gain) override {
@@ -986,7 +987,7 @@ public:
 
     int get_offset() const override {
         ensure_connected();
-        return static_cast<int>(sdk_.get_param(camera_id_value(), control::OFFSET));
+        return param_to_int(sdk_.get_param(camera_id_value(), control::OFFSET), "Offset");
     }
 
     void set_offset(int offset) override {
@@ -1765,6 +1766,9 @@ private:
     // and that is UB either way. Bound these workers' lifetimes; do not read
     // the raw-pointer rule as making detachment safe.
     QHYSDK& sdk_;
+    // Test-only (issue #510): see QHYWorkerStartHook in the header. Empty in
+    // production, and never reassigned after construction.
+    const QHYWorkerStartHook on_worker_start_;
     int device_number_;
     std::optional<std::string> camera_id_;
     std::optional<int> camera_index_;
@@ -2152,13 +2156,13 @@ private:
         // pass the joinable() pre-check and the loser would destroy a joinable
         // std::thread (std::terminate). Lock order: thread_start_mutex_ -> mutex_.
         std::lock_guard<std::mutex> start_lock(thread_start_mutex_);
+        if (!reap_stopped_worker(temp_thread_, temp_thread_stop_, temp_thread_running_, "temp-control")) {
+            return;  // a live generation already owns the worker
+        }
         std::string id;
         std::shared_ptr<WorkerStopSignal> stop_flag;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (temp_thread_.joinable()) {
-                return;
-            }
             // Fresh flag per generation, not a store(false) reset of the
             // shared member: a prior generation's timed-out-and-detached
             // zombie (join_temp_thread) keeps its own captured copy of the
@@ -2228,10 +2232,10 @@ private:
                 stop_flag->wait_for(std::chrono::seconds(1));
             }
         });
-        std::lock_guard<std::mutex> lock(mutex_);
-        // Serialised by thread_start_mutex_: temp_thread_ can only have been
-        // moved out (by a stop path) since the check above, never re-assigned.
-        temp_thread_ = std::move(t);
+        if (on_worker_start_) {
+            on_worker_start_(QHYWorker::TempControl);
+        }
+        store_or_reap_worker(temp_thread_, std::move(t), stop_flag, running_flag, "temp-control");
     }
 
     // Bounded wait + detach fallback for the temp-control thread, mirroring
@@ -2282,14 +2286,14 @@ private:
     void start_telemetry_thread() {
         // Same double-start guard as start_temp_control_thread.
         std::lock_guard<std::mutex> start_lock(thread_start_mutex_);
+        if (!reap_stopped_worker(telemetry_thread_, telemetry_thread_stop_, telemetry_thread_running_, "telemetry")) {
+            return;  // a live generation already owns the worker
+        }
         std::string id;
         std::shared_ptr<WorkerStopSignal> stop_flag;
         std::shared_ptr<std::atomic<bool>> running_flag;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (telemetry_thread_.joinable()) {
-                return;
-            }
             // Fresh signal per generation, not a reset of the old one: a
             // previous generation's timed-out-and-detached zombie keeps its
             // own copy, and resetting in place would un-stop it (same
@@ -2382,9 +2386,63 @@ private:
                 stop_flag->wait_for(std::chrono::seconds(1));
             }
         });
-        std::lock_guard<std::mutex> lock(mutex_);
-        // Serialised by thread_start_mutex_ (see start_temp_control_thread).
-        telemetry_thread_ = std::move(t);
+        if (on_worker_start_) {
+            on_worker_start_(QHYWorker::Telemetry);
+        }
+        store_or_reap_worker(telemetry_thread_, std::move(t), stop_flag, running_flag, "telemetry");
+    }
+
+    // Issue #510: both starters publish their generation's stop flag under
+    // mutex_ but store the thread only at the end, after the thread is built.
+    // A stop path (disconnect, destructor, cooler-off) landing in between
+    // requests the stop and moves out a still-empty member, so the thread the
+    // starter then stores belongs to a stopped generation: its worker exits,
+    // nothing joins it, and a joinable() guard alone would refuse every later
+    // start for the life of the driver (CCDTemperature frozen, the cooler
+    // unregulated). The two helpers below close that from both ends. Callers
+    // hold thread_start_mutex_ and not mutex_; the joins run outside mutex_
+    // because the workers take it (lock order thread_start_mutex_ -> mutex_).
+
+    // Start side. Returns false when `member` holds a worker of a live
+    // generation (the caller then has nothing to start). A joinable member
+    // whose generation was stopped is moved out and reaped with the same
+    // bounded join the stop paths use, and true is returned.
+    bool reap_stopped_worker(std::thread& member, const std::shared_ptr<WorkerStopSignal>& member_stop,
+                             const std::shared_ptr<std::atomic<bool>>& member_running, const char* label) {
+        std::thread stale;
+        std::shared_ptr<std::atomic<bool>> stale_running;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!member.joinable()) {
+                return true;
+            }
+            if (!member_stop->stopped()) {
+                return false;
+            }
+            stale = std::move(member);
+            stale_running = member_running;
+        }
+        join_worker_thread(stale, stale_running, label);  // bounded; may detach
+        return true;
+    }
+
+    // Store side. Stores `t` in `member` unless `stop_flag` (this start's own
+    // generation) was stopped while the thread was being built; then the stop
+    // path has already moved `member` out, so storing `t` would strand it, and
+    // it is reaped here instead.
+    void store_or_reap_worker(std::thread& member, std::thread t, const std::shared_ptr<WorkerStopSignal>& stop_flag,
+                              const std::shared_ptr<std::atomic<bool>>& running_flag, const char* label) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!stop_flag->stopped()) {
+                // Serialised by thread_start_mutex_: `member` can only have
+                // been moved out (by a stop path) since reap_stopped_worker(),
+                // never re-assigned.
+                member = std::move(t);
+                return;
+            }
+        }
+        join_worker_thread(t, running_flag, label);  // bounded; may detach
     }
 
     // open-astro#323: start_telemetry_thread_locked() and
@@ -2580,6 +2638,11 @@ std::unique_ptr<CameraDriver> create_qhy_camera(int device_number, const std::st
 
 std::unique_ptr<CameraDriver> create_qhy_camera_by_index(int device_number, int camera_index, QHYSDK& sdk) {
     return std::make_unique<QHYCameraDriver>(device_number, std::nullopt, camera_index, sdk);
+}
+
+std::unique_ptr<CameraDriver> create_qhy_camera(int device_number, const std::string& camera_id, QHYSDK& sdk,
+                                                QHYWorkerStartHook on_worker_start) {
+    return std::make_unique<QHYCameraDriver>(device_number, camera_id, std::nullopt, sdk, std::move(on_worker_start));
 }
 
 } // namespace alpacacore::vendor::qhy

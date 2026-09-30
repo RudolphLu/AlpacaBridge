@@ -612,7 +612,15 @@ public:
         // fixed step per call toward the target, clamped so it never
         // overshoots. `temp_settle_step_c = 0.0` restores the old instant
         // settle for a case that wants to skip the ramp.
-        auto& current = params[vendor::qhy::control::CURTEMP];
+        //
+        // find(), not operator[] (issue #510): a camera modelled with no
+        // CURTEMP entry has no temperature sensor, and inserting one here
+        // would make it report a temperature after a single call.
+        auto it = params.find(vendor::qhy::control::CURTEMP);
+        if (it == params.end()) {
+            return;
+        }
+        auto& current = it->second;
         const double delta = target_temp_c - current;
         if (temp_settle_step_c <= 0.0 || std::abs(delta) <= temp_settle_step_c) {
             current = target_temp_c;

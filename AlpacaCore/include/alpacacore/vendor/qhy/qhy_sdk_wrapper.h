@@ -12,10 +12,15 @@
 
 #pragma once
 
+#include <alpacacore/util/error_handling.h>
+
 #include <atomic>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace alpacacore::vendor::qhy {
@@ -364,5 +369,28 @@ private:
     QHYSDKWrapper(const QHYSDKWrapper&) = delete;
     QHYSDKWrapper& operator=(const QHYSDKWrapper&) = delete;
 };
+
+/// QHYCCD_ERROR (0xFFFFFFFF) as QHYSDK::get_param() returns it: GetQHYCCDParam()
+/// answers it for an unsupported control or a failed read.
+inline constexpr double kParamReadError = 4294967295.0;
+
+/**
+ * @brief Convert a QHYSDK::get_param() result to int (issue #510).
+ *
+ * A plain static_cast<int> of the QHYCCD_ERROR sentinel, or of any double
+ * outside int's range, is undefined behaviour. Throws DriverException
+ * ("QHY SDK returned no value for <control_name>") when the value is not
+ * finite, is the sentinel, or is outside [INT_MIN, INT_MAX]; otherwise
+ * returns the value truncated toward zero.
+ */
+inline int param_to_int(double value, std::string_view control_name) {
+    if (!std::isfinite(value) || value == kParamReadError ||
+        value < static_cast<double>(std::numeric_limits<int>::min()) ||
+        value > static_cast<double>(std::numeric_limits<int>::max())) {
+        throw AlpacaException("QHY SDK returned no value for " + std::string(control_name),
+                              AlpacaError::DriverException);
+    }
+    return static_cast<int>(value);
+}
 
 } // namespace alpacacore::vendor::qhy
