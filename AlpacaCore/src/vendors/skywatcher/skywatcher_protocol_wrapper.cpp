@@ -1706,6 +1706,8 @@ void SkyWatcherProtocolWrapper::set_step_period(int axis, uint32_t t1_preset, bo
     }
 }
 
+void SkyWatcherProtocolWrapper::disable_step_period_readback() { pimpl_->disable_step_period_readback(); }
+
 void SkyWatcherProtocolWrapper::start_motion(int axis) { send_command('J', axis); }
 
 void SkyWatcherProtocolWrapper::stop_motion(int axis) { send_command('K', axis); }

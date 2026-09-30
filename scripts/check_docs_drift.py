@@ -135,6 +135,21 @@ Checks:
      behind, and never more than MAX_UPDATED_DAYS_AHEAD past the badge, which
      catches a typo'd year without consulting the clock. Pure, so it runs in
      pre-flight; no git state is consulted.
+ 17. Every AlpacaError value AGENTS.md and .claude/commands/driver-build.md
+     write down matches the enum in AlpacaCore/include/alpacacore/alpaca_errors.h
+     (issue #682): the name must be a constant in `namespace AlpacaError` and
+     the hex value must be the one the header defines. Four written forms are
+     read: `Name` (0xNNN), Name `0xNNN`, `A` (or `B` ..., both 0xNNN), and an
+     exception-table row `| `Name` | ... (0xNNN ... |`, whose values belong to
+     the row's name. CamelCase names only, so a protocol constant such as
+     MC_AUX_GUIDE 0x26 is not read as a pin; a floor catches an extractor that
+     stops matching.
+ 18. The first bullet under AGENTS.md's "Continuous Integration and Pre-flight"
+     heading (`- CI (...`) names exactly the job ids under `jobs:` in
+     .github/workflows/ci.yml, in both directions and by id, not by count
+     (issue #702): it listed 11 of 18 jobs and called `format` `clang-format`.
+     The roster is every backticked token in the bullet outside parentheses,
+     so each id's description goes in parentheses after it.
 """
 
 import glob
@@ -1478,6 +1493,7 @@ ROSTER_ARRAY_RE = re.compile(r"kFakeConnectableRoster\[\]\s*=\s*\{(.*?)\n\};", r
 HELPER_FAKES = {
     "fake_pty_write.h": "bounded pty-master write and PtyPair, shared by the pty-backed fakes",
     "fake_raw_decoder.h": "fake RawDecoder seam for the gphoto camera, used together with fake_gphoto_sdk.h",
+    "fake_task_clock.h": "virtual-time TaskClock for driver wait tests",
 }
 
 
@@ -1891,6 +1907,167 @@ def check_supported_drivers_updated_date(root=ROOT):
     return _updated_date_findings(read("SUPPORTED-DRIVERS.md", root), read("README.md", root))
 
 
+# --- check 17: documented AlpacaError values vs alpaca_errors.h ---------------
+
+ALPACA_ERRORS_H = "AlpacaCore/include/alpacacore/alpaca_errors.h"
+ERROR_CODE_DOCS = ("AGENTS.md", ".claude/commands/driver-build.md")
+# Today's two docs carry ~15 pins; a floor well under that catches an
+# extractor that stops matching without tripping on an ordinary rewording.
+MIN_ERROR_CODE_PINS = 8
+
+_ALPACA_ERROR_NS_RE = re.compile(r"namespace\s+AlpacaError\s*\{(.*?)\}", re.DOTALL)
+_ALPACA_ERROR_DEF_RE = re.compile(r"constexpr\s+int\s+([A-Za-z]\w*)\s*=\s*(0[xX][0-9A-Fa-f]+|\d+)\s*;")
+# An error name as the docs write it: CamelCase, optionally backticked and
+# optionally qualified. CamelCase only, so a protocol constant such as
+# MC_AUX_GUIDE 0x26 is never read as a pin.
+_EC_NAME = r"(?<!\w)`?(?:alpacacore::)?(?:AlpacaError::)?([A-Z][a-z]+(?:[A-Z][a-z]*)+)`?"
+_EC_HEX = r"(0[xX][0-9A-Fa-f]+)\b"
+# `Name` (0xNNN ...)
+_EC_PAREN_RE = re.compile(_EC_NAME + r"\s*\(\s*" + _EC_HEX)
+# Name `0xNNN`
+_EC_TICK_RE = re.compile(_EC_NAME + r"\s+`" + _EC_HEX + r"`")
+# `A` (or `B` for a property, both 0xNNN)
+_EC_BOTH_RE = re.compile(_EC_NAME + r"\s*\(\s*or\s+" + _EC_NAME + r"[^)]*?\bboth\s+" + _EC_HEX)
+# | `Name` | ... (0xNNN ... |  -- an exception-table row: every value in the
+# row belongs to the row's name, whatever other names the cell mentions.
+_EC_ROW_RE = re.compile(r"^\|\s*`([A-Z][A-Za-z]+)`\s*\|(.*)$")
+_EC_ROW_VALUE_RE = re.compile(r"\(\s*" + _EC_HEX)
+
+
+def _alpaca_error_values(header_text):
+    """{name: int} for every constant inside `namespace AlpacaError { ... }`."""
+    m = _ALPACA_ERROR_NS_RE.search(header_text)
+    if not m:
+        return {}
+    return {name: int(value, 0) for name, value in _ALPACA_ERROR_DEF_RE.findall(m.group(1))}
+
+
+def _error_code_pins(text):
+    """(line number, name, hex text) for every error value the doc writes down."""
+    pins = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        row = _EC_ROW_RE.match(line)
+        if row:
+            pins.extend((lineno, row.group(1), h) for h in _EC_ROW_VALUE_RE.findall(row.group(2)))
+            continue
+        for m in _EC_BOTH_RE.finditer(line):
+            pins.append((lineno, m.group(1), m.group(3)))
+            pins.append((lineno, m.group(2), m.group(3)))
+        for regex in (_EC_PAREN_RE, _EC_TICK_RE):
+            pins.extend((lineno, m.group(1), m.group(2)) for m in regex.finditer(line))
+    return pins
+
+
+def _error_code_findings(header_text, docs, min_pins=MIN_ERROR_CODE_PINS):
+    """Check 17 over the header and the docs' text ({path: text}). Pure, so
+    --self-test can drive it."""
+    values = _alpaca_error_values(header_text)
+    if not values:
+        return ["found no AlpacaError constants in %s: the parser is stale or the namespace moved" % ALPACA_ERRORS_H]
+    failures = []
+    total = 0
+    for path, text in docs.items():
+        for lineno, name, hex_text in _error_code_pins(text):
+            total += 1
+            if name not in values:
+                failures.append("%s:%d: `%s` (%s) is not an AlpacaError constant in %s (known: %s)"
+                                % (path, lineno, name, hex_text, ALPACA_ERRORS_H, ", ".join(sorted(values))))
+            elif int(hex_text, 16) != values[name]:
+                failures.append("%s:%d: `%s` is written as %s but %s defines it as 0x%X"
+                                % (path, lineno, name, hex_text, ALPACA_ERRORS_H, values[name]))
+    if total < min_pins:
+        failures.append("found only %d documented error-code value(s) across %s (floor %d): the extractor is "
+                        "stale or the docs stopped writing the values down" % (total, ", ".join(docs), min_pins))
+    return failures
+
+
+def check_error_codes_match_header(root=ROOT):
+    return _error_code_findings(read(ALPACA_ERRORS_H, root), {p: read(p, root) for p in ERROR_CODE_DOCS})
+
+
+# --- check 18: AGENTS.md CI job roster vs ci.yml ------------------------------
+
+CI_ROSTER_HEADING = "## Continuous Integration and Pre-flight"
+CI_ROSTER_BULLET = "- CI ("
+_CI_JOBS_BLOCK_RE = re.compile(r"^jobs:[ \t]*\n(.*?)(?=^\S|\Z)", re.MULTILINE | re.DOTALL)
+_CI_JOB_ID_RE = re.compile(r"^  ([A-Za-z0-9_-]+):[ \t]*$", re.MULTILINE)
+_BACKTICK_RE = re.compile(r"`([^`]+)`")
+
+
+def _ci_job_ids(ci_text):
+    """The top-level job ids under `jobs:`, in file order (not the `on:` keys)."""
+    m = _CI_JOBS_BLOCK_RE.search(ci_text)
+    return _CI_JOB_ID_RE.findall(m.group(1)) if m else []
+
+
+def _strip_parenthesized(text):
+    """text with every (possibly nested) parenthesised group removed."""
+    out, depth = [], 0
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")" and depth:
+            depth -= 1
+        elif not depth:
+            out.append(ch)
+    return "".join(out)
+
+
+def _ci_roster_bullet(agents_text):
+    """The first bullet under the CI heading that starts with `- CI (`,
+    continuation lines included, or None."""
+    start = agents_text.find("\n" + CI_ROSTER_HEADING + "\n")
+    if start == -1:
+        return None
+    section_end = agents_text.find("\n## ", start + 1)
+    section = agents_text[start:section_end if section_end != -1 else len(agents_text)]
+    lines = section.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith(CI_ROSTER_BULLET):
+            bullet = [line]
+            for more in lines[i + 1:]:
+                if not more.startswith("  "):
+                    break
+                bullet.append(more)
+            return "\n".join(bullet)
+    return None
+
+
+def _ci_roster_findings(ci_text, agents_text):
+    """Check 18 over the two files' text. Pure, so --self-test can drive it.
+
+    The roster is every backticked token in the bullet outside parentheses:
+    the descriptions (the ci.yml path, the `[stress]` tags) sit in parentheses
+    after each id, so they are not read as job ids.
+    """
+    jobs = _ci_job_ids(ci_text)
+    if not jobs:
+        return ["found no job ids under `jobs:` in .github/workflows/ci.yml: the parser is stale"]
+    bullet = _ci_roster_bullet(agents_text)
+    if bullet is None:
+        return ["could not find the '%s...' job roster bullet under '%s' in AGENTS.md"
+                % (CI_ROSTER_BULLET, CI_ROSTER_HEADING)]
+    named = _BACKTICK_RE.findall(_strip_parenthesized(bullet))
+    failures = []
+    seen = set()
+    for job in named:
+        if job in seen:
+            failures.append("AGENTS.md CI roster names '%s' twice" % job)
+        seen.add(job)
+        if job not in jobs:
+            failures.append("AGENTS.md CI roster names '%s', which does not exist as a job id in "
+                            ".github/workflows/ci.yml (ids: %s)" % (job, ", ".join(jobs)))
+    for job in jobs:
+        if job not in seen:
+            failures.append("ci.yml job '%s' is missing from the AGENTS.md CI roster bullet ('%s...')"
+                            % (job, CI_ROSTER_BULLET))
+    return failures
+
+
+def check_ci_roster_matches_workflow(root=ROOT):
+    return _ci_roster_findings(read(".github/workflows/ci.yml", root), read("AGENTS.md", root))
+
+
 CHECKS = [
     ("Instruction discovery and Claude adapters", check_instruction_structure),
     ("CMake options documented in docs/development.md", check_cmake_options_documented),
@@ -1909,6 +2086,8 @@ CHECKS = [
     ("Every std::regex in router.cpp is built once (static)", check_router_regexes_static),
     ("README headline counts match SUPPORTED-DRIVERS.md", check_readme_headline_counts),
     ("SUPPORTED-DRIVERS.md Updated date is not behind the README release date", check_supported_drivers_updated_date),
+    ("Documented AlpacaError values match alpaca_errors.h", check_error_codes_match_header),
+    ("AGENTS.md CI job roster matches ci.yml job ids", check_ci_roster_matches_workflow),
 ]
 
 
@@ -2501,6 +2680,124 @@ def self_test():
     f = _updated_date_findings(ud_supported, "# no badge\n")
     check("updated date: a missing README badge is flagged rather than passing vacuously",
           len(f) == 1 and "release date in the README.md version badge" in f[0])
+
+    # check 17: documented AlpacaError values vs alpaca_errors.h (issue #682).
+    # attempt() so a helper that is missing or has the wrong signature is a
+    # FAIL line, not a crash that hides every check after it.
+    ec_header = (
+        "namespace alpacacore {\n"
+        "namespace AlpacaError {\n"
+        "    constexpr int Success = 0;\n"
+        "    constexpr int PropertyNotImplemented = 0x400; // 1024\n"
+        "    constexpr int MethodNotImplemented = 0x400;   // 1024\n"
+        "    constexpr int InvalidValue = 0x401;           // 1025\n"
+        "    constexpr int InvalidOperation = 0x40B;       // 1035\n"
+        "    constexpr int ActionNotImplemented = 0x40C;   // 1036\n"
+        "}\n"
+        "constexpr int NotAnAlpacaError = 0x999;\n"
+        "}\n"
+    )
+    ec_agents = (
+        "| Throw | When |\n"
+        "|---|---|\n"
+        "| `ActionNotImplemented` | a name not in `SupportedActions` (0x40C, ASCOM's exception). |\n"
+        "Throw `MethodNotImplemented` (or `PropertyNotImplemented` for a property, both 0x400).\n"
+        "`InvalidOperation` (0x40B) is for a supported member in the wrong state.\n"
+        "Use Celestron MC_AUX_GUIDE 0x26 for guiding.\n"
+    )
+    ec_build = (
+        "Error codes: InvalidValue `0x401`, InvalidOperation `0x40B`.\n"
+        "Assert `AlpacaError::ActionNotImplemented` (0x40C).\n"
+    )
+    ec_docs = {"AGENTS.md": ec_agents, ".claude/commands/driver-build.md": ec_build}
+
+    def ec(header=ec_header, docs=None, min_pins=1):
+        return attempt("error codes", lambda: _error_code_findings(header, docs or ec_docs, min_pins))
+
+    f = ec()
+    check("error codes: the documented values that match the enum are clean", f == [])
+    f = ec(min_pins=100)
+    check("error codes: the pin floor fires when the extractor finds too few pins",
+          f is not None and len(f) == 1 and "found only" in f[0])
+    f = ec(docs=dict(ec_docs, **{"AGENTS.md": sub(ec_agents, "(0x40B)", "(0x40A)")}))
+    check("error codes: a wrong '<Name> (0x...)' value names the file, the line and the expected value",
+          f is not None and len(f) == 1 and "AGENTS.md:5" in f[0] and "InvalidOperation" in f[0]
+          and "0x40A" in f[0] and "0x40B" in f[0])
+    f = ec(docs=dict(ec_docs, **{"AGENTS.md": sub(ec_agents, "`InvalidOperation` (0x40B)", "`InvalidOperate` (0x40B)")}))
+    check("error codes: an unknown '<Name> (0x...)' name names the file and the line and says it is not in the enum",
+          f is not None and len(f) == 1 and "AGENTS.md:5" in f[0] and "InvalidOperate" in f[0]
+          and "not an AlpacaError" in f[0])
+    f = ec(docs=dict(ec_docs, **{".claude/commands/driver-build.md": sub(ec_build, "InvalidValue `0x401`", "InvalidValue `0x402`")}))
+    check("error codes: a wrong 'Name `0x...`' list value is reported with the expected value",
+          f is not None and len(f) == 1 and ".claude/commands/driver-build.md:1" in f[0] and "0x401" in f[0])
+    f = ec(docs=dict(ec_docs, **{"AGENTS.md": sub(ec_agents, "both 0x400", "both 0x401")}))
+    check("error codes: a wrong shared '(or `B` ..., both 0x...)' value is reported for both names",
+          f is not None and len(f) == 2 and any("MethodNotImplemented" in x for x in f)
+          and any("PropertyNotImplemented" in x for x in f))
+    f = ec(docs=dict(ec_docs, **{"AGENTS.md": sub(ec_agents, "(0x40C, ASCOM's", "(0x40D, ASCOM's")}))
+    check("error codes: a wrong value in an exception-table row is pinned to the row's name, not a name in the cell",
+          f is not None and len(f) == 1 and "AGENTS.md:3" in f[0] and "ActionNotImplemented" in f[0]
+          and "0x40C" in f[0])
+    f = ec(docs=dict(ec_docs, **{".claude/commands/driver-build.md": sub(ec_build, "(0x40C)", "(0x400)")}))
+    check("error codes: an 'AlpacaError::' qualified name is pinned like a bare one",
+          f is not None and len(f) == 1 and "ActionNotImplemented" in f[0])
+    f = ec(header=ec_header.replace("constexpr int NotAnAlpacaError = 0x999;\n", ""),
+           docs=dict(ec_docs, **{"AGENTS.md": ec_agents + "`NotAnAlpacaError` (0x999)\n"}))
+    check("error codes: a constant outside namespace AlpacaError is not part of the enum",
+          f is not None and len(f) == 1 and "NotAnAlpacaError" in f[0])
+    f = ec(header="namespace AlpacaError {\n}\n")
+    check("error codes: an enum the parser cannot read is a finding, not a pass",
+          f is not None and any("no AlpacaError constants" in x for x in f))
+
+    # check 18: the AGENTS.md CI job roster vs ci.yml (issue #702).
+    roster_ci = (
+        "on:\n"
+        "  pull_request:\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+        "jobs:\n"
+        "  build-test:\n"
+        "    name: Build\n"
+        "    steps:\n"
+        "      - run: echo\n"
+        "  format:\n"
+        "    runs-on: x\n"
+        "  docs-drift:\n"
+        "    runs-on: x\n"
+    )
+    roster_agents = (
+        "# Agent Instructions\n\n"
+        "## Continuous Integration and Pre-flight\n\n"
+        "Related decision: none.\n\n"
+        "- CI (`.github/workflows/ci.yml`) runs on every PR. Its jobs, by id: `build-test` (vendors OFF),\n"
+        "  `format` (clang-format over `[stress]` changed lines), and `docs-drift`.\n"
+        "- **Layering gate** (`layering`, a later bullet) is not the roster.\n"
+    )
+
+    def roster(ci_text=roster_ci, agents_text=roster_agents):
+        return attempt("ci roster", lambda: _ci_roster_findings(ci_text, agents_text))
+
+    f = roster()
+    check("ci roster: a bullet naming exactly the ci.yml job ids is clean", f == [])
+    f = roster(agents_text=sub(roster_agents, "`build-test` (vendors OFF),\n", "\n"))
+    check("ci roster: a real ci.yml job missing from the bullet is reported by id",
+          f is not None and len(f) == 1 and "'build-test'" in f[0] and "missing" in f[0])
+    f = roster(agents_text=sub(roster_agents, "`format` (clang-format", "`clang-format` (clang-format"))
+    check("ci roster: a bullet naming a job id ci.yml does not define is reported (and the real id as missing)",
+          f is not None and len(f) == 2 and any("'clang-format'" in x and "does not exist" in x for x in f)
+          and any("'format'" in x and "missing" in x for x in f))
+    f = roster(agents_text=sub(roster_agents, "and `docs-drift`", "`docs-drift` and `docs-drift`"))
+    check("ci roster: a job id named twice is reported", f is not None and len(f) == 1 and "twice" in f[0])
+    f = roster(ci_text=roster_ci + "  zizmor:\n    runs-on: x\n")
+    check("ci roster: a job added to ci.yml without a bullet entry is reported",
+          f is not None and len(f) == 1 and "'zizmor'" in f[0])
+    f = roster(agents_text=roster_agents.replace("- CI (", "- Continuous integration ("))
+    check("ci roster: a missing roster bullet is a finding, not a pass",
+          f is not None and len(f) == 1 and "could not find" in f[0])
+    f = roster(ci_text=roster_ci.replace("jobs:\n", "workflows:\n"))
+    check("ci roster: a ci.yml with no jobs: block is a finding, not a pass",
+          f is not None and len(f) == 1 and "no job ids" in f[0])
 
     from check_instruction_structure import self_test as instruction_self_test
     instruction_self_test()

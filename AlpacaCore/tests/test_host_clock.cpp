@@ -388,8 +388,9 @@ TEST_CASE("HostClock - readers in flight survive a concurrent set_hooks", "[util
             started.fetch_add(1);
             // do/while, not while: a reader first scheduled after the writer
             // loop below has already stored stop would read nothing at all,
-            // and the reads > 0 guard at the end would then be reporting the
-            // scheduler rather than the behaviour it exists to pin. That is
+            // and the reads > 0 guard that used to end this case (#596
+            // replaced it) would then report the scheduler rather than the
+            // behaviour it existed to pin. That was
             // not hypothetical -- at -j 8 on a 4-core box under ASan+UBSan it
             // was a 3-in-10 red (PR #594, which took ctest from nproc to twice
             // nproc and so supplied the oversubscription that exposed it).
@@ -411,18 +412,31 @@ TEST_CASE("HostClock - readers in flight survive a concurrent set_hooks", "[util
 
     // Let every reader reach its loop before the swaps start, so they race
     // live readers rather than possibly all landing before the first one is
-    // scheduled. This is what makes the case test overlap; the do/while above
-    // is what makes the reads > 0 guard independent of the scheduler.
+    // scheduled. This is what makes the case test overlap; the progress check
+    // below keeps swapping until readers get past a swap, so it does not
+    // depend on the scheduler either.
     while (started.load() < kReaders && !expired()) {
         std::this_thread::yield();
     }
 
-    for (int i = 0; i < 200 && !expired(); ++i) {
+    // open-astro#596: the guard is progress DURING the storm, sampled here.
+    // The old CHECK(reads > 0) could not fail: the do/while above makes every
+    // reader count at least once whether or not a swap ever let it through.
+    // Each reader may also be part-way through a read at this sample and
+    // count it afterwards without ever getting past a swap, so progress means
+    // more than kReaders reads beyond it. Swapping continues past the 200
+    // until readers show that, bounded by the deadline, so a set_hooks() that
+    // starves readers until the deadline turns this red instead of passing
+    // on reads that were already in flight.
+    const int before_swaps = reads.load();
+    const auto progressed = [&] { return reads.load() > before_swaps + kReaders; };
+    for (int i = 0; (i < 200 || !progressed()) && !expired(); ++i) {
         const bool synced = (i % 2) == 0;
         c.set_hooks([synced] { return synced; },
                     [](std::chrono::system_clock::time_point, std::string&) { return true; },
                     [synced] { return !synced; });
     }
+    const int after_swaps = reads.load();
 
     stop.store(true);
     for (auto& t : readers) {
@@ -430,7 +444,7 @@ TEST_CASE("HostClock - readers in flight survive a concurrent set_hooks", "[util
     }
     prober.join();
     CHECK_FALSE(expired());
-    CHECK(reads.load() > 0);
+    CHECK(after_swaps > before_swaps + kReaders);
 }
 
 // ── The client-clock disagreement warning for mounts with their own clock (#409) ──

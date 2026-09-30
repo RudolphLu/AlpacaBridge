@@ -40,6 +40,11 @@ if(ALPACACORE_ENABLE_QHY)
     target_include_directories(alpacacore_qhy PRIVATE
         ${CMAKE_SOURCE_DIR}/include
     )
+
+    # Base drivers, logging and AsyncConnectable live in alpacacore; this vendor
+    # links down to it, never the reverse (open-astro#710).
+    target_link_libraries(alpacacore_qhy PRIVATE alpacacore)
+
     # SYSTEM: the vendored SDK headers trip -Werror otherwise (26.06.04 ships
     # qhyccdcamdef.h with QHY26800A_MAX_WIDTH defined twice with different
     # values -- a vendor bug we don't get to fix).

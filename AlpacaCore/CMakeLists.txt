@@ -116,118 +116,135 @@ target_include_directories(alpacacore PUBLIC
 # Create namespace alias for consistent target naming
 add_library(AlpacaCore::alpacacore ALIAS alpacacore)
 
+# Built-in descriptor composition (open-astro#710): which vendor descriptors this
+# build registers. Kept out of alpacacore so the core links no vendor library and
+# the dependency runs one way: alpacacore <- alpacacore_<vendor> <- alpacacore_builtins.
+# Every vendor schema half (src/vendors/<vendor>/<vendor>_schema.cpp) compiles here,
+# in every build; the vendor links and ALPACACORE_ENABLE_<VENDOR> definitions for
+# register_builtin_factories() are added per vendor below.
+add_library(alpacacore_builtins STATIC
+    src/catalog/builtin_catalog.cpp
+    src/vendors/astroasis/astroasis_schema.cpp
+)
+target_link_libraries(alpacacore_builtins PUBLIC alpacacore)
+add_library(AlpacaCore::alpacacore_builtins ALIAS alpacacore_builtins)
+
 # Vendor support (conditional)
 # Only add subdirectories for vendors that are actually implemented
 # Check if CMakeLists.txt exists and is not empty before adding
 if(ALPACACORE_ENABLE_ZWO)
     add_subdirectory(src/vendors/zwo)
     if(TARGET alpacacore_zwo)
-        target_link_libraries(alpacacore PRIVATE alpacacore_zwo)
+        target_link_libraries(alpacacore_builtins PRIVATE alpacacore_zwo)
     endif()
 endif()
 
 if(ALPACACORE_ENABLE_QHY)
     add_subdirectory(src/vendors/qhy)
     if(TARGET alpacacore_qhy)
-        target_link_libraries(alpacacore PRIVATE alpacacore_qhy)
+        target_link_libraries(alpacacore_builtins PRIVATE alpacacore_qhy)
     endif()
 endif()
 
 if(ALPACACORE_ENABLE_IOPTRON)
     add_subdirectory(src/vendors/ioptron)
     if(TARGET alpacacore_ioptron)
-        target_link_libraries(alpacacore PRIVATE alpacacore_ioptron)
+        target_link_libraries(alpacacore_builtins PRIVATE alpacacore_ioptron)
     endif()
 endif()
 
 if(ALPACACORE_ENABLE_SYNSCAN)
     add_subdirectory(src/vendors/synscan)
     if(TARGET alpacacore_synscan)
-        target_link_libraries(alpacacore PRIVATE alpacacore_synscan)
+        target_link_libraries(alpacacore_builtins PRIVATE alpacacore_synscan)
     endif()
 endif()
 
 if(ALPACACORE_ENABLE_SKYWATCHER)
     add_subdirectory(src/vendors/skywatcher)
     if(TARGET alpacacore_skywatcher)
-        target_link_libraries(alpacacore PRIVATE alpacacore_skywatcher)
+        target_link_libraries(alpacacore_builtins PRIVATE alpacacore_skywatcher)
     endif()
 endif()
 
 if(ALPACACORE_ENABLE_ONSTEP)
     add_subdirectory(src/vendors/onstep)
     if(TARGET alpacacore_onstep)
-        target_link_libraries(alpacacore PRIVATE alpacacore_onstep)
+        target_link_libraries(alpacacore_builtins PRIVATE alpacacore_onstep)
     endif()
 endif()
 
 if(ALPACACORE_ENABLE_WEEWX)
     add_subdirectory(src/vendors/weewx)
     if(TARGET alpacacore_weewx)
-        target_link_libraries(alpacacore PRIVATE alpacacore_weewx)
+        target_link_libraries(alpacacore_builtins PRIVATE alpacacore_weewx)
     endif()
 endif()
 
 if(ALPACACORE_ENABLE_GEMINI)
     add_subdirectory(src/vendors/gemini)
     if(TARGET alpacacore_gemini)
-        target_link_libraries(alpacacore PRIVATE alpacacore_gemini)
+        target_link_libraries(alpacacore_builtins PRIVATE alpacacore_gemini)
     endif()
 endif()
 
 if(ALPACACORE_ENABLE_WANDERERASTRO)
     add_subdirectory(src/vendors/wandererastro)
     if(TARGET alpacacore_wandererastro)
-        target_link_libraries(alpacacore PRIVATE alpacacore_wandererastro)
+        target_link_libraries(alpacacore_builtins PRIVATE alpacacore_wandererastro)
     endif()
 endif()
 
 if(ALPACACORE_ENABLE_SVBONY)
     add_subdirectory(src/vendors/svbony)
     if(TARGET alpacacore_svbony)
-        target_link_libraries(alpacacore PRIVATE alpacacore_svbony)
+        target_link_libraries(alpacacore_builtins PRIVATE alpacacore_svbony)
     endif()
 endif()
 
 if(ALPACACORE_ENABLE_GPHOTO)
     add_subdirectory(src/vendors/gphoto)
     if(TARGET alpacacore_gphoto)
-        target_link_libraries(alpacacore PRIVATE alpacacore_gphoto)
+        target_link_libraries(alpacacore_builtins PRIVATE alpacacore_gphoto)
     endif()
 endif()
 
 if(ALPACACORE_ENABLE_CELESTRON)
     add_subdirectory(src/vendors/celestron)
     if(TARGET alpacacore_celestron)
-        target_link_libraries(alpacacore PRIVATE alpacacore_celestron)
+        target_link_libraries(alpacacore_builtins PRIVATE alpacacore_celestron)
     endif()
 endif()
 
 if(ALPACACORE_ENABLE_BISQUE)
     add_subdirectory(src/vendors/bisque)
     if(TARGET alpacacore_bisque)
-        target_link_libraries(alpacacore PRIVATE alpacacore_bisque)
+        target_link_libraries(alpacacore_builtins PRIVATE alpacacore_bisque)
     endif()
 endif()
 
 if(ALPACACORE_ENABLE_TOUPTEK)
     add_subdirectory(src/vendors/touptek)
     if(TARGET alpacacore_touptek)
-        target_link_libraries(alpacacore PRIVATE alpacacore_touptek)
+        target_link_libraries(alpacacore_builtins PRIVATE alpacacore_touptek)
     endif()
 endif()
 
 if(ALPACACORE_ENABLE_PLAYERONE)
     add_subdirectory(src/vendors/playerone)
     if(TARGET alpacacore_playerone)
-        target_link_libraries(alpacacore PRIVATE alpacacore_playerone)
+        target_link_libraries(alpacacore_builtins PRIVATE alpacacore_playerone)
     endif()
 endif()
 
 if(ALPACACORE_ENABLE_ASTROASIS)
     add_subdirectory(src/vendors/astroasis)
     if(TARGET alpacacore_astroasis)
-        target_link_libraries(alpacacore PRIVATE alpacacore_astroasis)
+        target_link_libraries(alpacacore_builtins PRIVATE alpacacore_astroasis)
+        # register_builtin_factories() (src/catalog/builtin_catalog.cpp) guards its
+        # Astroasis factory registration behind this macro. Without it the
+        # registration compiles empty even though alpacacore_astroasis links fine.
+        target_compile_definitions(alpacacore_builtins PRIVATE ALPACACORE_ENABLE_ASTROASIS)
     endif()
 endif()
 
@@ -263,6 +280,13 @@ add_subdirectory(examples)
 
 # Installation
 install(TARGETS alpacacore
+    EXPORT AlpacaCoreTargets
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin
+)
+
+install(TARGETS alpacacore_builtins
     EXPORT AlpacaCoreTargets
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib

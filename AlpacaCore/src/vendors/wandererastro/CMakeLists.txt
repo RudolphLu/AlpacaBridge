@@ -17,6 +17,10 @@ target_include_directories(alpacacore_wandererastro PRIVATE
     ${CMAKE_SOURCE_DIR}/include
 )
 
+# Base drivers, logging and AsyncConnectable live in alpacacore; this vendor
+# links down to it, never the reverse (open-astro#710).
+target_link_libraries(alpacacore_wandererastro PRIVATE alpacacore)
+
 # WandererCover uses an ASCII serial protocol over a CH340 USB-serial link.
 # No external SDK is required — only standard POSIX/Win32 APIs and a reader thread.
 find_package(Threads REQUIRED)

@@ -76,6 +76,31 @@ constexpr int measured_dec_axis_sense(std::uint8_t mount_code) {
     }
 }
 
+// open-astro#666: whether a live in-place ":I" on a running axis needs a ":J"
+// re-latch before the motor follows it. The EQM-35 Pro (MC 3.39) stores a bare
+// ":I" without applying it (2026-09-06), so every board re-latches by default,
+// as INDI does. The EQ-AL55i Pro (0x09, MC 3.48) applied 16 of 16 bare ":I"
+// writes (sidereal, 0.5x and 1.5x) within the +-2 counts/s a 2 s ":j" window
+// resolves (2026-09-26), and on that board the ":J" is not free: each start
+// re-anchors the trajectory on the encoder, turning the RA servo's following
+// error into a position step whose sign follows the mount's balance (+1.8
+// counts per ":J1" with the RA axis at -45 deg, -1.4 at +45 deg, bare mount).
+// Two per guide pulse put ConformU's 5 s East/West pulses outside its 0.07 s
+// tolerance. Such a board still gets the sampled rate-applied check and its
+// ":I"+":J" resend where the caller runs one. Gated on the mount code alone.
+// Only MC 3.48 was measured; the same mount ran MC 3.46 before a firmware
+// update, and Sky-Watcher's changelog lists 3.48's only change as support for
+// updating the Wi-Fi module's firmware, so 3.46 is not expected to differ.
+constexpr bool live_rate_change_needs_relatch(std::uint8_t mount_code) { return mount_code != 0x09; }
+
+// open-astro#686: whether the ":i" step-period readback after an ":I" write
+// means anything on this board. The EQ-AL55i Pro (0x09, MC 3.48) answers ":i"
+// with FFFFFF on both axes whatever ":I" stored, including while ":j" shows the
+// axis running at the written rate (2026-09-26), so every compared write
+// logged a false mismatch. Every other board keeps the diagnostic, as does a
+// board that could not be identified.
+constexpr bool step_period_readback_usable(std::uint8_t mount_code) { return mount_code != 0x09; }
+
 constexpr uint32_t kCountsMask = 0xFFFFFF;
 constexpr double kSiderealDegPerSec = 360.0 / 86164.0905;
 constexpr double kDefaultGuideRateDegPerSec = 0.5 * kSiderealDegPerSec;
@@ -140,7 +165,8 @@ constexpr double kMinInPlacePulseRateDegPerSec = 0.05 * kSiderealDegPerSec;
 // of wall time DURING the pulse (more at small rate deltas, where the sample
 // window stretches to stay resolvable); on a typical 50-500 ms autoguider
 // pulse that would dominate the pulse itself, so those rely on the ":J" kick
-// alone.
+// alone (or, on a board that skips the re-latch, on the bare ":I" alone --
+// see live_rate_change_needs_relatch()).
 constexpr int kMinPulseForRateVerifyMs = 1500;
 // verify_live_rate_or_rekick timing. kRateVerifyMaxWindow is the ceiling
 // used by callers with no duration budget to respect (the RightAscensionRate
@@ -418,6 +444,13 @@ public:
                                                   std::to_string(static_cast<int>(board.mount_code)) + "), firmware " +
                                                   board.firmware_version);
                 dec_axis_sense_ = measured_dec_axis_sense(board.mount_code);  // open-astro#458
+                live_rate_relatch_ = live_rate_change_needs_relatch(board.mount_code);  // open-astro#666
+                if (!step_period_readback_usable(board.mount_code)) {                   // open-astro#686
+                    protocol.disable_step_period_readback();
+                    ALPACA_LOG_INFO("SkyWatcher",
+                                    "Step-period readback (':i') off for this board: it answers FFFFFF whatever was "
+                                    "written (open-astro#686)");
+                }
             } catch (...) {
                 // A board that will not answer ":e" is still usable, so never
                 // fail the connect over it -- but do not keep a previous
@@ -1140,12 +1173,11 @@ public:
             if (homing_) {
                 return;  // already homing
             }
-            if (at_home_ && !get_hardware_slewing_locked()) {
+            if (at_home_ && !get_hardware_slewing_locked(true)) {
                 return;  // already at home
             }
             invalidate_position_cache_locked();
             slewing_cached_ = true;
-            slew_force_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(8);
             restore_tracking_after_slew_ = false;
             manual_axis_slewing_[0] = false;
             manual_axis_slewing_[1] = false;
@@ -1197,13 +1229,11 @@ public:
             } catch (const std::exception& ex) {
                 homing_ = false;
                 slewing_cached_ = false;
-                slew_force_until_ = std::chrono::steady_clock::time_point::min();
                 stop_axes_if_cancelled_locked();
                 ALPACA_LOG_WARN("SkyWatcher", std::string("FindHome failed: ") + ex.what());
             } catch (...) {
                 homing_ = false;
                 slewing_cached_ = false;
-                slew_force_until_ = std::chrono::steady_clock::time_point::min();
                 stop_axes_if_cancelled_locked();
                 ALPACA_LOG_WARN("SkyWatcher", "FindHome failed with unknown exception");
             }
@@ -1249,7 +1279,6 @@ public:
             target_dec_axis = park_dec_axis_deg_;
             invalidate_position_cache_locked();
             slewing_cached_ = true;
-            slew_force_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(8);
             restore_tracking_after_slew_ = false;
             manual_axis_slewing_[0] = false;
             manual_axis_slewing_[1] = false;
@@ -1291,13 +1320,11 @@ public:
             } catch (const std::exception& ex) {
                 parking_ = false;
                 slewing_cached_ = false;
-                slew_force_until_ = std::chrono::steady_clock::time_point::min();
                 stop_axes_if_cancelled_locked();
                 ALPACA_LOG_WARN("SkyWatcher", std::string("Park failed: ") + ex.what());
             } catch (...) {
                 parking_ = false;
                 slewing_cached_ = false;
-                slew_force_until_ = std::chrono::steady_clock::time_point::min();
                 stop_axes_if_cancelled_locked();
                 ALPACA_LOG_WARN("SkyWatcher", "Park failed with unknown exception");
             }
@@ -1429,7 +1456,8 @@ public:
             bool verify_dispatch_rate = false;
             // Set once the live ":I" at the pulse rate has gone out on a
             // tracking axis. From then on a dispatch failure (the ":J"
-            // re-latch below throwing, say) leaves the axis running at the
+            // re-latch below throwing, on a board that sends one; on 0x09
+            // only the ":I" itself can throw) leaves the axis running at the
             // pulse rate with nothing scheduled to bring it back: before the
             // ":J" kick a dispatch failure left the axis at its prior, safe
             // drive rate. Give the drive-rate restore the same retried care
@@ -1460,7 +1488,9 @@ public:
                         auto& proto = *protocol_;
                         proto.set_step_period(kAxisRa, tracking_step_period_for(restore_rate),
                                               /*with_readback=*/false);
-                        proto.start_motion(kAxisRa);
+                        if (live_rate_relatch_) {  // open-astro#666
+                            proto.start_motion(kAxisRa);
+                        }
                         cmd_axis_rate_deg_s_[0] = restore_rate;
                         return;
                     } catch (const std::exception& e) {
@@ -1507,15 +1537,20 @@ public:
                     // INDI's skywatcherAPI.cpp always follows an in-place
                     // SetClockTicksPerMicrostep with StartAxisMotion even
                     // when the axis never stopped; do the same, and verify
-                    // below in case that alone is not sufficient.
-                    proto.start_motion(kAxisRa);
+                    // below in case that alone is not sufficient. Not on a
+                    // board where the ":J" itself moves the axis and a bare
+                    // ":I" is known to apply (open-astro#666).
+                    if (live_rate_relatch_) {
+                        proto.start_motion(kAxisRa);
+                    }
                     cmd_axis_rate_deg_s_[0] = ra_pulse_rate;
                     // Only sample-verify when the pulse is long enough to
                     // absorb the sample window. A real autoguider sends
                     // 50-500 ms pulses; there the ~450 ms check would BE the
                     // pulse (the deduction below can only clamp at zero, not
                     // give the time back), so short pulses rely on the ":J"
-                    // kick alone. ConformU's 5 s pulses are always verified.
+                    // kick alone (or, on a no-re-latch board, on the bare
+                    // ":I"). ConformU's 5 s pulses are always verified.
                     verify_dispatch_rate = duration >= kMinPulseForRateVerifyMs;
                 } else if (restore_tracking) {
                     // The pulse runs against the axis's own tracking sense
@@ -1598,10 +1633,13 @@ public:
                 if (restore_tracking && !pulse_restart && !ra_reverses) {
                     // RA pulse over a live tracking axis: restore the drive
                     // step period; the axis never stopped. Same ":J" kick as
-                    // the dispatch above, for the same reason.
+                    // the dispatch above, for the same reason, and skipped
+                    // on the same boards.
                     proto.set_step_period(kAxisRa, tracking_step_period_for(ra_restore_rate_deg_per_sec),
                                           /*with_readback=*/false);
-                    proto.start_motion(kAxisRa);
+                    if (live_rate_relatch_) {
+                        proto.start_motion(kAxisRa);
+                    }
                     std::lock_guard<std::mutex> lock(mutex_);
                     cmd_axis_rate_deg_s_[0] = ra_restore_rate_deg_per_sec;
                 } else if (restore_tracking) {
@@ -1789,6 +1827,9 @@ public:
             // failed.
             clear_last_slew_error_locked();
             slew_epoch = slew_error_epoch_;
+            // Slewing must read true once this returns, but goto_in_progress_
+            // is only set when the task below takes mutex_. This window covers
+            // that gap for client reads; landing detection ignores it.
             slew_force_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(8);
             target_ra_hours_ = ra;
             target_dec_degrees_ = dec;
@@ -1817,6 +1858,11 @@ public:
         slew_task_thread_ = std::thread([this, ra, dec, slew_epoch]() {
             std::unique_lock<std::mutex> lock(mutex_);
             if (!connected_ || slew_task_cancel_.load()) {
+                // Reaped before it dispatched (a newer Park/FindHome/slew,
+                // AbortSlew, disconnect): drop the initiator's window with it,
+                // or Slewing reads true for the rest of its 8 s after the
+                // reaper's own operation has failed or finished.
+                slew_force_until_ = std::chrono::steady_clock::time_point::min();
                 return;
             }
             goto_in_progress_ = true;
@@ -2477,6 +2523,8 @@ private:
         // open-astro#458: a board that will not answer ":e" is an unmeasured
         // one; never carry the previous connection's sense into this one.
         dec_axis_sense_ = 0;
+        // open-astro#666: likewise an unidentified board gets the ":J" re-latch.
+        live_rate_relatch_ = true;
         // Both are MEASURED off the mount that was connected, so they must not
         // survive into the next one: a driver instance reconnected to
         // different hardware would otherwise aim a goto ahead by the previous
@@ -3040,16 +3088,19 @@ private:
         // hardware 2026-09-10 as a spurious "did not take" + resend on a
         // TrackingRate=Lunar write. Stretch the window as far as needed, up
         // to max_window; past that the change is below what this check can
-        // resolve within its budget, so leave it to the ":J" kick alone.
+        // resolve within its budget, so leave it to the ":J" kick alone (the
+        // bare ":I" alone on a board that skips the re-latch).
         const auto effective_max_window = std::min(max_window, kRateVerifyMaxWindow);
         constexpr double kMinResolvableDeltaCounts = 4.0;
         const double delta_counts_per_sec = std::abs(expected_counts_per_sec - previous_counts_per_sec);
         const double needed_s = delta_counts_per_sec > 0.0 ? kMinResolvableDeltaCounts / delta_counts_per_sec : 1e9;
         if (needed_s > std::chrono::duration<double>(effective_max_window).count()) {
-            ALPACA_LOG_INFO("SkyWatcher", "Axis " + std::to_string(channel) + " rate change of " +
-                                              std::to_string(delta_counts_per_sec) +
-                                              " counts/s is below the rate-applied check's resolution; relying "
-                                              "on the :J re-latch alone");
+            ALPACA_LOG_INFO(
+                "SkyWatcher",
+                "Axis " + std::to_string(channel) + " rate change of " + std::to_string(delta_counts_per_sec) +
+                    " counts/s is below the rate-applied check's resolution; relying "
+                    "on " +
+                    (live_rate_relatch_ ? std::string("the :J re-latch") : std::string("the bare :I")) + " alone");
             return;
         }
         const auto window =
@@ -3516,7 +3567,9 @@ private:
             // place — the axis never stops. ":J" kick for the same reason
             // as the PulseGuide live-rate change (see
             // verify_live_rate_or_rekick): a bare ":I" here is not always
-            // enough on this firmware. The sampled rate-applied check cannot
+            // enough on some firmware (EQM-35 Pro), except on boards where
+            // live_rate_change_needs_relatch() is false (the EQ-AL55i Pro),
+            // which apply a bare ":I" and skip the kick. The sampled rate-applied check cannot
             // run here (synchronous under mutex_ from a property setter, and
             // it needs an unlocked ~450 ms window), so it runs as a one-shot
             // background task instead.
@@ -3538,7 +3591,9 @@ private:
             reap_rate_verify_task();
             auto& protocol = *protocol_;
             protocol.set_step_period(kAxisRa, tracking_step_period_for(eff));
-            protocol.start_motion(kAxisRa);
+            if (live_rate_relatch_) {  // open-astro#666: see live_rate_change_needs_relatch()
+                protocol.start_motion(kAxisRa);
+            }
             cmd_axis_rate_deg_s_[0] = eff;  // keep dead reckoning on the new rate
             spawn_rate_verify_task_locked(previous_effective, eff);
         } else {
@@ -3676,13 +3731,12 @@ private:
 
     // After the first goto lands, close the residual (prediction error) with
     // short re-gotos until inside the deadband. Slewing is held true across
-    // the inter-goto gaps via slew_force_until_.
+    // the inter-goto gaps by goto_in_progress_, which both callers set.
     void refine_goto_landing(std::unique_lock<std::mutex>& lock, double ra, double dec) {
         for (int iter = 0; iter < 3; ++iter) {
             if (slew_task_cancel_.load()) {
                 break;  // AbortSlew/unpark/disconnect cancelled the slew
             }
-            slew_force_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(3);
             refresh_position_cache_locked(true);
             // Judge the landing against the target ADVANCED by the resume
             // window -- the mount deliberately lands ahead (see above).
@@ -3695,7 +3749,6 @@ private:
             dispatch_predicted_goto_locked(lock, ra, dec);
             wait_for_slew_complete(lock);
         }
-        slew_force_until_ = std::chrono::steady_clock::time_point::min();
         slewing_cached_ = false;
     }
 
@@ -3706,7 +3759,6 @@ private:
         // that retries a rejected goto (even via the blocking
         // SlewToCoordinates) must not be told the OLD goto failed.
         clear_last_slew_error_locked();
-        slew_force_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(8);
         restore_tracking_after_slew_ = tracking_;
         // open-astro#404: the target is what the client ASKED for, so it is
         // published before dispatch on every writer (this one, the async slew
@@ -3722,7 +3774,6 @@ private:
             // Dispatch failed before the mount started moving: clear the
             // pre-published slew state so Slewing cannot wedge true.
             slewing_cached_ = false;
-            slew_force_until_ = std::chrono::steady_clock::time_point::min();
             restore_tracking_after_slew_ = false;
             throw;
         }
@@ -3964,18 +4015,25 @@ private:
         if (parking_ || homing_ || goto_in_progress_ || restoring_tracking_) {
             return true;
         }
-        return get_hardware_slewing_locked();
+        return get_hardware_slewing_locked(true);
     }
 
     // Hardware/manual slewing state WITHOUT the parking_ override. The park
     // task's own wait_for_slew_complete must poll this variant: polling
     // get_slewing_locked() while parking_ is set can never see "stopped" and
     // times out at 180s (AtPark stays false -- ConformU Park failure).
-    bool get_hardware_slewing_locked() const {
+    //
+    // honor_force_window: client-facing reads (get_slewing_locked, the
+    // FindHome already-at-home check) pass true, so Slewing reads true from
+    // the moment SlewToCoordinatesAsync returns until its task has set
+    // goto_in_progress_. Landing detection (wait_for_slew_complete) passes
+    // false and asks the board on every poll: a goto has landed when the
+    // board says it stopped, not when a timer expires (open-astro#715).
+    bool get_hardware_slewing_locked(bool honor_force_window) const {
         if (manual_axis_slewing_[0] || manual_axis_slewing_[1]) {
             return true;
         }
-        if (std::chrono::steady_clock::now() < slew_force_until_) {
+        if (honor_force_window && std::chrono::steady_clock::now() < slew_force_until_) {
             return true;
         }
         bool was_slewing = slewing_cached_;
@@ -4234,7 +4292,7 @@ private:
                 // the join is bounded.
                 throw AlpacaException("Slew wait cancelled");
             }
-            bool slewing = get_hardware_slewing_locked();
+            bool slewing = get_hardware_slewing_locked(false);
             if (slewing) {
                 saw_slewing = true;
             }
@@ -4262,6 +4320,8 @@ private:
             last_goto_dispatch_time_ = std::chrono::steady_clock::time_point{};
         }
         slewing_cached_ = false;
+        // Landed: end the async initiator's window too, or Slewing would stay
+        // true for the rest of its 8 s after a short goto and its restore.
         slew_force_until_ = std::chrono::steady_clock::time_point::min();
         invalidate_position_cache_locked();
         // No post-slew position freeze: gotos are LST-compensated and refined
@@ -4499,6 +4559,10 @@ private:
     // open-astro#458: measured_dec_axis_sense() of the connected board, 0 when
     // unmeasured or unknown. See home_term_sign_locked().
     int dec_axis_sense_ = 0;
+    // open-astro#666: live_rate_change_needs_relatch() of the connected board,
+    // true when unknown. Atomic because the pulse task's restore reads it
+    // without mutex_.
+    std::atomic<bool> live_rate_relatch_{true};
     mutable bool position_cache_valid_ = false;
     // open-astro#505: set when a recovered link turned out to belong to a
     // board that had restarted (init_done cleared, position registers reset).
@@ -4555,8 +4619,8 @@ private:
     mutable bool parking_ = false;
     mutable bool homing_ = false;
     // True from goto dispatch until the landing refinement finishes: Slewing
-    // must not flicker false mid-refinement (the timed slew_force_until_
-    // expired during a slow refine iteration, ConformU proceeded, and the
+    // must not flicker false mid-refinement (the timed 3 s window this
+    // replaced expired during a slow refine iteration, ConformU proceeded, and the
     // next refinement goto fought its pulse-guide test for the motors).
     mutable bool goto_in_progress_ = false;
     // Slewing must stay true across the post-slew tracking restore and its

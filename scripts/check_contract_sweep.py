@@ -3,21 +3,28 @@
 
 The cross-driver contract sweep (AlpacaCore/tests/contract_sweep.h +
 test_contract_sweep.cpp) runs the ASCOM contract cases over one registry entry
-per (vendor, device type) pair the router can construct. Nothing else makes a
-new driver join it: without this gate an 8th telescope driver inherits no
-contract coverage and CI stays green, which is the failure the sweep exists to
-end.
+per (vendor, device type) pair the server can construct, through either a
+Router::register_device_from_config() arm or a device-catalog factory
+(AlpacaCore/src/vendors/*/*_catalog.cpp). Nothing else makes a new driver join
+it: without this gate an 8th telescope driver inherits no contract coverage and
+CI stays green, which is the failure the sweep exists to end.
 
-Rules:
-  1. Every (vendor, deviceType) pair Router::register_device_from_config()
-     constructs has an `X(<vendor>_<devicetype>)` registry entry, or is in
-     ALLOWLIST with a reason.
-  2. A stale ALLOWLIST entry fails: the pair is now registered, or the router no
-     longer constructs it.
-  3. A registry entry whose pair the router does not construct fails (orphan),
-     and one registered under a guard that does not name its vendor fails (the
-     vendors-off build would sweep the wrong set). GUARD_OVERRIDE names the
-     pairs the router itself builds under another vendor's flag.
+Rules (a "constructed" pair is the union of the router arms and the catalog
+files' DeviceKey{...} pairs):
+  1. Every constructed (vendor, deviceType) pair has an
+     `X(<vendor>_<devicetype>)` registry entry, or is in ALLOWLIST with a reason
+     (UNSWEPT PAIR). Every create_* backend a router arm or catalog factory
+     calls for a swept pair is called by some registry entry, or is in
+     BACKEND_ALLOWLIST (UNSWEPT BACKEND). A catalog file with no parseable
+     DeviceKey{...} literal, or a router or registry construct the text parser
+     does not follow, fails (PARSER LIMIT).
+  2. A stale ALLOWLIST or BACKEND_ALLOWLIST entry fails: the pair or backend is
+     now swept, or neither the router nor the catalog constructs it any more.
+  3. A registry entry whose pair neither the router nor the catalog constructs
+     fails (orphan), and one registered under a guard that does not name its
+     vendor fails (the vendors-off build would sweep the wrong set).
+     GUARD_OVERRIDE names the pairs the router itself builds under another
+     vendor's flag.
   4. tests/CMakeLists.txt must define every ALPACACORE_* guard the registry uses
      for alpacacore_tests. Those macros are NOT inherited from the vendor
      targets (only AlpacaHTTP/CMakeLists.txt defines them, for the router), so a
@@ -73,6 +80,11 @@ PARSER_LIMITS = (
 ARM_RE = re.compile(r'vendor\s*==\s*"(?P<v>[a-z0-9]+)"\s*&&\s*device_type_str\s*==\s*"(?P<t>[a-z0-9]+)"')
 ENTRY_RE = re.compile(r"\bX\(\s*(?P<id>[a-z0-9]+_[a-z0-9]+(?:_[a-z0-9]+)*)\s*\)")
 GUARD_TOKEN_RE = re.compile(r"ALPACACORE_[A-Z0-9_]+")
+
+# open-astro#664: the catalog (AlpacaCore/src/vendors/*/*_catalog.cpp) is a second
+# source of constructed pairs, alongside the router arms above.
+CATALOG_GLOB = "AlpacaCore/src/vendors/*/*_catalog.cpp"
+CATALOG_KEY_RE = re.compile(r'DeviceKey\{\s*"(?P<v>[a-z0-9]+)"\s*,\s*DeviceType::(?P<t>[A-Za-z]+)\s*\}')
 
 
 def read_text(path: pathlib.Path) -> str:
@@ -217,6 +229,25 @@ def router_backends(router_text: str) -> dict[tuple[str, str], set[str]]:
     return out
 
 
+def find_catalog_files(root: pathlib.Path) -> list[pathlib.Path]:
+    """Every AlpacaCore/src/vendors/<vendor>/<vendor>_catalog.cpp under root, sorted."""
+    return sorted(root.glob(CATALOG_GLOB))
+
+
+def catalog_pairs(file_texts: dict[str, str]) -> dict[str, set[tuple[str, str]]]:
+    """repo-relative path -> the (vendor, deviceType) pairs its DeviceKey{...}
+    literals name (comments stripped). A file with none is a parser limit,
+    not silently zero pairs -- the caller reports it."""
+    return {path: {(m.group("v"), m.group("t").lower()) for m in CATALOG_KEY_RE.finditer(strip_comments(text))}
+            for path, text in file_texts.items()}
+
+
+def catalog_backends(file_texts: dict[str, str]) -> dict[str, set[str]]:
+    """repo-relative path -> the create_* factories it calls, normalised."""
+    return {path: {normalise_factory(f.group("f")) for f in FACTORY_RE.finditer(strip_comments(text))}
+            for path, text in file_texts.items()}
+
+
 def registry_factories(header_text: str, registered_ids: set[str]) -> set[str]:
     """The create_* factories called inside contract_entry_<id>() for each REGISTERED id.
 
@@ -320,22 +351,48 @@ def check(root: pathlib.Path) -> list[str]:
         vendor, dtype = eid.split("_")[:2]
         entry_pairs.setdefault((vendor, dtype), []).append(eid)
 
+    # open-astro#664: the catalog is a second source of constructed pairs. One
+    # file per vendor; a file with no DeviceKey{...} literal is a parser limit.
+    catalog_file_texts = {p.relative_to(root).as_posix(): read_text(p) for p in find_catalog_files(root)}
+    cat_pairs_by_file = catalog_pairs(catalog_file_texts)
+    cat_backends_by_file = catalog_backends(catalog_file_texts)
+    for path, found in sorted(cat_pairs_by_file.items()):
+        if not found:
+            failures.append("PARSER LIMIT: %s yields no DeviceKey{...} literal, which catalog_pairs() requires to "
+                            "find a pair to sweep; teach the parser or rewrite the registration in that form" % path)
+    all_catalog_pairs: set[tuple[str, str]] = set().union(*cat_pairs_by_file.values()) if cat_pairs_by_file else set()
+    catalog_backends_by_pair: dict[tuple[str, str], set[str]] = {}
+    for path, file_pairs in cat_pairs_by_file.items():
+        for pair in file_pairs:
+            catalog_backends_by_pair.setdefault(pair, set()).update(cat_backends_by_file.get(path, set()))
+    combined_pairs = pairs | all_catalog_pairs
+
+    def source_phrase(pair: tuple[str, str]) -> str:
+        from_router = pair in pairs
+        from_catalog = pair in all_catalog_pairs
+        if from_router and from_catalog:
+            return "the router and the catalog construct"
+        if from_router:
+            return "the router constructs"
+        return "the catalog constructs"
+
     # 1 + 2: coverage and stale allow-list.
-    for pair in sorted(pairs):
+    for pair in sorted(combined_pairs):
         covered = pair in entry_pairs
         allowed = pair in ALLOWLIST
         if not covered and not allowed:
             failures.append(
-                "UNSWEPT PAIR: the router constructs %s/%s but %s has no X(%s_%s) entry and it is not in "
+                "UNSWEPT PAIR: %s %s/%s but %s has no X(%s_%s) entry and it is not in "
                 "ALLOWLIST. Add a registry entry (contract_entry_%s_%s + the CS_ list) or allow-list it "
-                "with a reason in %s." % (pair[0], pair[1], REGISTRY, pair[0], pair[1], pair[0], pair[1], THIS_SCRIPT))
+                "with a reason in %s." % (source_phrase(pair), pair[0], pair[1], REGISTRY, pair[0], pair[1], pair[0],
+                                          pair[1], THIS_SCRIPT))
         if covered and allowed:
             failures.append(
                 "STALE ALLOWLIST ENTRY: %s/%s is now in the registry -- remove ('%s', '%s') from ALLOWLIST in %s"
                 % (pair[0], pair[1], pair[0], pair[1], THIS_SCRIPT))
-    for pair in sorted(set(ALLOWLIST) - pairs):
+    for pair in sorted(set(ALLOWLIST) - combined_pairs):
         failures.append(
-            "STALE ALLOWLIST ENTRY: %s/%s is no longer constructed by the router -- remove ('%s', '%s') from "
+            "STALE ALLOWLIST ENTRY: %s/%s is no longer constructed -- remove ('%s', '%s') from "
             "ALLOWLIST in %s" % (pair[0], pair[1], pair[0], pair[1], THIS_SCRIPT))
 
     # 2b: every backend factory a swept pair can construct has a registry entry that calls it.
@@ -354,10 +411,25 @@ def check(root: pathlib.Path) -> list[str]:
                 failures.append(
                     "STALE ALLOWLIST ENTRY: %s/%s %s is now swept -- remove %r from BACKEND_ALLOWLIST in %s"
                     % (pair[0], pair[1], fac, key, THIS_SCRIPT))
+    for pair, want in sorted(catalog_backends_by_pair.items()):
+        if pair not in entry_pairs:
+            continue  # the pair-level check above owns this
+        for fac in sorted(want):
+            key = (pair[0], pair[1], fac)
+            if fac not in have and key not in BACKEND_ALLOWLIST:
+                failures.append(
+                    "UNSWEPT BACKEND: the catalog's %s/%s factory constructs %s but no registry entry calls it. Add "
+                    "an entry (its id must start %s_%s) or allow-list ('%s', '%s', '%s') with a reason in %s."
+                    % (pair[0], pair[1], fac, pair[0], pair[1], pair[0], pair[1], fac, THIS_SCRIPT))
+            if fac in have and key in BACKEND_ALLOWLIST:
+                failures.append(
+                    "STALE ALLOWLIST ENTRY: %s/%s %s is now swept -- remove %r from BACKEND_ALLOWLIST in %s"
+                    % (pair[0], pair[1], fac, key, THIS_SCRIPT))
     known = {(v, t, f) for (v, t), fs in router_backends(router_text).items() for f in fs}
+    known |= {(v, t, f) for (v, t), fs in catalog_backends_by_pair.items() for f in fs}
     for key in sorted(set(BACKEND_ALLOWLIST) - known):
         failures.append(
-            "STALE ALLOWLIST ENTRY: %s/%s %s is no longer constructed by the router -- remove %r from "
+            "STALE ALLOWLIST ENTRY: %s/%s %s is no longer constructed -- remove %r from "
             "BACKEND_ALLOWLIST in %s" % (key[0], key[1], key[2], key, THIS_SCRIPT))
     fn_start = router_text.find(ROUTER_FUNCTION)
     fn_open = router_text.find("{", router_text.find(")", fn_start)) if fn_start >= 0 else -1
@@ -374,9 +446,9 @@ def check(root: pathlib.Path) -> list[str]:
 
     # 3: orphan entries and guard/vendor mismatch.
     for eid, pair in sorted((eid, pair) for pair, ids in entry_pairs.items() for eid in ids):
-        if pairs and pair not in pairs:
-            failures.append("ORPHAN ENTRY: %s is in the registry but the router does not construct %s/%s"
-                            % (eid, pair[0], pair[1]))
+        if combined_pairs and pair not in combined_pairs:
+            failures.append("ORPHAN ENTRY: %s is in the registry but neither the router nor the catalog "
+                            "constructs %s/%s" % (eid, pair[0], pair[1]))
         want = "ALPACACORE_ENABLE_" + GUARD_OVERRIDE.get(pair, pair[0].upper())
         if want not in entries[eid]:
             failures.append(
@@ -421,8 +493,10 @@ def main() -> int:
         print("\n%d finding(s)." % len(failures))
         return 1
     pairs = router_pairs(read_text(ROOT / ROUTER))
-    print("Contract-sweep registration OK -- %d router pairs checked, %d allow-listed as not-yet-swept."
-          % (len(pairs), len(ALLOWLIST)))
+    cat_by_file = catalog_pairs({p.relative_to(ROOT).as_posix(): read_text(p) for p in find_catalog_files(ROOT)})
+    cat_pairs: set[tuple[str, str]] = set().union(*cat_by_file.values()) if cat_by_file else set()
+    print("Contract-sweep registration OK -- %d router pairs and %d catalog pairs checked (%d total), "
+          "%d allow-listed as not-yet-swept." % (len(pairs), len(cat_pairs), len(pairs | cat_pairs), len(ALLOWLIST)))
     return 0
 
 
@@ -509,10 +583,52 @@ endif()
 FIX_SWEEP = "CONTRACT_SWEEP_ENTRIES(CS_T1_INVALID)\n"
 
 
-def _run(router=FIX_ROUTER, header=FIX_HEADER, cmake=FIX_CMAKE, sweep=FIX_SWEEP) -> list[str]:
+# open-astro#664: the catalog is a second source of constructed pairs. One file per
+# vendor, AlpacaCore/src/vendors/<vendor>/<vendor>_catalog.cpp, holding the
+# DeviceKey literal(s) and the create_* calls of that vendor's factories.
+CATALOG_ASTROASIS = "AlpacaCore/src/vendors/astroasis/astroasis_catalog.cpp"
+
+FIX_CATALOG = '''
+#include <alpacacore/catalog/device_catalog.h>
+#include <alpacacore/vendor/astroasis/astroasis_focuser_driver.h>
+namespace alpacacore::catalog {
+void register_astroasis_factory(DeviceCatalog& catalog) {
+    // DeviceKey{"ghost", DeviceType::Camera} inside a comment is not a pair
+    catalog.add(Factory{DeviceKey{"astroasis", DeviceType::Focuser}, [](const DeviceConfig& c, int n) {
+        const std::string hid = c.get(kHidPath);
+        if (!hid.empty()) return vendor::astroasis::create_astroasis_focuser(n, hid);
+        return vendor::astroasis::create_astroasis_focuser_by_index(n, 0);
+    }});
+}
+}
+'''
+
+FIX_CATALOG_HEADER = '''
+#ifdef ALPACACORE_ENABLE_ASTROASIS
+#define CS_ASTROASIS(X) X(astroasis_focuser)
+#else
+#define CS_ASTROASIS(X)
+#endif
+inline ContractEntry contract_entry_astroasis_focuser() {
+    return make_entry("astroasis_focuser", "astroasis", "focuser", DeviceType::Focuser,
+        [](int n) { return vendor::astroasis::create_astroasis_focuser(n, "/dev/hidraw0"); }, kSrc);
+}
+'''
+
+FIX_CMAKE_ASTROASIS = '''
+if(TARGET alpacacore_astroasis)
+    target_compile_definitions(alpacacore_tests PRIVATE ALPACACORE_ENABLE_ASTROASIS)
+endif()
+'''
+
+
+def _run(router=FIX_ROUTER, header=FIX_HEADER, cmake=FIX_CMAKE, sweep=FIX_SWEEP,
+         catalog: dict[str, str] | None = None) -> list[str]:
     with tempfile.TemporaryDirectory() as d:
         root = pathlib.Path(d)
-        for rel, text in ((ROUTER, router), (REGISTRY, header), (TESTS_CMAKE, cmake), (SWEEP_TEST, sweep)):
+        files = dict(((ROUTER, router), (REGISTRY, header), (TESTS_CMAKE, cmake), (SWEEP_TEST, sweep)))
+        files.update(catalog or {})
+        for rel, text in files.items():
             p = root / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(text, encoding="utf-8")
@@ -632,6 +748,24 @@ def self_test() -> int:
         # Robustness: a moved router function is a finding, not a silent pass.
         expect("router moved", _run(router="int x;\n"), "NO ROUTER ARMS FOUND")
         expect("empty registry", _run(header="// empty\n"), "EMPTY REGISTRY")
+        # open-astro#664: catalog pairs. AlpacaCore/src/vendors/*/*_catalog.cpp is the second
+        # source of constructed pairs; the pair set is the union of router and catalog, and
+        # UNSWEPT PAIR, ORPHAN ENTRY and UNSWEPT BACKEND apply to both. `catalog` maps a
+        # repo-relative path to file text; None (the default) writes no catalog file.
+        swept = dict(header=FIX_HEADER + FIX_CATALOG_HEADER, cmake=FIX_CMAKE + FIX_CMAKE_ASTROASIS)
+        expect("catalog pair swept (the commented ghost pair is not one)",
+               _run(catalog={CATALOG_ASTROASIS: FIX_CATALOG}, **swept), None)
+        expect("catalog pair without a registry entry", _run(catalog={CATALOG_ASTROASIS: FIX_CATALOG}),
+               "UNSWEPT PAIR: the catalog constructs astroasis/focuser")
+        expect("entry constructed by neither router nor catalog", _run(**swept),
+               "ORPHAN ENTRY: astroasis_focuser is in the registry but neither the router nor the catalog "
+               "constructs astroasis/focuser")
+        expect("catalog create_* call no registry entry calls", _run(catalog={CATALOG_ASTROASIS: FIX_CATALOG.replace(
+            "create_astroasis_focuser_by_index(n, 0)", "create_astroasis_focuser_hid2(n)")}, **swept),
+               "UNSWEPT BACKEND: the catalog's astroasis/focuser factory constructs create_astroasis_focuser_hid2")
+        expect("catalog file in a form the parser does not read", _run(catalog={CATALOG_ASTROASIS: FIX_CATALOG.replace(
+            'DeviceKey{"astroasis", DeviceType::Focuser}', "astroasis_key()")}, **swept),
+               "PARSER LIMIT: " + CATALOG_ASTROASIS)
     finally:
         ALLOWLIST = saved
         BACKEND_ALLOWLIST = saved_backends

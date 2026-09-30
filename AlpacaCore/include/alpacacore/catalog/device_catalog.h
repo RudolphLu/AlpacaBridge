@@ -73,8 +73,4 @@ private:
     std::vector<Factory> factories_;
 };
 
-// Empty until the vendor-descriptor slices land (see docs/decisions/0004-device-catalog.md).
-void register_builtin_schemas(DeviceCatalog& catalog);
-void register_builtin_factories(DeviceCatalog& catalog);
-
 }  // namespace alpacacore::catalog

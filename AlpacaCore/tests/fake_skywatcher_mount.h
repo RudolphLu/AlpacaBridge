@@ -15,12 +15,23 @@
 // Loopback UDP Sky-Watcher motor controller simulator (POSIX-only, like the
 // other test socket helpers). Unlike FakeMountServer's canned replies, this
 // implements the MC command set with a CONTINUOUS AXIS MODEL — counts advance
-// in real time per the commanded mode/rate, gotos ramp to their target and
+// with the clock per the commanded mode/rate, gotos ramp to their target and
 // stop, and the home-index registers latch when an axis sweeps past the
 // simulated sensor — so the SkyWatcher driver's async state machines (slew
 // dispatch + landing refinement, Park/FindHome tasks, pulse-guide timers,
 // MoveAxis stop tasks) run end-to-end through the REAL protocol wrapper and
 // UDP transport with no hardware and no production-code seams (issue #213).
+//
+// The clock is injected (open-astro#715, decision 0005): by default the real
+// one, so motion runs in real time; a test that passes a FakeTaskClock moves
+// the axes only through advance(), so a 180 degree flip lands in the same
+// real instant. Only the motion integration reads that clock. The reply-hold
+// sleep (hold_next_reply) stays on wall time: it models transport latency
+// the driver waits for in real time. The driver under test stays on the
+// wall clock in this slice; what the fake offers a test instead of a waiter
+// rendezvous is the board traffic itself: frames_seen() / wait_for_frames()
+// block until the driver has sent its next frame, so a case never sleeps for
+// a driver timer.
 //
 // Simulated geometry matches the Wave 100i values captured in
 // .github/instructions/skywatcher.instructions.md:
@@ -29,14 +40,18 @@
 
 #ifndef _WIN32
 
+#include <alpacacore/util/task_clock.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -63,6 +78,10 @@ struct FakeMountProfile {
     // ":s" (steps per worm). nullopt: the board rejects ":s" with "!0".
     // A value, zero included, is answered as "=" + that value.
     std::optional<uint32_t> steps_per_worm;
+    // ":i" (read the step period) answers "=FFFFFF" whatever ":I" stored,
+    // instead of the stored preset. Off for every board that has been seen
+    // to read its preset back.
+    bool step_period_readback_all_ones = false;
 
     // Wave 100i, MC firmware 3.58, mount code 0x44 (.github/instructions/skywatcher.instructions.md capture).
     static FakeMountProfile wave_100i() { return FakeMountProfile{}; }
@@ -102,6 +121,9 @@ struct FakeMountProfile {
     // driver already reads a high-speed ratio of 0 as 1.
     // No HOME_INDEXER bit (0x04) -> find_home() takes the count-frame fallback
     // instead of AutoHome; get_can_find_home() stays true unconditionally.
+    // ":i1"/":i2" -> =FFFFFF on every read, whatever ":I" wrote, while ":j"
+    // showed the axis running at the written rate (same mount on MC 3.48,
+    // TRACE log 2026-09-26, open-astro#686).
     static FakeMountProfile eq_al55i() {
         FakeMountProfile p;
         p.cpr = 4032000;
@@ -111,6 +133,7 @@ struct FakeMountProfile {
         p.high_speed_ratio_reply = "01";
         p.features = 0x9000;
         p.steps_per_worm = 0;
+        p.step_period_readback_all_ones = true;
         return p;
     }
 };
@@ -125,13 +148,20 @@ public:
     const uint32_t kCprDec;
     const uint32_t kTimerFreq;
 
-    explicit FakeSkyWatcherMount(FakeMountProfile profile = FakeMountProfile::wave_100i())
+    /// @param clock the clock the axis model integrates motion against.
+    /// Real by default; a FakeTaskClock makes motion virtual (see the file
+    /// comment). The clock must outlive the mount.
+    explicit FakeSkyWatcherMount(FakeMountProfile profile = FakeMountProfile::wave_100i(),
+                                 alpacacore::util::TaskClock& clock = alpacacore::util::default_task_clock())
         : kCpr(profile.cpr),
           kCprDec(profile.cpr_dec != 0 ? profile.cpr_dec : profile.cpr),
           kTimerFreq(profile.timer_freq),
-          profile_(std::move(profile)) {
+          profile_(std::move(profile)),
+          clock_(clock) {
         axes_[0].cpr = kCpr;
         axes_[1].cpr = kCprDec;
+        axes_[0].last = now();
+        axes_[1].last = now();
         fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (fd_ < 0) {
             return;
@@ -201,11 +231,44 @@ public:
         return ax(axis).stop_count;
     }
 
+    /// Number of ":i" step-period inquiries received for an axis
+    /// (open-astro#686: a board whose ":i" is meaningless must not be asked).
+    int step_period_inquiry_count(int axis) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return ax(axis).step_period_inquiries;
+    }
+
     bool axis_running(int axis) {
         std::lock_guard<std::mutex> lock(mutex_);
         Axis& a = ax(axis);
         a.advance(now());
         return a.running;
+    }
+
+    /// The axis is running a GOTO (":G" goto mode + ":J", not yet at its
+    /// target): the state a fake-clock test jumps virtual time through.
+    bool axis_in_goto(int axis) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Axis& a = ax(axis);
+        a.advance(now());
+        return a.running && a.in_goto;
+    }
+
+    /// Number of well-formed frames handled so far, for one command letter
+    /// (':f' status inquiries as 'f', ':J' starts as 'J', ...) or, with
+    /// @p cmd 0, for every command.
+    int frames_seen(char cmd = 0) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return frame_count(cmd);
+    }
+
+    /// Blocks until frames_seen(cmd) >= @p n or @p real_timeout of real time
+    /// passes; returns whether @p n was reached. The rendezvous with the
+    /// driver's board traffic: a test that must wait for the driver's next
+    /// poll waits for its frame instead of sleeping for its timer.
+    bool wait_for_frames(char cmd, int n, std::chrono::milliseconds real_timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return frames_cv_.wait_for(lock, real_timeout, [this, cmd, n] { return frame_count(cmd) >= n; });
     }
 
     /// Place the simulated home-index sensor (axis degrees from count home).
@@ -263,8 +326,10 @@ public:
     /// Swallow the re-latch of the next @p n ":J" on a RUNNING axis: the kick
     /// is acknowledged but the stored preset still is not applied. Combined
     /// with stall_live_rate_writes this is a stall that survives the driver's
-    /// unconditional ":I"+":J" and can only be recovered by the sampled
-    /// rate-applied check re-kicking (verify_live_rate_or_rekick).
+    /// ":I"+":J" and can only be recovered by the sampled rate-applied check
+    /// re-kicking (verify_live_rate_or_rekick). On a board that skips the
+    /// live-rate re-latch (EQ-AL55i Pro, 0x09, #666) there is no dispatch ":J"
+    /// to swallow, so only the verify resend's ":J" is affected.
     void ignore_start_relatches(int axis, int n) {
         std::lock_guard<std::mutex> lock(mutex_);
         ax(axis).ignore_start_relatches = n;
@@ -351,6 +416,7 @@ private:
         uint32_t indexer = 0;
         int start_count = 0;
         int stop_count = 0;
+        int step_period_inquiries = 0;
         int short_landings = 0;    // goto landings to report stopped early (test knob)
         int64_t short_counts = 0;  // how far short of the target to report it (test knob)
         int coast_ms = 0;          // how long the remainder takes to arrive (test knob)
@@ -365,7 +431,8 @@ private:
         int ignore_start_relatches = 0;     // ":J" kicks on a running axis that must NOT re-latch T1 (test knob)
         int reject_starts = 0;              // ":J" to refuse with "!2" (test knob)
         int64_t home_index_counts = kHome;
-        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+        // Set from the injected clock in the constructor.
+        std::chrono::steady_clock::time_point last{};
 
         void advance(std::chrono::steady_clock::time_point t) {
             double dt = std::chrono::duration<double>(t - last).count();
@@ -450,7 +517,16 @@ private:
         void arm_indexer() { indexer = counts < home_index_counts ? 0u : 0xFFFFFFu; }
     };
 
-    static std::chrono::steady_clock::time_point now() { return std::chrono::steady_clock::now(); }
+    // The injected clock: virtual under a FakeTaskClock, real by default.
+    std::chrono::steady_clock::time_point now() const { return clock_.now(); }
+
+    // Caller holds mutex_.
+    int frame_count(char cmd) const {
+        if (cmd == 0) {
+            return total_frames_;
+        }
+        return frames_by_cmd_[static_cast<unsigned char>(cmd)];
+    }
 
     Axis& ax(int axis) { return axes_[axis == 2 ? 1 : 0]; }
 
@@ -490,6 +566,9 @@ private:
         std::lock_guard<std::mutex> lock(mutex_);
         Axis& a = ax(axis);
         a.advance(now());
+        ++total_frames_;
+        ++frames_by_cmd_[static_cast<unsigned char>(cmd)];
+        frames_cv_.notify_all();
         bool was_running_on_start = false;  // ":J" only; declared here to not cross case labels
         switch (cmd) {
             case 'e':
@@ -557,6 +636,10 @@ private:
                 return "=";
             }
             case 'i':  // inquire the T1 step period last written with ":I"
+                ++a.step_period_inquiries;
+                if (profile_.step_period_readback_all_ones) {
+                    return "=" + u24(0xFFFFFF);
+                }
                 return "=" + u24(static_cast<uint32_t>(a.t1 & 0xFFFFFF));
             case 'J':
                 if (a.reject_starts > 0) {
@@ -658,10 +741,14 @@ private:
     int fd_ = -1;
     int port_ = 0;
     FakeMountProfile profile_;
+    alpacacore::util::TaskClock& clock_;
     std::atomic<bool> stop_{false};
     std::thread thread_;
     std::atomic<int> hold_ms_{0};
     std::mutex mutex_;
+    std::condition_variable frames_cv_;
+    int total_frames_ = 0;
+    std::array<int, 256> frames_by_cmd_{};
     int stop_ramp_ms_ = 0;
     bool garbled_version_replies_ = false;  // ":e" replies made unparseable (test knob)
     Axis axes_[2];

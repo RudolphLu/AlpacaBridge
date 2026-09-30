@@ -29,6 +29,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -48,6 +49,7 @@
 #include <vector>
 
 #include "test_assert.h"
+#include "test_catalog_descriptor.h"
 
 namespace {
 
@@ -188,6 +190,7 @@ struct PersistedAttempt {
     nlohmann::json config;        // Config of the registered device
     bool failed_listed = false;   // not registered, but listed as "<vendor> (failed to load)"
     nlohmann::json failed_entry;  // that row (DeviceType lower-case, LoadError true, sanitized Config)
+    std::string name;             // DeviceName of the registered device (what the factory was handed)
     std::vector<std::string> warnings;
     std::vector<std::string> errors;  // an exception out of a driver constructor is logged at ERROR, not WARN
 };
@@ -224,7 +227,13 @@ struct ScopedCwd {
 // configureddevices, capture every WARN and ERROR the load logged, and
 // unregister the device from the process-wide DeviceRegistry. `device_type` is
 // the listed name ("Telescope"); the entry carries the lower-case one.
-PersistedAttempt persisted_attempt(const nlohmann::json& entry, const std::string& device_type) {
+// `extend_catalog`, when set, adds test descriptors to the Router's catalog
+// before the persisted file is loaded (open-astro#664): the load runs inside
+// the constructor, so a descriptor added through Router::catalog() afterwards
+// is too late for the ConfigSource::Persisted path.
+PersistedAttempt persisted_attempt(
+    const nlohmann::json& entry, const std::string& device_type,
+    const std::function<void(alpacacore::catalog::DeviceCatalog&)>& extend_catalog = {}) {
     const std::filesystem::path persisted = std::filesystem::path("config") / "registered_devices.json";
     const std::string vendor = entry.value("vendor", "");
     const std::string lower_type = entry.value("deviceType", "");
@@ -260,8 +269,12 @@ PersistedAttempt persisted_attempt(const nlohmann::json& entry, const std::strin
                 result.errors.emplace_back(text);
             }
         });
-    alpacahttp::Router startup_router;
-    result.config = listed_config(startup_router, device_type, device_number);
+    alpacahttp::Router startup_router(extend_catalog);
+    {
+        const auto listed = listed_entry(startup_router, device_type, device_number);
+        result.config = listed.is_null() ? nlohmann::json() : listed.value("Config", nlohmann::json());
+        result.name = listed.is_null() ? std::string() : listed.value("DeviceName", "");
+    }
     result.listed = !result.config.is_null();
     if (!result.listed) {
         result.failed_entry = listed_failed_entry(startup_router, lower_type, device_number);
@@ -736,6 +749,51 @@ int main() {
     std::cout << "Testing routing...\n";
 
     alpacahttp::Router router;
+
+    // open-astro#711: libstdc++ std::regex recurses once per repeated
+    // character, so a ~60,000-byte path segment overflowed the worker stack
+    // and killed the server. route() refuses a path over 2048 bytes with 400
+    // + InvalidValue before any regex, and never echoes the path back.
+    {
+        const auto length_refusal = [&](const std::string& path) {
+            const auto resp = route_request(router, "GET", path + "?ClientTransactionID=711");
+            const auto json = nlohmann::json::parse(resp.body(), nullptr, false);
+            EXPECT(!json.is_discarded());
+            const std::string message = json.value("ErrorMessage", std::string());
+            const bool refused = message.find("the limit is 2048 bytes") != std::string::npos;
+            if (refused) {
+                EXPECT(resp.status_code() == 400);
+                EXPECT(json.value("ErrorNumber", 0) == 0x401);
+                EXPECT(json.value("ClientTransactionID", 0) == 711);
+                EXPECT(message.find(std::to_string(path.size())) != std::string::npos);
+                EXPECT(message.find("aaaa") == std::string::npos);
+            }
+            return refused;
+        };
+        const std::string long_segment(60000, 'a');
+        EXPECT(length_refusal("/api/v1/" + long_segment + "/0/connected"));
+        EXPECT(length_refusal("/setup/v1/" + long_segment + "/0/setup"));
+        EXPECT(length_refusal("/management/v1/wifi/profiles/" + long_segment));
+        EXPECT(length_refusal("/management/v1/logfiles/" + long_segment));
+        EXPECT(length_refusal("/web/" + long_segment));
+
+        // Boundary: 2048 bytes still routes, 2049 bytes is refused.
+        const std::string prefix = "/api/v1/";
+        const std::string suffix = "/0/connected";
+        const std::string at_limit = prefix + std::string(2048 - prefix.size() - suffix.size(), 'a') + suffix;
+        EXPECT(at_limit.size() == 2048);
+        EXPECT(!length_refusal(at_limit));
+        const std::string over_limit = prefix + std::string(2049 - prefix.size() - suffix.size(), 'a') + suffix;
+        EXPECT(over_limit.size() == 2049);
+        EXPECT(length_refusal(over_limit));
+
+        // No regression on an ordinary device path: no device at 0 is still
+        // the handler's 400, not the length refusal.
+        EXPECT(!length_refusal("/api/v1/telescope/0/connected"));
+        const auto resp = route_request(router, "GET", "/api/v1/telescope/0/connected");
+        EXPECT(resp.status_code() == 400);
+        EXPECT(nlohmann::json::parse(resp.body()).value("ErrorNumber", 0) != 0);
+    }
     alpacahttp::Request request;
 
     // Test management endpoint parsing
@@ -2286,12 +2344,17 @@ int main() {
         // astroasis / focuser — explicit hidPath persists through
         // sanitize_device_config. (An empty hidPath instead falls back to
         // focuserIndex, whose USB scan runs at connect time since #659.)
-        const auto cfg = roundtrip_config(
-            router,
-            {{"vendor", "astroasis"}, {"deviceType", "focuser"}, {"deviceNumber", 9621}, {"hidPath", "/dev/hidraw3"}},
-            "Focuser", 9621);
+        const auto cfg = roundtrip_config(router,
+                                          {{"vendor", "astroasis"},
+                                           {"deviceType", "focuser"},
+                                           {"deviceNumber", 9621},
+                                           {"hidPath", "/dev/hidraw3"},
+                                           {"responseTimeoutMs", 2500}},
+                                          "Focuser", 9621);
         EXPECT(cfg.is_object() && !cfg.empty());
         EXPECT(cfg.value("hidPath", "") == "/dev/hidraw3");
+        // A vendor-agnostic key survives the catalog-sanitized save.
+        EXPECT(cfg.value("responseTimeoutMs", -1) == 2500);
         remove_device(router, "astroasis", "focuser", 9621);
     }
     {
@@ -5261,6 +5324,97 @@ int main() {
             // A plausible epoch, so a served-but-empty reply cannot pass.
             EXPECT(json["Value"].is_number_integer() && json["Value"].get<std::int64_t>() > 1600000000);
         }
+
+        // open-astro#674: a ClientTransactionID sent only in the JSON body is
+        // echoed on every reply, not only on the cross-origin 403 (#509). A
+        // successful POST would set this machine's clock, which a unit test
+        // must never do (see above), so the success reply is the GET, served
+        // through the NowFn seam; the POST cases are the InvalidValue replies.
+        {
+            const auto echoed = [](const alpacahttp::Response& response) {
+                const auto json = nlohmann::json::parse(response.body(), nullptr, false);
+                EXPECT(!json.is_discarded());
+                return json.value("ClientTransactionID", 0U);
+            };
+            router.set_now_fn([] { return std::chrono::system_clock::time_point(std::chrono::seconds(1790467200)); });
+            const auto ok = route_request(router, "GET", "/management/v1/synctime", R"({"ClientTransactionID": 4242})");
+            EXPECT(nlohmann::json::parse(ok.body(), nullptr, false).value("ErrorNumber", -1) == 0);
+            EXPECT(echoed(ok) == 4242U);
+            router.set_now_fn([] { return std::chrono::system_clock::now(); });
+
+            for (const char* body :
+                 {R"({"Epoch": 100, "ClientTransactionID": 4242})", R"({"ClientTransactionID": 4242})"}) {
+                const auto response = route_request(router, "POST", "/management/v1/synctime", body);
+                const auto json = nlohmann::json::parse(response.body(), nullptr, false);
+                EXPECT(!json.is_discarded());
+                EXPECT(json.value("ErrorNumber", 0) == static_cast<int>(alpacacore::AlpacaError::InvalidValue));
+                EXPECT(echoed(response) == 4242U);
+            }
+
+            // Same precedence as the 403 path: a non-zero query-string ID wins.
+            const auto both = route_request(router, "POST", "/management/v1/synctime?ClientTransactionID=7",
+                                            R"({"Epoch": 100, "ClientTransactionID": 4242})");
+            EXPECT(echoed(both) == 7U);
+        }
+    }
+
+    // open-astro#675: set_now_fn() may replace the clock while a request
+    // thread is inside the previous one. The call in flight must keep its
+    // callable alive until it returns, the shape HostClock::set_hooks() has
+    // (#399); a plain std::function assignment destroys it under the reader.
+    {
+        alpacahttp::Router router;
+        // Function-local statics, not captures: on the unfixed code the
+        // callable is destroyed while it runs, and a body that reached its
+        // own captures after that would read freed memory before the check
+        // below could report it.
+        static std::mutex gate_mutex;
+        static std::condition_variable gate_cv;
+        static bool entered = false;
+        static bool release = false;
+        struct Token {
+            std::shared_ptr<std::atomic<bool>> destroyed;
+            ~Token() { destroyed->store(true); }
+        };
+        const auto destroyed = std::make_shared<std::atomic<bool>>(false);
+        auto token = std::make_shared<Token>();
+        token->destroyed = destroyed;
+        router.set_now_fn([token] {
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            entered = true;
+            gate_cv.notify_all();
+            gate_cv.wait(lock, [] { return release; });
+            return std::chrono::system_clock::time_point(std::chrono::seconds(1790467200));
+        });
+        token.reset();
+
+        nlohmann::json reply;
+        std::thread reader([&] {
+            reply =
+                nlohmann::json::parse(route_request(router, "GET", "/management/v1/synctime").body(), nullptr, false);
+        });
+        {
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            EXPECT(gate_cv.wait_for(lock, std::chrono::seconds(30), [] { return entered; }));
+        }
+        router.set_now_fn([] { return std::chrono::system_clock::now(); });
+        const bool alive_after_swap = !destroyed->load();
+        {
+            std::lock_guard<std::mutex> lock(gate_mutex);
+            release = true;
+        }
+        gate_cv.notify_all();
+        reader.join();
+        EXPECT(alive_after_swap);
+        // The in-flight call finished on the callable it started with...
+        EXPECT(reply.value("ErrorNumber", -1) == 0);
+        EXPECT(reply.value("Value", std::int64_t{0}) == 1790467200);
+        // ...which was released once it returned, not leaked...
+        EXPECT(destroyed->load());
+        // ...and the next request uses the replacement.
+        const auto next =
+            nlohmann::json::parse(route_request(router, "GET", "/management/v1/synctime").body(), nullptr, false);
+        EXPECT(next.value("Value", std::int64_t{0}) > 1600000000 && next.value("Value", std::int64_t{0}) != 1790467200);
     }
 
     // wifi management endpoints: routing + input validation. The happy paths
@@ -6013,6 +6167,196 @@ int main() {
         EXPECT(!echoed.is_discarded());
         EXPECT(echoed.value("ClientTransactionID", 0) == 8271);
     }
+
+    // open-astro#664 Part B: GET /management/v1/devicecatalog serves the
+    // catalog in the management envelope. The shape is pinned by the committed
+    // fixture tests/fixtures/devicecatalog.json (a fixture change is a
+    // deliberate commit). The catalog under test holds the built-in Astroasis
+    // descriptor plus the "zzz" test descriptor, schema only, so its
+    // `available` is false.
+    {
+        alpacahttp::Router router;
+        alpacahttp::test_catalog::add_schema(router.catalog());
+
+        const std::filesystem::path fixture_path = std::filesystem::path(ALPACAHTTP_ROUTER_SRC_DIR).parent_path() /
+                                                   "tests" / "fixtures" / "devicecatalog.json";
+        std::ifstream fixture_in(fixture_path);
+        EXPECT(fixture_in.good());
+        nlohmann::json fixture = nlohmann::json::parse(fixture_in, nullptr, false);
+        EXPECT(!fixture.is_discarded() && fixture.is_array() && fixture.size() == 2);
+        // The fixture is written for the all-vendors build. `available` is the
+        // one value that depends on the build (true with the vendor on, false
+        // with ALPACACORE_ENABLE_ASTROASIS=OFF), so it is set from this build
+        // before the compare; every other byte must match.
+        for (auto& entry : fixture) {
+            if (entry.value("vendor", "") == "astroasis") {
+#ifdef ALPACACORE_ENABLE_ASTROASIS
+                entry["available"] = true;
+#else
+                entry["available"] = false;
+#endif
+            }
+        }
+
+        const auto response = route_request(router, "GET", "/management/v1/devicecatalog?ClientTransactionID=4242");
+        EXPECT(response.status_code() == 200);
+        const auto json = nlohmann::json::parse(response.body(), nullptr, false);
+        EXPECT(!json.is_discarded());
+        EXPECT(json.value("ErrorNumber", -1) == 0);
+        EXPECT(json.value("ErrorMessage", "x").empty());
+        EXPECT(json.value("ClientTransactionID", 0) == 4242);
+        EXPECT(json.contains("ServerTransactionID") && json["ServerTransactionID"].is_number_unsigned());
+        EXPECT(json.contains("Value") && json["Value"].is_array());
+        // Canonical compare: dump() of the parsed objects on both sides.
+        EXPECT(json["Value"].dump() == fixture.dump());
+
+        // The unversioned alias resolves to the same handler.
+        const auto alias =
+            nlohmann::json::parse(route_request(router, "GET", "/management/devicecatalog").body(), nullptr, false);
+        EXPECT(!alias.is_discarded() && alias.value("ErrorNumber", -1) == 0);
+        EXPECT(alias["Value"].dump() == fixture.dump());
+
+        // GET only: a PUT or POST is refused the way the description endpoint
+        // refuses one -- 405 with InvalidOperation (0x40B) in the envelope.
+        const auto put = route_request(router, "PUT", "/management/v1/devicecatalog", "ClientTransactionID=77");
+        EXPECT(put.status_code() == 405);
+        const auto put_json = nlohmann::json::parse(put.body(), nullptr, false);
+        EXPECT(!put_json.is_discarded() && put_json.value("ErrorNumber", 0) == 0x40B);
+        const auto post = route_request(router, "POST", "/management/v1/devicecatalog", "{}");
+        EXPECT(post.status_code() == 405);
+    }
+
+    // open-astro#664 Part C: the router consults the catalog before its arm
+    // chain. "zzz" has no arm, so every outcome below is the catalog path.
+    {
+        alpacahttp::Router router;
+        alpacahttp::test_catalog::add_schema_and_factory(router.catalog());
+
+        // API, valid: registered through the catalog factory with the
+        // normalized config (the stub's Name reports what it was handed) and
+        // listed with the sanitized raw config: undeclared keys, nulls and the
+        // secret dropped, a record's undeclared key dropped, and a field whose
+        // applies_when does not match ("host" applies when mode is "b") kept.
+        const auto ok = api_attempt(
+            router,
+            nlohmann::json::parse(R"({"vendor":"zzz","deviceType":"focuser","deviceNumber":9255,"count":3,"mode":"a",)"
+                                  R"("host":"h","token":"s3cret","junk":1,"ratio":null,)"
+                                  R"("ports":[{"name":"p0","pwm":true,"junk":2}]})"),
+            "Focuser");
+        EXPECT(ok.ok);
+        const auto expected_config =
+            nlohmann::json::parse(R"({"vendor":"zzz","deviceType":"focuser","deviceNumber":9255,"count":3,"mode":"a",)"
+                                  R"("host":"h","ports":[{"name":"p0","pwm":true}]})");
+        EXPECT(ok.config.dump() == expected_config.dump());
+        EXPECT(listed_entry(router, "Focuser", 9255).value("DeviceName", "") == "zzz count=3 mode=a");
+        remove_device(router, "zzz", "focuser", 9255);
+
+        // The vendor-agnostic keys sanitize_device_config() keeps for every
+        // device (responseTimeoutMs, site, optics, syncTimeOnConnect) survive
+        // a catalog-sanitized save too, as they did through the deleted arm.
+        const auto shared =
+            api_attempt(router,
+                        nlohmann::json::parse(R"({"vendor":"zzz","deviceType":"focuser","deviceNumber":9255,"count":3,)"
+                                              R"("responseTimeoutMs":2500,"apertureDiameter":0.2,"focalLength":1.0,)"
+                                              R"("siteLatitude":-41.5,"siteLongitude":174.5,"siteElevation":30.0,)"
+                                              R"("learnSiteFromClient":true,"syncTimeOnConnect":false})"),
+                        "Focuser");
+        EXPECT(shared.ok);
+        EXPECT(shared.config.value("count", -1) == 3);
+        EXPECT(shared.config.value("responseTimeoutMs", -1) == 2500);
+        EXPECT(shared.config.value("apertureDiameter", -1.0) == 0.2);
+        EXPECT(shared.config.value("focalLength", -1.0) == 1.0);
+        EXPECT(shared.config.value("siteLatitude", 0.0) == -41.5);
+        EXPECT(shared.config.value("siteLongitude", 0.0) == 174.5);
+        EXPECT(shared.config.value("siteElevation", 0.0) == 30.0);
+        EXPECT(shared.config.value("learnSiteFromClient", false) == true);
+        EXPECT(shared.config.value("syncTimeOnConnect", true) == false);
+        remove_device(router, "zzz", "focuser", 9255);
+
+        // API, wrong type: the bridge's InvalidValue is reported as a
+        // config_get() failure is today, and nothing registers.
+        const auto wrong = api_attempt(
+            router,
+            nlohmann::json::parse(R"({"vendor":"zzz","deviceType":"focuser","deviceNumber":9255,"count":"seven"})"),
+            "Focuser");
+        EXPECT(!wrong.ok);
+        EXPECT(wrong.message == "Device config field 'count' has the wrong type (got string)");
+        EXPECT(listed_entry(router, "Focuser", 9255).is_null());
+
+        // API, out of range: normalize's rejection is the error message, the
+        // outcome reject_invalid_config() produces, and nothing registers.
+        const auto rejected = api_attempt(
+            router, nlohmann::json::parse(R"({"vendor":"zzz","deviceType":"focuser","deviceNumber":9255,"count":99})"),
+            "Focuser");
+        EXPECT(!rejected.ok);
+        EXPECT(rejected.message.find("count is out of range") != std::string::npos);
+        EXPECT(listed_entry(router, "Focuser", 9255).is_null());
+
+        // A key with no schema falls through to the arm chain unchanged.
+        const auto unknown = api_attempt(
+            router, nlohmann::json::parse(R"({"vendor":"yyy","deviceType":"focuser","deviceNumber":9255})"), "Focuser");
+        EXPECT(!unknown.ok);
+        EXPECT(unknown.message == "Vendor/device type combination not yet supported: yyy/focuser");
+    }
+    {
+        // Persisted: the catalog consult's own warning text, one line per
+        // warning -- distinct from reject_invalid_config()'s "will refuse to
+        // connect" wording (that text is false here: normalize() has already
+        // substituted a usable value, so the device is not refusing anything).
+        // The device registers anyway with the normalized config (count
+        // dropped to its default, mode substituted) while configureddevices
+        // keeps showing the raw values, secret excluded, so the entry stays
+        // editable.
+        const auto persisted = persisted_attempt(
+            nlohmann::json::parse(
+                R"({"vendor":"zzz","deviceType":"focuser","deviceNumber":9256,"count":99,"mode":"zzz","token":"s3cret"})"),
+            "Focuser", alpacahttp::test_catalog::add_schema_and_factory);
+        EXPECT(persisted.listed);
+        EXPECT(persisted.name == "zzz count=1 mode=a");
+        EXPECT(persisted.config.value("count", -1) == 99);
+        EXPECT(persisted.config.value("mode", "") == "zzz");
+        EXPECT(!persisted.config.contains("token"));
+        EXPECT(any_warning_contains(
+            persisted.warnings,
+            "Persisted zzz focuser 9256 config normalized: count is out of range (min 1) (max 8). "
+            "The saved value is not used: the field falls back to its default, or stays unset if it has none. "
+            "Registered so it stays listed and editable in the web UI."));
+        EXPECT(any_warning_contains(
+            persisted.warnings,
+            "Persisted zzz focuser 9256 config normalized: mode must be one of: a, b. "
+            "The saved value is not used: the field falls back to its default, or stays unset if it has none. "
+            "Registered so it stays listed and editable in the web UI."));
+        EXPECT(!any_warning_contains(persisted.warnings, "will refuse to connect"));
+        EXPECT(persisted.errors.empty());
+    }
+    {
+        // Persisted, wrong JSON type: the bridge's InvalidValue is thrown before
+        // normalize() runs, so the entry fails to load as a config_get() failure
+        // did through the deleted arm. It is not normalized to the default.
+        const auto persisted = persisted_attempt(
+            nlohmann::json::parse(R"({"vendor":"zzz","deviceType":"focuser","deviceNumber":9258,"count":"seven"})"),
+            "Focuser", alpacahttp::test_catalog::add_schema_and_factory);
+        EXPECT(!persisted.listed);
+        EXPECT(persisted.failed_listed);
+        EXPECT(!any_warning_contains(persisted.warnings, "config normalized"));
+    }
+
+#ifndef ALPACACORE_ENABLE_ASTROASIS
+    // open-astro#664 Part C step 3: with the vendor built out, the catalog path
+    // reports the deleted arm's exact text. Green before the arm is deleted;
+    // it pins the client-facing and web-UI text across the move.
+    {
+        alpacahttp::Router router;
+        const auto off = api_attempt(
+            router,
+            nlohmann::json::parse(
+                R"({"vendor":"astroasis","deviceType":"focuser","deviceNumber":9257,"hidPath":"/dev/hidraw3"})"),
+            "Focuser");
+        EXPECT(!off.ok);
+        EXPECT(off.message == "Astroasis support not enabled. Rebuild with -DALPACACORE_ENABLE_ASTROASIS=ON");
+        EXPECT(listed_entry(router, "Focuser", 9257).is_null());
+    }
+#endif
 
     std::cout << "All routing tests passed!\n";
     return 0;

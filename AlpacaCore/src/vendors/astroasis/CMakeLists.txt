@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 set(ASTROASIS_SOURCES
     astroasis_protocol_wrapper.cpp
     astroasis_focuser_driver.cpp
+    astroasis_catalog.cpp
 )
 
 add_library(alpacacore_astroasis STATIC ${ASTROASIS_SOURCES})
@@ -21,3 +22,7 @@ target_link_libraries(alpacacore_astroasis PRIVATE PkgConfig::HIDAPI)
 
 find_package(Threads REQUIRED)
 target_link_libraries(alpacacore_astroasis PRIVATE Threads::Threads)
+
+# Base drivers, logging and AsyncConnectable live in alpacacore; this vendor
+# links down to it, never the reverse (open-astro#710).
+target_link_libraries(alpacacore_astroasis PRIVATE alpacacore)

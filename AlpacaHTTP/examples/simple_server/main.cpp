@@ -110,6 +110,19 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
+    // A loop that ended with g_running still true was ended by the server
+    // itself (a restart whose listener could not re-bind, a failed start).
+    // Nobody asked for this, so exit 1: systemd's Restart=on-failure respawns
+    // the service, where a 0 would have left it down for good (#713).
+    const bool stop_requested = !g_running;
+    int exit_status = 0;
+    if (!stop_requested) {
+        alpacahttp::util::log_error(
+            "HTTP server stopped without a shutdown request (restart could not re-bind the listener, or the "
+            "listener failed); exiting with status 1 so systemd restarts the service");
+        exit_status = 1;
+    }
+
     alpacahttp::util::log_info("Shutting down...");
 
     // Stop services in reverse order of startup
@@ -136,5 +149,5 @@ int main(int argc, char* argv[]) {
 
     // Use exit() to ensure process terminates even if there are lingering threads
     // (all device task threads were joined by the registry clear above).
-    exit(0);
+    exit(exit_status);
 }

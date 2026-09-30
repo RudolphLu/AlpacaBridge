@@ -1907,17 +1907,21 @@ public:
         task.generation = pulse_generation_.load();
 
         {
+            // open-astro#714: mutex_ before pulse_mutex_, the order the
+            // Connected=true refresh uses when it clears the queue. Taking
+            // them the other way round deadlocked a guiding client against a
+            // second client's Connect. One critical section keeps the queue
+            // end, the offsets and pulse_guiding_end_ in step for any reader
+            // that holds mutex_.
+            std::lock_guard<std::mutex> state_lock(mutex_);
             std::lock_guard<std::mutex> lock(pulse_mutex_);
             const auto now = std::chrono::steady_clock::now();
             const auto start_time = std::max(pulse_queue_end_, now);
             pulse_queue_end_ = start_time + std::chrono::milliseconds(effective_duration);
-            {
-                std::lock_guard<std::mutex> state_lock(mutex_);
-                ra_offset_hours_ += expected_hours;
-                dec_offset_deg_ += expected_dec;
-                dec_offset_deg_ = std::clamp(dec_offset_deg_, -180.0, 180.0);
-                pulse_guiding_end_ = pulse_queue_end_ + kPulseGuideHold;
-            }
+            ra_offset_hours_ += expected_hours;
+            dec_offset_deg_ += expected_dec;
+            dec_offset_deg_ = std::clamp(dec_offset_deg_, -180.0, 180.0);
+            pulse_guiding_end_ = pulse_queue_end_ + kPulseGuideHold;
             pulse_queue_.push_back(task);
         }
         pulse_cv_.notify_one();

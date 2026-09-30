@@ -8,6 +8,7 @@
 #
 #   ./scripts/ci_preflight.sh                 # base = main
 #   PREFLIGHT_BASE=upstream/main ./scripts/ci_preflight.sh   # fork contributors
+#     (a base that does not resolve, or shares no history with HEAD, is a hard failure)
 #   RUN_SANITIZERS=0 ./scripts/ci_preflight.sh # SKIP the ASan+UBSan job (on by default)
 #   RUN_TSAN=1 ./scripts/ci_preflight.sh       # also run the TSan concurrency stress job
 #   RUN_SCAN_BUILD=1 ./scripts/ci_preflight.sh # also run Clang Static Analyzer (advisory)
@@ -181,7 +182,26 @@ ensure_zizmor() {
 # --- changed-file sets -----------------------------------------------------
 
 git fetch --no-tags origin "${BASE#origin/}" >/dev/null 2>&1 || true
-MERGE_BASE="$(git merge-base "${BASE}" HEAD 2>/dev/null || echo HEAD)"
+# Fail fast when the base cannot be resolved (issue #601): an empty diff would
+# make every change-scoped gate skip and the run end "Safe to push".
+if ! git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null; then
+  {
+    echo "ERROR: cannot resolve the diff base '${BASE}' to a commit."
+    echo "Fetch the remote it names, or set PREFLIGHT_BASE to a ref that exists, e.g.:"
+    echo "  git remote add upstream https://github.com/open-astro/AlpacaBridge.git && git fetch upstream"
+    echo "  PREFLIGHT_BASE=upstream/main ./scripts/ci_preflight.sh"
+  } >&2
+  exit 1
+fi
+if ! MERGE_BASE="$(git merge-base "${BASE}" HEAD 2>/dev/null)"; then
+  {
+    echo "ERROR: no merge-base between the diff base '${BASE}' and HEAD."
+    echo "The history is probably shallow or the base is unrelated: run"
+    echo "  git fetch --unshallow"
+    echo "or set PREFLIGHT_BASE to a ref that shares history with HEAD."
+  } >&2
+  exit 1
+fi
 echo "Diff base: ${BASE} (merge-base ${MERGE_BASE})"
 
 mapfile -t CHANGED < <(git diff --name-only "${MERGE_BASE}" HEAD)

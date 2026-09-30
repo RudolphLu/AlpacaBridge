@@ -147,17 +147,44 @@ datagrams before each send so replies cannot get off-by-one.
   2026-09-06): the board stores the preset (`:i` reads it back) but the motor keeps its old
   rate. Every live in-place `:I` is therefore followed by a `:J` re-latch (INDI does the
   same), and the driver sample-verifies the rate over ~450 ms (`verify_live_rate_or_rekick`)
-  and resends `:I`+`:J` if the axis did not change speed. Pulses ≥ 1.5 s verify inside the
-  pulse task (the window is deducted from the pulse; shorter pulses rely on the kick alone);
+  and resends `:I`+`:J` if the axis did not change speed. **Except on the EQ-AL55i Pro
+  (0x09, `live_rate_change_needs_relatch()`, open-astro#666):** there a bare `:I` applied
+  16 of 16 times, and the `:J` is not free: each one re-anchors the board's trajectory on
+  the encoder, stepping the tracking RA axis by the servo's following error (~2 counts,
+  sign set by the mount's balance), which put ConformU's 5 s E/W pulses outside tolerance.
+  That board skips the re-latch at every live-rate site (pulse dispatch and restore, the
+  rate setters, the dispatch-failure recovery); the verify and its `:I`+`:J` resend stay,
+  so 0x09 still sends a `:J` (and takes its ~2-count step) whenever the verify finds a
+  stalled `:I` -- up to twice on a long pulse (dispatch and post-stop).
+  Add a board to that exception only on the same evidence: bare `:I` applied on hardware
+  AND a measured `:J` position step. The measurements are from MC firmware 3.48; the
+  3.46 readings in `FakeMountProfile::eq_al55i()` are from the same mount before its
+  firmware update (see the EQ-AL55i Pro firmware release notes below). Pulses ≥ 1.5 s verify inside the
+  pulse task (the window is deducted from the pulse; shorter pulses rely on the kick alone,
+  or on 0x09 on the bare `:I`);
   the `RightAscensionRate`/`TrackingRate` setters cannot wait 450 ms inside a property call,
   so they spawn a one-shot background task (`rate_verify_thread_`, open-astro #248). That
   task never takes `mutex_`, which is what lets every RA-taking path reap it WITH `mutex_`
   held (setters, Tracking off, `stop_axis_and_wait_locked`, pulse dispatch, AbortSlew,
   disconnect) — a lock-free reap would leave a window for a setter to spawn one between an
   initiator's reap and its lock, and the resend would land mid-pulse or on a stopped axis.
+- **EQ-AL55i Pro motor-board firmware release notes** (Sky-Watcher's own changelog, copied
+  verbatim; append each new version here). Both versions on record ran on the same mount.
+  3.48 lists no motor-control change, so motor behaviour measured on either version is
+  taken to hold for both:
+  - **3.48**: "Support upgrading the Wi-Fi module's firmware." (the only change listed)
+  - **3.46**: the first version on record (`:e` -> `=032E09`, `FakeMountProfile::eq_al55i()`).
 - `:f` status nibbles: char0 bit0 speed-mode/bit1 CCW/bit2 fast; char1 bit0 running/bit1
   blocked; char2 bit0 init-done/bit1 level switch. Slewing = running AND NOT speed-mode
   on either axis (a tracking axis is not slewing).
+- **The `:i` step-period readback is a diagnostic only** (`set_step_period()`): it WARNs
+  on a mismatch with what `:I` wrote and never resends or throws. It turns itself off for
+  the connection when a board rejects `:i` with `!0`, and **per board when `:i` answers but
+  means nothing** (`step_period_readback_usable()`, open-astro#686): the EQ-AL55i Pro (0x09,
+  MC 3.48) answers `=FFFFFF` on both axes whatever was written, including while `:j` shows
+  the axis at the written rate, which logged a false mismatch on every checked write. Add a
+  board only on the same evidence: `:i` disagreeing with `:I` while the axis runs at the
+  written rate.
 - Connect sequence: `:e` version, `:a`/`:b`/`:g` per axis, then `:F` init (with `:E` home
   stamp) ONLY when the status reports not-initialized — never re-stamp an aligned session.
 - **Wave USB port is STM32 CDC-ACM** (`0483:5740`, `/dev/ttyACM*`, by-id name
@@ -235,6 +262,11 @@ datagrams before each send so replies cannot get off-by-one.
   constant ~79 arcsec sync-return error). Diagnosed by logging every motion
   frame (:G/:I/:J/:K) at WARN and killing ConformU at the first issue -- the
   trace showed three refinement gotos interleaved with the pulse.
+  Landing detection follows the same rule since open-astro#715: `wait_for_slew_complete()`
+  asks the board on every poll (`get_hardware_slewing_locked(false)`) instead of waiting out
+  an 8 s window, so a short goto lands when the board stops. The one window left is
+  `SlewToCoordinatesAsync`'s, covering only the gap before its task sets `goto_in_progress_`;
+  every exit of that task clears it, the early return of a reaped task included.
 - **Reap the pulse task at every motion boundary** (slews, park, home,
   moveaxis, sync, abort): ConformU's dual-axis pulse test leaves a live pulse
   timer that otherwise fires its stop/step-period restore into the middle of
@@ -423,8 +455,8 @@ below was one of them.
   clearing while the last counts still arrive -- and it needed its own seam (`land_short_by()`:
   report the landing stopped N counts short, then creep the remainder in). Goto counts could not
   be the signal either (`refine_goto_landing()` burns all three iterations on this fake whether or
-  not a landing coasts), nor wall-clock timing (the 3 s `slew_force_until_` window and the
-  tracking restore both sit between the landing and `Slewing` clearing). What works: coast for
+  not a landing coasts), nor wall-clock timing (the tracking restore sits between the landing
+  and `Slewing` clearing, as the 3 s `slew_force_until_` window also did before #715). What works: coast for
   longer than `kLandingSettleTimeout` and assert the check's own give-up WARN, a string nothing
   else emits. **Rule:** before claiming a change is covered, delete it and run the suite; if it
   stays green, the seam models the wrong failure.

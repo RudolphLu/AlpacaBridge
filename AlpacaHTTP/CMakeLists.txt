@@ -249,6 +249,7 @@ set(ALPACAHTTP_SOURCES
     src/core/response.cpp
     src/core/config.cpp
     src/core/json_utils.cpp
+    src/core/catalog_json.cpp
     src/http/router.cpp
     src/http/server.cpp
     src/http/thread_join.cpp
@@ -315,6 +316,7 @@ target_link_libraries(alpacahttp
     PUBLIC
         nlohmann_json::nlohmann_json
         AlpacaCore::alpacacore
+        AlpacaCore::alpacacore_builtins
         ZLIB::ZLIB
         PkgConfig::SYSTEMD
         CURL::libcurl
@@ -359,6 +361,11 @@ if(ALPACAHTTP_BUILD_TESTS)
     set(TEST_ROUTING_DIR ${CMAKE_CURRENT_BINARY_DIR}/test_routing_cwd)
     file(MAKE_DIRECTORY ${TEST_ROUTING_DIR})
     add_test(NAME test_routing COMMAND test_routing WORKING_DIRECTORY ${TEST_ROUTING_DIR})
+    # open-astro#664: the devicecatalog endpoint case reads the committed
+    # fixture tests/fixtures/devicecatalog.json, located from the source tree
+    # the same way test_route_table finds its type-name fixture.
+    target_compile_definitions(test_routing PRIVATE
+        ALPACAHTTP_ROUTER_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src")
 
     # #646: route-table snapshot, dispatch reach and rejection fixture. Own
     # working directory for the same reason as test_routing (relative
@@ -399,6 +406,13 @@ if(ALPACAHTTP_BUILD_TESTS)
     target_link_libraries(test_thread_join alpacahttp)
     target_include_directories(test_thread_join PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME test_thread_join COMMAND test_thread_join)
+
+    # open-astro#664: the JSON bridge of the device catalog (src/core/catalog_json.h,
+    # an internal seam like thread_join.h, hence src/ on the include path).
+    add_executable(test_catalog_json tests/test_catalog_json.cpp)
+    target_link_libraries(test_catalog_json alpacahttp)
+    target_include_directories(test_catalog_json PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME test_catalog_json COMMAND test_catalog_json)
 
     add_executable(test_json tests/test_json.cpp)
     target_link_libraries(test_json alpacahttp)

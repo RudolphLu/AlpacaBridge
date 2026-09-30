@@ -498,7 +498,7 @@ The Web UI (Step 6) should include a connection type selector matching this patt
 Update `AlpacaCore/CMakeLists.txt`:
 1. Add `option(ALPACACORE_ENABLE_<VENDOR> ...)`.
 2. Update `ALPACACORE_ENABLE_ALL_VENDORS` logic (if it exists).
-3. Add conditional `add_subdirectory(src/vendors/<vendor>)` + link.
+3. Add conditional `add_subdirectory(src/vendors/<vendor>)` + `target_link_libraries(alpacacore_builtins PRIVATE alpacacore_<vendor>)` (never link a vendor into `alpacacore`; the vendor's own CMakeLists links `alpacacore` PRIVATE, #710). A vendor whose descriptor factory `register_builtin_factories()` registers (`AlpacaCore/src/catalog/builtin_catalog.cpp`) also needs `target_compile_definitions(alpacacore_builtins PRIVATE ALPACACORE_ENABLE_<VENDOR>)` next to that link, or the registration compiles empty with no build error (see the Astroasis block in `AlpacaCore/CMakeLists.txt`).
 4. Add install rules for vendor target.
 
 Create `AlpacaCore/src/vendors/<vendor>/CMakeLists.txt` for the vendor target.
@@ -648,10 +648,17 @@ All 8 are mandatory. Read the existing tests to match the exact patterns used in
 4. **Unsupported actions** `"<Vendor> <Device> Driver - Unsupported actions"` `[<vendor>][<device>][unit]`
    - `CHECK(driver.get_supported_actions().empty());` (unless the driver defines custom actions)
    - `CHECK(driver.can_action("anything") == false);`
-   - `CHECK_THROWS_AS(driver.action("test", ""), alpacacore::AlpacaException);`
-   - `CHECK_THROWS_AS(driver.command_blind("test", false), alpacacore::AlpacaException);`
-   - `CHECK_THROWS_AS(driver.command_bool("test", false), alpacacore::AlpacaException);`
-   - `CHECK_THROWS_AS(driver.command_string("test", false), alpacacore::AlpacaException);`
+   - Assert the exact codes with the `require_alpaca_error` helper (case 6), not `CHECK_THROWS_AS(..., alpacacore::AlpacaException)`, which passes for any code: `action()` with an unlisted name is `ActionNotImplemented` (0x40C), and the three `command_*` methods are `MethodNotImplemented` (0x400) unless the driver implements command pass-through. A pass-through driver checks the connection first, so disconnected it throws `NotConnected` (0x407): assert that code for its three `command_*` calls instead of the `MethodNotImplemented` lines below.
+     ```cpp
+     require_alpaca_error([&]() { driver.action("test", ""); },
+                          alpacacore::AlpacaError::ActionNotImplemented);
+     require_alpaca_error([&]() { driver.command_blind("test", false); },
+                          alpacacore::AlpacaError::MethodNotImplemented);
+     require_alpaca_error([&]() { driver.command_bool("test", false); },
+                          alpacacore::AlpacaError::MethodNotImplemented);
+     require_alpaca_error([&]() { driver.command_string("test", false); },
+                          alpacacore::AlpacaError::MethodNotImplemented);
+     ```
 
 5. **Device-specific behavior** `[<vendor>][<device>][unit]`
    At least one test covering behavior unique to the device type. Examples:

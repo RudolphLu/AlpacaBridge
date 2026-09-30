@@ -16,5 +16,9 @@ if(ALPACACORE_ENABLE_SYNSCAN)
         ${CMAKE_SOURCE_DIR}/include
     )
 
+    # Base drivers, logging and AsyncConnectable live in alpacacore; this vendor
+    # links down to it, never the reverse (open-astro#710).
+    target_link_libraries(alpacacore_synscan PRIVATE alpacacore)
+
     message(STATUS "SynScan driver: Serial and TCP connection support enabled")
 endif()

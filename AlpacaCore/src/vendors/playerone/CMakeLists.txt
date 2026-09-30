@@ -55,6 +55,10 @@ if(ALPACACORE_ENABLE_PLAYERONE)
         ${PLAYERONE_PW_SDK_INCLUDE}
     )
 
+    # Base drivers, logging and AsyncConnectable live in alpacacore; this vendor
+    # links down to it, never the reverse (open-astro#710).
+    target_link_libraries(alpacacore_playerone PRIVATE alpacacore)
+
     # Link the shared libraries; RPATH covers both install paths used by the
     # workspace (/usr/local/lib via install_alpaca_service.sh) and the Debian
     # package (/usr/lib/alpacabridge via debian/rules).

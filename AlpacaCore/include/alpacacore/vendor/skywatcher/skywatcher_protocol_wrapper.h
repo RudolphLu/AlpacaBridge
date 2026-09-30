@@ -180,6 +180,10 @@ public:
     // ":I". with_readback=false skips the diagnostic ":i" comparison (one extra
     // serial round-trip) for callers on a timing-critical path.
     void set_step_period(int axis, uint32_t t1_preset, bool with_readback = true);
+    // Turn the ":i" readback diagnostic off until the next connect(), for a
+    // board whose ":i" reply does not reflect the stored preset
+    // (open-astro#686). connect() turns it back on.
+    void disable_step_period_readback();
     void start_motion(int axis);                         // ":J"
     void stop_motion(int axis);                          // ":K"
     void instant_stop(int axis);                         // ":L"

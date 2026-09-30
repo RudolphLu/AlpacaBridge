@@ -2034,12 +2034,16 @@ let serverClockOffsetMs = null;
 // TimeZone field ('' until the first successful load, or when the host
 // cannot name one); formatServerClock() falls back to the browser's zone.
 let serverTimeZone = '';
+// open-astro#677: the synctime ErrorMessage while the server refuses to report
+// its time (serverClockError() in web/format.js), '' otherwise.
+let serverClockErrorText = '';
 
 async function refreshServerClockOffset() {
     try {
         const t0 = Date.now();
         const response = await fetch(API_BASE + '/management/v1/synctime');
         const result = await response.json();
+        serverClockErrorText = serverClockError(result);
         if (result && result.ErrorNumber === 0 && isValidClockSeconds(result.Value)) {
             // Value is whole seconds; assume the server read its clock halfway
             // through the round trip.
@@ -2077,6 +2081,27 @@ function updateServerClock() {
     if (!el) {
         return;
     }
+    if (el.dataset.defaultTitle === undefined) {
+        el.dataset.defaultTitle = el.title;
+    }
+    if (serverClockErrorText) {
+        // open-astro#677: the reply carried no time, so show none, in the red
+        // "needs sync" style, with the server's reason on hover; the #670
+        // refusal names Sync Time as the fix. The header has no room for the
+        // whole message.
+        el.textContent = 'clock error';
+        el.title = serverClockErrorText;
+        el.classList.add('drift');
+        // A title tooltip never shows on a touch screen and a span takes no
+        // keyboard focus, so the clock becomes a control that shows the
+        // message (showServerClockError()) until the error clears.
+        el.tabIndex = 0;
+        el.setAttribute('role', 'button');
+        return;
+    }
+    el.title = el.dataset.defaultTitle;
+    el.removeAttribute('tabindex');
+    el.removeAttribute('role');
     if (serverClockOffsetMs === null) {
         el.textContent = '--:--:--';
         el.classList.remove('drift');
@@ -2087,6 +2112,20 @@ function updateServerClock() {
     // The GET returns whole seconds, so up to ±1 s of the offset is
     // quantization, not drift; only flag beyond 2 s.
     el.classList.toggle('drift', Math.abs(serverClockOffsetMs) > 2000);
+}
+
+// open-astro#677: a tap, click, Enter or Space on the header clock while it
+// reads "clock error" shows the server's message, which the title tooltip
+// alone keeps from touch and keyboard users.
+function showServerClockError(event) {
+    if (!serverClockErrorText) {
+        return;
+    }
+    if (event.type === 'keydown' && event.key !== 'Enter' && event.key !== ' ') {
+        return;
+    }
+    event.preventDefault();
+    alert(serverClockErrorText + '\n\nTo set it from this device, use Sync Time at the bottom of the page.');
 }
 
 // Shutdown server
@@ -4459,6 +4498,11 @@ function escapeHtml(text) {
 document.addEventListener('DOMContentLoaded', function() {
     loadDevices();
     loadServerInfo();
+    const serverClock = document.getElementById('server-clock');
+    if (serverClock) {
+        serverClock.addEventListener('click', showServerClockError);
+        serverClock.addEventListener('keydown', showServerClockError);
+    }
     refreshServerClockOffset();
     setInterval(updateServerClock, 1000);
     setInterval(refreshServerClockOffset, 60000);

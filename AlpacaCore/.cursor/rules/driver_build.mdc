@@ -417,9 +417,8 @@ if(ALPACACORE_ENABLE_ZWO)
         )
     endif()
     
-    # Link to main library
-    # Use PRIVATE to avoid circular dependency warnings
-    # The vendor library uses alpacacore headers but doesn't expose them to consumers
+    # Link down to the core library (one way: alpacacore never links a vendor
+    # library; alpacacore_builtins links this one, #710)
     target_link_libraries(alpacacore_zwo PRIVATE alpacacore)
     
     # Platform-specific settings
@@ -484,7 +483,7 @@ if(ALPACACORE_ENABLE_ZWO)
     # ZWO not yet implemented - skip for now
     # add_subdirectory(src/vendors/zwo)
     # if(TARGET alpacacore_zwo)
-    #     target_link_libraries(alpacacore PRIVATE alpacacore_zwo)
+    #     target_link_libraries(alpacacore_builtins PRIVATE alpacacore_zwo)
     # endif()
     message(WARNING "ZWO vendor support is not yet implemented")
 endif()
@@ -493,7 +492,7 @@ if(ALPACACORE_ENABLE_QHY)
     # QHY not yet implemented - skip for now
     # add_subdirectory(src/vendors/qhy)
     # if(TARGET alpacacore_qhy)
-    #     target_link_libraries(alpacacore PRIVATE alpacacore_qhy)
+    #     target_link_libraries(alpacacore_builtins PRIVATE alpacacore_qhy)
     # endif()
     message(WARNING "QHY vendor support is not yet implemented")
 endif()
@@ -501,7 +500,7 @@ endif()
 if(ALPACACORE_ENABLE_IOPTRON)
     add_subdirectory(src/vendors/ioptron)
     if(TARGET alpacacore_ioptron)
-        target_link_libraries(alpacacore PRIVATE alpacacore_ioptron)
+        target_link_libraries(alpacacore_builtins PRIVATE alpacacore_ioptron)
     endif()
 endif()
 
@@ -509,12 +508,14 @@ endif()
 if(ALPACACORE_ENABLE_NEWVENDOR)
     add_subdirectory(src/vendors/newvendor)
     if(TARGET alpacacore_newvendor)
-        target_link_libraries(alpacacore PRIVATE alpacacore_newvendor)
+        target_link_libraries(alpacacore_builtins PRIVATE alpacacore_newvendor)
     endif()
 endif()
 ```
 
 **Replace `newvendor` with your vendor name (lowercase) and `NEWVENDOR` with uppercase.**
+
+A vendor whose descriptor factory `register_builtin_factories()` registers (`AlpacaCore/src/catalog/builtin_catalog.cpp`) also needs `target_compile_definitions(alpacacore_builtins PRIVATE ALPACACORE_ENABLE_<VENDOR>)` next to that link, or the registration compiles empty with no build error (see the Astroasis block in `AlpacaCore/CMakeLists.txt`).
 
 #### Step 4: Add Installation Rules
 

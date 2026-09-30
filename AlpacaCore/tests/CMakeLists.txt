@@ -25,12 +25,15 @@ set(TEST_SOURCES
     test_contract_sweep.cpp
     test_async_connectable.cpp
     test_device_catalog.cpp
+    test_catalog_builtins.cpp
     test_device_registry.cpp
     test_device_state.cpp
     test_error_handling.cpp
     test_fake_pty_write.cpp
     test_host_clock.cpp
     test_poll_settle.cpp
+    test_task_clock.cpp
+    test_async_operation.cpp
     test_connection_resolver.cpp
     test_serial_by_id_scan.cpp
     test_stress_call_guard.cpp
@@ -202,7 +205,7 @@ endif()
 
 # Create test executable
 add_executable(alpacacore_tests ${TEST_SOURCES})
-target_link_libraries(alpacacore_tests PRIVATE alpacacore ${CATCH2_MAIN_TARGET})
+target_link_libraries(alpacacore_tests PRIVATE alpacacore alpacacore_builtins ${CATCH2_MAIN_TARGET})
 if(TARGET alpacacore_zwo)
     target_link_libraries(alpacacore_tests PRIVATE alpacacore_zwo)
     # The registry in contract_sweep.h is guarded by this macro; the vendor

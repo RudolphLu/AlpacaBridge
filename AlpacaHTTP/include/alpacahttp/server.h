@@ -55,8 +55,33 @@ public:
     // Stop the server
     void stop();
 
-    // Check if server is running
-    bool is_running() const { return running_; }
+    // Check if server is running. stop() clears running_ before it joins, so
+    // a restart (stop then start on the endpoint's detached thread) read false
+    // for the whole join window; the embedder's wait loop exited on that and
+    // the process ended with status 0, which Restart=on-failure does not
+    // respawn (#713). restart_epoch_ bridges that window: it is odd while a
+    // restart runs, and a running_ read counts only when the epoch is even and
+    // unchanged on both sides of it, so the read cannot fall inside a restart
+    // (two separate loads of running_ and a bool flag could). It is view-only:
+    // start(), start_async() and stop() keep testing the raw running_, so the
+    // !running_ reap-only path and the idempotency early-returns are unchanged.
+    bool is_running() const {
+        for (;;) {
+            const std::uint64_t epoch = restart_epoch_.load();
+            if ((epoch & 1U) != 0) {
+                return true;
+            }
+            const bool running = running_.load();
+            if (restart_epoch_.load() == epoch) {
+                return running;
+            }
+        }
+    }
+
+    // Test-only: true from the moment a management restart claims the server
+    // until handle_restart_request() has made its last write to it, so a test
+    // can wait for the detached restart thread before stop() or destruction.
+    bool restart_in_progress_for_test() const { return restart_requested_; }
 
     // The port actually bound, read back from the listening socket via
     // getsockname(). Differs from config's http_port() when that was 0 ("let
@@ -89,9 +114,11 @@ private:
     std::atomic<util::SocketHandle> server_fd_{util::kInvalidSocket};
     std::thread server_thread_;
     // Guards ownership of server_thread_ only (not the lifecycle phases).
-    // stop() is re-entrant from another thread -- the shutdown endpoint's
-    // detached thread runs the shutdown callback, which can make the embedder's
-    // own loop call stop() too -- so without this both callers could reach
+    // stop() is re-entrant from another thread -- the restart endpoint's
+    // detached thread stops and restarts the server, and an embedder that also
+    // calls stop() from its own thread can land in the middle of it (the
+    // shutdown endpoint no longer stops when a callback is installed, #713,
+    // but an embedder may still) -- so without this both callers could reach
     // join_server_thread() and join() the same std::thread. Concurrent join()
     // is UB, and in practice the second pthread_join throws std::system_error
     // that nothing catches, i.e. std::terminate(): the very failure #402 set
@@ -258,6 +285,10 @@ private:
     std::function<void()> restart_callback_;
     std::mutex restart_mutex_;
     std::atomic<bool> restart_requested_{false};
+    // Odd from handle_restart_request()'s stop() until its start_async() has
+    // returned, even otherwise; read only by is_running(). Its only writer is
+    // the restart thread, which restart_requested_'s CAS keeps to one at a time.
+    std::atomic<std::uint64_t> restart_epoch_{0};
 };
 
 } // namespace alpacahttp

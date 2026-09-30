@@ -147,8 +147,8 @@ std::string make_request_with_header_size(std::size_t header_bytes) {
 // --- keep-alive helpers ------------------------------------------------------
 
 // Read back the ephemeral port a just-started Server bound, retrying
-// briefly: is_running() can go true before the listener is actually created
-// (see the restart-case comment below for why), so bound_port() may answer 0
+// briefly: is_running() goes true before the listener is actually created,
+// so bound_port() may answer 0
 // for a few milliseconds after start_async() returns. Returns 0 if the port
 // never showed up within the budget.
 std::uint16_t wait_for_bound_port(alpacahttp::Server& server, int budget_ms) {
@@ -161,6 +161,18 @@ std::uint16_t wait_for_bound_port(alpacahttp::Server& server, int budget_ms) {
         }
     }
     return port;
+}
+
+// Wait for a management restart's detached thread to make its last write to
+// the server. A new listener answering proves start_async() ran, not that the
+// thread has finished: stop() racing its tail can read is_running() true, and
+// the Server can leave scope while that thread still writes its members.
+bool wait_for_restart_done(const alpacahttp::Server& server, int budget_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budget_ms);
+    while (server.restart_in_progress_for_test() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return !server.restart_in_progress_for_test();
 }
 
 int connect_local(std::uint16_t port) {
@@ -901,21 +913,19 @@ int main() {
                 ::close(fd);
 
                 // The restart runs on a detached thread 100 ms after the
-                // response, so polling is_running() here would race it (a
-                // true seen before stop() begins is the OLD generation, and
-                // a client connecting then lands in a listener about to be
-                // closed and gets a reset). Wait for proof the restart
-                // happened instead: stop() closes the parked bystander.
+                // response, and is_running() stays true for the whole of it
+                // (#713), so it cannot tell the old generation from the new
+                // one: a client connecting too early lands in a listener
+                // about to be closed and gets a reset. Wait for proof the
+                // restart happened instead: stop() closes the parked
+                // bystander.
                 EXPECT(peer_closed(bystander, 5000));
                 ::close(bystander);
-                // Then for the new generation to be up. is_running() goes
-                // true before the new listener is bound, so retry connect.
-                bool back = false;
-                for (int i = 0; i < 50 && !back; ++i) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    back = restart_server.is_running();
-                }
-                EXPECT(back);
+                // Then for the new generation to be up: the restart thread
+                // clears its flag only after stop() dropped the old listener
+                // and start_async() returned, so bound_port() below cannot
+                // answer the old one.
+                EXPECT(wait_for_restart_done(restart_server, 5000));
                 // The new generation's listener is a fresh ephemeral port
                 // (config_.http_port() is still 0), not necessarily the one
                 // from before this restart -- re-read it before using
@@ -950,10 +960,204 @@ int main() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
                 EXPECT(restart_probes.load() > probes_before);
+                // Let this restart's thread finish before the next round's
+                // request (a duplicate would be ignored) or stop().
+                EXPECT(wait_for_restart_done(restart_server, 5000));
             }
             restart_server.stop();
         } else {
             std::cout << "  (skipped restart case: could not bind an ephemeral port)\n";
+        }
+    }
+
+    // open-astro#713: is_running() stays true for the WHOLE of a restart.
+    // handle_restart_request() runs stop() then start_async() on the
+    // endpoint's detached thread, and stop() clears running_ FIRST and only
+    // then joins the reactor, the RTC probe, the workers and the server
+    // thread -- a window of many milliseconds in which is_running() read
+    // false. The example embedder's wait loop (`while (g_running &&
+    // server.is_running())`) polls that flag every 100 ms, so a restart
+    // could end the process with exit status 0, which Restart=on-failure
+    // does not bring back: the web UI Restart button stopped AlpacaBridge
+    // for good. A watcher sampling the flag in a tight loop across one
+    // restart must never read false. It turns false only when the server is
+    // stopped outside a restart, or when the restart's start_async() failed
+    // to bring the server back.
+    {
+        alpacahttp::Config keep_config;
+        keep_config.set_http_port(0);
+        keep_config.set_discovery_enabled(false);
+        keep_config.set_server_name("TestServerRestartKeepsRunning");
+        alpacahttp::Server keep_server(keep_config);
+        keep_server.start_async();
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+        if (const std::uint16_t keep_port = keep_server.is_running() ? wait_for_bound_port(keep_server, 2000) : 0;
+            keep_port != 0) {
+            struct timeval tv {};
+            tv.tv_sec = 5;
+
+            // A bystander parked on the reactor: stop() closing it is the
+            // proof that the restart actually ran (as in the restart case
+            // above), so the watcher's clean record cannot be vacuous.
+            int bystander = connect_local(keep_port);
+            EXPECT(bystander >= 0);
+            std::string bystander_carry;
+            send_all(bystander, kGet11);
+            EXPECT(read_one_response(bystander, bystander_carry).find("Connection: keep-alive\r\n") !=
+                   std::string::npos);
+
+            // Tight loop, no sleep: the join window is tens of milliseconds
+            // wide and a sleeping sampler could straddle it.
+            std::atomic<bool> watch{true};
+            std::atomic<bool> saw_false{false};
+            std::atomic<long> samples{0};
+            std::thread watcher([&keep_server, &watch, &saw_false, &samples]() {
+                while (watch.load()) {
+                    if (!keep_server.is_running()) {
+                        saw_false = true;
+                    }
+                    samples.fetch_add(1);
+                }
+            });
+
+            int fd = connect_local(keep_port);
+            EXPECT(fd >= 0);
+            ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            std::string carry;
+            send_all(fd, "PUT /management/restart HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+            EXPECT(read_one_response(fd, carry).rfind("HTTP/1.1 200 ", 0) == 0);
+            ::close(fd);
+
+            // The restart happened: stop() closed the parked bystander.
+            EXPECT(peer_closed(bystander, 5000));
+            ::close(bystander);
+
+            // Then wait until the server answers a new connection again.
+            // is_running() cannot be the readiness signal here (it must read
+            // true throughout), and the old listener may still be bound for
+            // a moment after the bystander closes, so re-read the port and
+            // retry the whole connect + request until a 200 comes back.
+            struct timeval short_tv {};
+            short_tv.tv_sec = 1;
+            bool answered = false;
+            const auto back_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (!answered && std::chrono::steady_clock::now() < back_deadline) {
+                const std::uint16_t new_port = keep_server.bound_port();
+                int after = new_port != 0 ? connect_local(new_port) : -1;
+                if (after >= 0) {
+                    ::setsockopt(after, SOL_SOCKET, SO_RCVTIMEO, &short_tv, sizeof(short_tv));
+                    // Raw send: a connect that landed in the old listener is
+                    // reset, which is a retry here, not a failed check.
+                    if (::send(after, kGet11.data(), kGet11.size(), MSG_NOSIGNAL) ==
+                        static_cast<ssize_t>(kGet11.size())) {
+                        std::string after_carry;
+                        answered = read_one_response(after, after_carry).rfind("HTTP/1.1 200 ", 0) == 0;
+                    }
+                    ::close(after);
+                }
+                if (!answered) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+            }
+            EXPECT(answered);
+
+            watch = false;
+            watcher.join();
+            EXPECT(samples.load() > 0);
+            EXPECT(!saw_false.load());
+
+            EXPECT(wait_for_restart_done(keep_server, 5000));
+            keep_server.stop();
+            EXPECT(!keep_server.is_running());
+        } else {
+            std::cout << "  (skipped restart-keeps-running case: could not bind an ephemeral port)\n";
+        }
+    }
+
+    // open-astro#713: with a shutdown callback installed, the shutdown
+    // endpoint's handler runs the callback and nothing else. The embedder's
+    // own stop() -- the example server's main loop calls it once the callback
+    // has cleared its flag -- is the one stop, and it returns only after
+    // every server thread is joined. Before this the handler called stop()
+    // as well, straight after the callback returned: the embedder saw
+    // is_running() drop before it had asked for anything, and two stop()
+    // calls raced on one Server (the concurrent-stop case below is what
+    // keeps that race from aborting). With no callback installed the handler
+    // keeps calling stop() itself; that path is not under test here.
+    {
+        std::mutex shutdown_cb_mutex;
+        std::condition_variable shutdown_cb_cv;
+        bool shutdown_cb_called = false;
+        alpacahttp::Config cb_config;
+        cb_config.set_http_port(0);
+        cb_config.set_discovery_enabled(false);
+        cb_config.set_server_name("TestServerShutdownCallbackOnly");
+        alpacahttp::Server cb_server(cb_config);
+        cb_server.set_shutdown_callback([&shutdown_cb_mutex, &shutdown_cb_cv, &shutdown_cb_called]() {
+            {
+                std::lock_guard<std::mutex> lock(shutdown_cb_mutex);
+                shutdown_cb_called = true;
+            }
+            shutdown_cb_cv.notify_all();
+        });
+        cb_server.start_async();
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+        if (const std::uint16_t cb_port = cb_server.is_running() ? wait_for_bound_port(cb_server, 2000) : 0;
+            cb_port != 0) {
+            struct timeval tv {};
+            tv.tv_sec = 5;
+
+            // A bystander parked on the reactor: a stop() the handler must
+            // not run would close it.
+            int bystander = connect_local(cb_port);
+            EXPECT(bystander >= 0);
+            std::string bystander_carry;
+            send_all(bystander, kGet11);
+            EXPECT(read_one_response(bystander, bystander_carry).find("Connection: keep-alive\r\n") !=
+                   std::string::npos);
+
+            int fd = connect_local(cb_port);
+            EXPECT(fd >= 0);
+            ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            std::string carry;
+            send_all(fd, "PUT /management/shutdown HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+            const std::string r = read_one_response(fd, carry);
+            EXPECT(r.rfind("HTTP/1.1 200 ", 0) == 0);
+            EXPECT(r.find("Shutdown initiated") != std::string::npos);
+            ::close(fd);
+
+            // The callback runs on the endpoint's detached thread 100 ms
+            // after the response.
+            {
+                std::unique_lock<std::mutex> lock(shutdown_cb_mutex);
+                shutdown_cb_cv.wait_for(lock, std::chrono::seconds(5),
+                                        [&shutdown_cb_called] { return shutdown_cb_called; });
+                EXPECT(shutdown_cb_called);
+            }
+
+            // After the callback the server is still up: the bystander is
+            // still open half a second later, is_running() still reads true,
+            // and a fresh request is served.
+            EXPECT(!peer_closed(bystander, 500));
+            EXPECT(cb_server.is_running());
+            int after = connect_local(cb_port);
+            EXPECT(after >= 0);
+            ::setsockopt(after, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            std::string after_carry;
+            send_all(after, kGet11);
+            EXPECT(read_one_response(after, after_carry).rfind("HTTP/1.1 200 ", 0) == 0);
+            ::close(after);
+
+            // The embedder's stop() is the one stop; when it returns, every
+            // server thread is joined and the parked connection is gone.
+            cb_server.stop();
+            EXPECT(!cb_server.is_running());
+            EXPECT(peer_closed(bystander, 5000));
+            ::close(bystander);
+        } else {
+            std::cout << "  (skipped shutdown-callback-only case: could not bind an ephemeral port)\n";
         }
     }
 
@@ -1361,12 +1565,15 @@ int main() {
     }
 
     {
-        // Two threads calling stop() on the SAME running Server, which is the
-        // shipped shutdown path, not a contrived one: PUT
-        // /management/v1/shutdown spawns a detached thread that runs the
-        // shutdown callback, and the example server's callback clears the flag
-        // its own main loop polls -- so that loop calls stop() too, while the
-        // detached thread is inside stop(). Both reach join_server_thread().
+        // Two threads calling stop() on the SAME running Server, which a
+        // shipped server can reach, not a contrived one: PUT
+        // /management/v1/restart spawns a detached thread whose
+        // handle_restart_request() stops and restarts the server, and an
+        // embedder that also calls stop() from its own thread (its main loop
+        // after SIGTERM, or the shutdown endpoint with no callback installed)
+        // can land while that thread is inside stop(). The shutdown endpoint
+        // no longer stops when a callback is installed (#713), but these
+        // pairs still race. Both reach join_server_thread().
         //
         // Concurrent join() on one std::thread is UB; in practice the second
         // pthread_join throws std::system_error, which nothing catches, so the

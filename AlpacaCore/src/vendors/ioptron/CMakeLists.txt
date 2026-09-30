@@ -73,8 +73,9 @@ if(ALPACACORE_ENABLE_IOPTRON)
         ${CMAKE_SOURCE_DIR}/include
     )
 
-    # Do NOT link to alpacacore here - that creates a circular dependency
-    # The vendor library only uses headers, and alpacacore will link to this library
+    # Base drivers, logging and AsyncConnectable live in alpacacore; this vendor
+    # links down to it, never the reverse (open-astro#710).
+    target_link_libraries(alpacacore_ioptron PRIVATE alpacacore)
 
     if(_ioptron_powerbox)
         # libgpiod (>= 2.0) backs the iMate PowerBox Switch driver. The iMate's
