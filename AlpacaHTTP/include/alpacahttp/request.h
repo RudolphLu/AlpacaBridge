@@ -32,8 +32,10 @@ class Request {
 public:
     // Maximum accepted request body size (bounds Content-Length so a hostile
     // header can neither over-allocate nor exhaust the read loop). Shared by
-    // Request::parse and the server's recv path.
-    static constexpr std::size_t kMaxBodyBytes = std::size_t{10} * 1024 * 1024;
+    // Request::parse and the server's recv path. 64 KiB (issue #741): the
+    // largest legitimate body, one device's configuredevice JSON or an Alpaca
+    // form PUT, is a few KiB.
+    static constexpr std::size_t kMaxBodyBytes = std::size_t{64} * 1024;
 
     Request() = default;
     ~Request() = default;
