@@ -57,7 +57,10 @@ reports that the run finished without changing the installed version and the
 transcript shows why. The daemon reads
 the tail of that file for the UI and uses the marker as the durable record of
 the last run, because a finished oneshot unit is garbage-collected by systemd
-and reads as never-run afterwards.
+and reads as never-run afterwards. A start job that systemd still holds for
+the unit (queued behind `network-online.target`, before the helper has
+truncated the previous transcript) is reported as `running`, so the previous
+run's marker is never mistaken for the new run's result.
 
 The transcript directory is the helper unit's own `LogsDirectory=`, created
 `root:root 0755`, and deliberately not the daemon's `/var/log/AlpacaBridge`:

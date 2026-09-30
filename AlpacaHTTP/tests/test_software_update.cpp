@@ -735,6 +735,34 @@ int main() {
         EXPECT(status_state(manager.status()) == "running");
     }
 
+    // --- classify_installer_state: the durable-record contract, pure.
+    {
+        using alpacahttp::util::classify_installer_state;
+        const std::string ok = "=== started\n=== RESULT: success 2026-09-30T00:00:00Z installed 4.2.0\n";
+        const std::string bad = "=== started\n=== RESULT: failure 2026-09-30T00:00:00Z exit 100\n";
+        const std::string both = bad + "=== started again\n=== RESULT: success\n";
+        EXPECT(classify_installer_state("activating", "start", "", false, "").state == "running");
+        EXPECT(classify_installer_state("active", "running", "", false, ok).state == "running");
+        EXPECT(classify_installer_state("deactivating", "stop", "", false, "").state == "running");
+        // A queued start job with the unit still inactive is running, and the
+        // previous transcript's marker must not be reported as the result.
+        const auto queued = classify_installer_state("inactive", "dead", "success", true, ok);
+        EXPECT(queued.state == "running");
+        EXPECT(queued.detail.find("Job=pending") != std::string::npos);
+        EXPECT(classify_installer_state("failed", "failed", "exit-code", false, ok).state == "failed");
+        EXPECT(classify_installer_state("inactive", "dead", "success", false, ok).state == "succeeded");
+        EXPECT(classify_installer_state("inactive", "dead", "success", false, bad).state == "failed");
+        EXPECT(classify_installer_state("inactive", "dead", "success", false, both).state == "succeeded");
+        const auto killed = classify_installer_state("inactive", "dead", "success", false, "=== started\n");
+        EXPECT(killed.state == "failed");
+        EXPECT(killed.detail.find("no result recorded") != std::string::npos);
+        const auto idle = classify_installer_state("inactive", "dead", "success", false, "");
+        EXPECT(idle.state == "idle");
+        EXPECT(idle.detail == "ActiveState=inactive SubState=dead Result=success");
+        EXPECT(idle.log.empty());
+        EXPECT(classify_installer_state("inactive", "dead", "success", false, ok).log == ok);
+    }
+
     std::cout << "All software update tests passed!\n";
     return 0;
 }

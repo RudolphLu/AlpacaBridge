@@ -100,6 +100,19 @@ struct InstallerState {
     std::string log;
 };
 
+// The durable-record contract behind InstallerState, as a pure function so
+// it can be pinned without systemd: `active_state`, `sub_state` and `result`
+// are the unit's properties, `job_pending` is whether systemd holds a job for
+// the unit (a start queued behind network-online.target, before the helper
+// has truncated the previous transcript), `log` is the transcript tail.
+//   running   : the unit is active/activating/deactivating, OR a job is pending
+//   failed    : ActiveState=failed, OR the transcript's last marker is failure,
+//               OR a transcript exists with no marker (killed or rebooted)
+//   succeeded : the transcript's last marker is success
+//   idle      : inactive with no transcript
+InstallerState classify_installer_state(const std::string& active_state, const std::string& sub_state,
+                                        const std::string& result, bool job_pending, const std::string& log);
+
 class SoftwareUpdateBackend {
 public:
     virtual ~SoftwareUpdateBackend() = default;

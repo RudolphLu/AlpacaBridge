@@ -342,6 +342,44 @@ void SystemSoftwareUpdateBackend::start_installer() {
     log_info("Software update: started " + unit_);
 }
 
+InstallerState classify_installer_state(const std::string& active_state, const std::string& sub_state,
+                                        const std::string& result, bool job_pending, const std::string& log) {
+    InstallerState state;
+    state.log = log;
+    state.detail = "ActiveState=" + active_state + " SubState=" + sub_state +
+                   (result.empty() ? "" : " Result=" + result) + (job_pending ? " Job=pending" : "");
+    if (job_pending || active_state == "activating" || active_state == "active" || active_state == "deactivating" ||
+        active_state == "reloading") {
+        state.state = "running";
+        return state;
+    }
+    if (active_state == "failed") {
+        state.state = "failed";
+        return state;
+    }
+    // Inactive: the transcript's own marker is the durable record, since a
+    // finished oneshot unit is garbage-collected and reads as never-run.
+    switch (last_result_marker(log)) {
+        case 1:
+            state.state = "succeeded";
+            break;
+        case -1:
+            state.state = "failed";
+            break;
+        default:
+            if (!log.empty()) {
+                // Started but never reached a result: killed (TimeoutStartSec)
+                // or the host rebooted mid-run.
+                state.state = "failed";
+                state.detail += " (no result recorded)";
+            } else {
+                state.state = "idle";
+            }
+            break;
+    }
+    return state;
+}
+
 InstallerState SystemSoftwareUpdateBackend::installer_state() {
     InstallerState state;
     state.log = read_log_tail(log_path_, SoftwareUpdateManager::kLogTailBytes);
@@ -384,36 +422,24 @@ InstallerState SystemSoftwareUpdateBackend::installer_state() {
     const std::string active = unit_property_string(bus.bus, unit_path, kSystemdUnitIface, "ActiveState");
     const std::string sub = unit_property_string(bus.bus, unit_path, kSystemdUnitIface, "SubState");
     const std::string result = unit_property_string(bus.bus, unit_path, kSystemdServiceIface, "Result");
-    state.detail = "ActiveState=" + active + " SubState=" + sub + (result.empty() ? "" : " Result=" + result);
-
-    if (active == "activating" || active == "active" || active == "deactivating" || active == "reloading") {
-        state.state = "running";
-        return state;
+    // Job: (uo) with id 0 when nothing is queued. Right after StartUnit the
+    // unit can still read inactive while its start job waits on
+    // network-online.target, before the helper truncates the old transcript;
+    // without this the previous run's marker would be reported as the result.
+    bool job_pending = false;
+    {
+        BusError job_err;
+        BusMessage job_msg;
+        if (sd_bus_get_property(bus.bus, kSystemdService, unit_path.c_str(), kSystemdUnitIface, "Job", &job_err.err,
+                                &job_msg.msg, "(uo)") >= 0) {
+            std::uint32_t job_id = 0;
+            const char* job_path = nullptr;
+            if (sd_bus_message_read(job_msg.msg, "(uo)", &job_id, &job_path) > 0) job_pending = job_id != 0;
+        }
     }
-    if (active == "failed") {
-        state.state = "failed";
-        return state;
-    }
-    // Inactive: the transcript's own marker is the durable record, since a
-    // finished oneshot unit is garbage-collected and reads as never-run.
-    switch (last_result_marker(state.log)) {
-        case 1:
-            state.state = "succeeded";
-            break;
-        case -1:
-            state.state = "failed";
-            break;
-        default:
-            if (!state.log.empty()) {
-                // Started but never reached a result: killed (TimeoutStartSec)
-                // or the host rebooted mid-run.
-                state.state = "failed";
-                state.detail += " (no result recorded)";
-            } else {
-                state.state = "idle";
-            }
-            break;
-    }
+    const InstallerState classified = classify_installer_state(active, sub, result, job_pending, state.log);
+    state.state = classified.state;
+    state.detail = classified.detail;
     return state;
 }
 
