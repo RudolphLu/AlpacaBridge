@@ -154,16 +154,15 @@ struct SoftwareUpdateSettings {
 std::string expand_version_template(std::string url_template, const std::string& version);
 
 // Policy over the backend. Thread-safe. The cached result (latest version,
-// check time, error, notes) is read and written under one mutex, but
-// check() performs its two network fetches (index, then notes; each bounded
-// by kFetchTimeout) WITHOUT holding it, so a status() poll never queues
-// behind a slow mirror; the settings it reads meanwhile are immutable after
-// construction. Two concurrent checks therefore interleave freely and the
-// last one to finish stores its answer (last writer wins; both read the same
-// index, so the answers differ only if the repository changed between
-// them, and a check arriving mid-fetch reuses the running one, see check()).
-// install() likewise makes its sd-bus calls outside the mutex, with an
-// in-flight flag refusing a second install meanwhile.
+// check time, error, notes) is read and written under one mutex, and no
+// network or sd-bus call runs while it is held: check() fetches (index,
+// then notes; each bounded by kFetchTimeout), install() talks to systemd,
+// and status() reads the installer state, all before taking the lock, so a
+// status() poll never queues behind a slow mirror or a slow polkitd. The
+// settings read meanwhile are immutable after construction. A check that
+// arrives while another is fetching waits for it and returns its result
+// (one fetch, one answer for both callers); an install that arrives while
+// another is starting is refused.
 class SoftwareUpdateManager {
 public:
     static constexpr std::chrono::milliseconds kFetchTimeout{15000};
@@ -205,7 +204,9 @@ public:
     nlohmann::json install();
 
 private:
-    nlohmann::json status_locked();
+    // `installer` is the backend's answer, read by the caller BEFORE taking
+    // mutex_ (an sd-bus round trip must not run under the lock).
+    nlohmann::json status_locked(const InstallerState& installer);
     bool update_available_locked() const;
 
     std::mutex mutex_;

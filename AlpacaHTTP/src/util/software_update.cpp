@@ -439,7 +439,7 @@ bool SoftwareUpdateManager::update_available_locked() const {
     return latest_version_ && compare_debian_versions(*latest_version_, settings_.installed_version) > 0;
 }
 
-nlohmann::json SoftwareUpdateManager::status_locked() {
+nlohmann::json SoftwareUpdateManager::status_locked(const InstallerState& installer) {
     const bool available = update_available_locked();
     nlohmann::json out;
     out["InstalledVersion"] = settings_.installed_version;
@@ -461,14 +461,14 @@ nlohmann::json SoftwareUpdateManager::status_locked() {
     out["ReleaseUrl"] = available && !settings_.release_url_template.empty()
                             ? nlohmann::json(expand_version_template(settings_.release_url_template, latest))
                             : nlohmann::json(nullptr);
-    const InstallerState installer = backend_->installer_state();
     out["Installer"] = nlohmann::json{{"State", installer.state}, {"Detail", installer.detail}, {"Log", installer.log}};
     return out;
 }
 
 nlohmann::json SoftwareUpdateManager::status() {
+    const InstallerState installer = backend_->installer_state();
     std::lock_guard<std::mutex> lock(mutex_);
-    return status_locked();
+    return status_locked(installer);
 }
 
 nlohmann::json SoftwareUpdateManager::check() {
@@ -486,7 +486,8 @@ nlohmann::json SoftwareUpdateManager::check() {
         std::unique_lock<std::mutex> lock(mutex_);
         if (check_in_flight_) {
             cv_.wait(lock, [&] { return !check_in_flight_; });
-            return status_locked();
+            lock.unlock();
+            return status();
         }
         check_in_flight_ = true;
     }
@@ -543,12 +544,13 @@ nlohmann::json SoftwareUpdateManager::check() {
         }
     }
 
+    const InstallerState installer = backend_->installer_state();
     std::lock_guard<std::mutex> lock(mutex_);
     latest_version_ = *version;
     checked_at_ = std::chrono::system_clock::now();
     check_error_.reset();
     release_notes_ = std::move(notes);
-    return status_locked();
+    return status_locked(installer);
 }
 
 nlohmann::json SoftwareUpdateManager::install() {
@@ -586,8 +588,9 @@ nlohmann::json SoftwareUpdateManager::install() {
     log_info("Software update: installing " + settings_.package + " " + latest + " over " +
              settings_.installed_version);
     backend_->start_installer();
+    const InstallerState started = backend_->installer_state();
     std::lock_guard<std::mutex> lock(mutex_);
-    return status_locked();
+    return status_locked(started);
 }
 
 }  // namespace alpacahttp::util

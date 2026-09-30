@@ -662,6 +662,79 @@ int main() {
         EXPECT(second_result["UpdateAvailable"] == true);
     }
 
+    // --- install() makes its sd-bus calls outside the mutex and refuses a
+    // second install while the first is still starting: with the start
+    // parked on a latch, status() answers and a concurrent install() throws
+    // INVALID_OPERATION without a second start. Putting the start back under
+    // the lock hangs the poll; dropping the in-flight flag doubles the start.
+    {
+        class BlockingInstallBackend final : public SoftwareUpdateBackend {
+        public:
+            std::mutex m;
+            std::condition_variable cv;
+            bool release = false;
+            bool parked = false;
+            int starts = 0;
+            std::string fetch_url(const std::string&, std::chrono::milliseconds) override {
+                return "Package: alpacabridge\nVersion: 4.2.0\n";
+            }
+            void start_installer() override {
+                std::unique_lock<std::mutex> lock(m);
+                ++starts;
+                parked = true;
+                cv.notify_all();
+                cv.wait(lock, [&] { return release; });
+                state.state = "running";
+            }
+            InstallerState installer_state() override {
+                std::lock_guard<std::mutex> lock(m);
+                return state;
+            }
+            InstallerState state;
+        };
+        auto backend = std::make_unique<BlockingInstallBackend>();
+        auto* blocking = backend.get();
+        SoftwareUpdateManager manager(settings("4.1.0", "u"), std::move(backend));
+        EXPECT(manager.check()["UpdateAvailable"] == true);
+
+        std::thread installer([&] { manager.install(); });
+        {
+            std::unique_lock<std::mutex> lock(blocking->m);
+            blocking->cv.wait(lock, [&] { return blocking->parked; });
+        }
+        // The start is parked (state still idle). status() must answer now.
+        std::atomic<bool> status_returned{false};
+        std::thread poller([&] {
+            const auto status = manager.status();
+            EXPECT(status["UpdateAvailable"] == true);
+            status_returned = true;
+        });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!status_returned && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        EXPECT(status_returned);
+        // A second install is refused by the in-flight flag, not started twice.
+        bool threw = false;
+        try {
+            manager.install();
+        } catch (const SoftwareUpdateError& e) {
+            threw = true;
+            EXPECT(e.alpaca_error() == alpacahttp::util::ErrorCode::INVALID_OPERATION);
+        }
+        EXPECT(threw);
+        {
+            std::lock_guard<std::mutex> lock(blocking->m);
+            EXPECT(blocking->starts == 1);
+            blocking->release = true;
+        }
+        blocking->cv.notify_all();
+        installer.join();
+        poller.join();
+        EXPECT(blocking->starts == 1);
+        EXPECT(status_state(manager.status()) == "running");
+    }
+
     std::cout << "All software update tests passed!\n";
     return 0;
 }

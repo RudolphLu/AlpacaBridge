@@ -73,6 +73,8 @@ they disagree or if the daemon's unit claims the same directory.
 
 All three live under `/management/v1/update/` (the unversioned
 `/management/update/` alias works too) and use the standard Alpaca envelope.
+`check` and `install` accept `PUT` as well as `POST`, like the other
+state-changing management endpoints; the examples use `POST`.
 The state-changing pair carries the cross-origin guard documented in
 [wifi-api.md](wifi-api.md): a browser request whose `Origin` does not match
 `Host` gets HTTP 403 with `ErrorMessage` "Cross-origin software update requests
@@ -84,6 +86,7 @@ are not allowed". `GET status` is exempt, like every other GET.
   ```json
   {
     "InstalledVersion": "4.1.0",
+    "CheckEnabled": true,
     "LatestVersion": "4.2.0",
     "UpdateAvailable": true,
     "CheckedAt": 1790535600,
