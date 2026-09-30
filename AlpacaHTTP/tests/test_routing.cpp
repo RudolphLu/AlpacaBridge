@@ -4540,6 +4540,23 @@ int main() {
             "Content-Length: 2\r\n\r\n{}";
         EXPECT(good_request.parse(good));
         EXPECT(good_request.body() == "{}");
+
+        // The cap is 64 KiB (issue #741): one byte over fails to parse, and a
+        // body of exactly the cap parses in full.
+        alpacahttp::Request over_64k_request;
+        std::string over_64k =
+            "POST /management/v1/configuredevice HTTP/1.1\r\n"
+            "Content-Length: 65537\r\n\r\n" +
+            std::string(65537, 'x');
+        EXPECT(!over_64k_request.parse(over_64k));
+
+        alpacahttp::Request at_64k_request;
+        std::string at_64k =
+            "POST /management/v1/configuredevice HTTP/1.1\r\n"
+            "Content-Length: 65536\r\n\r\n" +
+            std::string(65536, 'x');
+        EXPECT(at_64k_request.parse(at_64k));
+        EXPECT(at_64k_request.body().size() == 65536);
     }
 
     // Host-clock wiring (issue #302). The decision logic inside HostClock is

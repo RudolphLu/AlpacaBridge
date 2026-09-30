@@ -616,6 +616,24 @@ int main() {
         ::close(fd);
     }
 
+    // A Content-Length over the 64 KiB body cap (issue #741) is refused with
+    // 413 from the headers alone: the client sends no body, so a server that
+    // waited for one would never answer inside the receive timeout.
+    {
+        int fd = connect_local(port);
+        EXPECT(fd >= 0);
+        timeval tv{};
+        tv.tv_sec = 3;
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        std::string carry;
+        send_all(fd,
+                 "PUT /management/v1/configuredevice HTTP/1.1\r\nHost: localhost\r\n"
+                 "Content-Length: 65537\r\n\r\n");
+        std::string r = read_one_response(fd, carry);
+        EXPECT(r.rfind("HTTP/1.1 413 ", 0) == 0);
+        ::close(fd);
+    }
+
     // HEAD is not in parse_method, so it routes as UNKNOWN and is answered
     // with a normal BODIED error. Sending a body to a HEAD client is already
     // wrong (RFC 7231 4.3.2), but on a persistent connection it desyncs: the
