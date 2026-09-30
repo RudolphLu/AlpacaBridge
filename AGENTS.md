@@ -1179,7 +1179,10 @@ the operation needs, never add a fourth without a decision record:
   - **The helper's transcript is the durable record**, not systemd's state: a
     finished oneshot unit is garbage-collected and `LoadUnit` then reports it
     as never run. The helper ends its log with a result marker the daemon
-    parses; `installer_state()` trusts systemd only for "running".
+    parses; `installer_state()` trusts systemd for "running" (active, or a
+    start job still queued), "failed" (`ActiveState=failed`) and
+    "unavailable" (`LoadState` not loaded), and resolves an inactive unit
+    from the transcript marker (`classify_installer_state()`).
   - **Read unit state with `LoadUnit`, not `GetUnit`**: `GetUnit` answers
     `NoSuchUnit` for a unit that is not loaded, which a never-started helper is.
   - **Start the unit in a separate cgroup from the daemon** (any unit is) when

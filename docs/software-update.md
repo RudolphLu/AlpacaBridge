@@ -84,7 +84,8 @@ The state-changing pair carries the cross-origin guard documented in
 are not allowed". `GET status` is exempt, like every other GET.
 
 - `GET /management/v1/update/status` returns the last check result and the
-  installer state without touching the network:
+  installer state without any network fetch (it reads the unit's state over
+  the local system bus and the transcript file):
 
   ```json
   {
@@ -160,6 +161,10 @@ install.
 
 ## Operator notes
 
+- The helper passes `--force-confold`, so a changed packaged `default.yaml`
+  conffile keeps the installed copy on upgrade, exactly as a manual
+  `apt install` with that option would; the new version's copy lands next to
+  it as `default.yaml.dpkg-dist`.
 - A dev build reporting a version newer than the repository reads as up to
   date. A dev build with the same version as the repository also reads as up
   to date; the check compares numbers, not commits.
