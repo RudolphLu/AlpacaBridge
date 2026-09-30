@@ -588,6 +588,80 @@ int main() {
         EXPECT(manager.status()["LatestVersion"] == "4.2.0");
     }
 
+    // --- an empty packages_url disables the check: status says so, check()
+    // is NOT_IMPLEMENTED, nothing is fetched and no CheckError is recorded.
+    {
+        auto backend = std::make_unique<FakeBackend>();
+        auto* fake = backend.get();
+        fake->index = "Package: alpacabridge\nVersion: 4.2.0\n";
+        SoftwareUpdateManager manager(settings("4.1.0", ""), std::move(backend));
+        auto status = manager.status();
+        EXPECT(status["CheckEnabled"] == false);
+        bool threw = false;
+        try {
+            manager.check();
+        } catch (const SoftwareUpdateError& e) {
+            threw = true;
+            EXPECT(e.alpaca_error() == alpacahttp::util::ErrorCode::NOT_IMPLEMENTED);
+            EXPECT(std::string(e.what()).find("turned off") != std::string::npos);
+        }
+        EXPECT(threw);
+        EXPECT(fake->urls.empty());
+        status = manager.status();
+        EXPECT(status["CheckError"].is_null());
+        EXPECT(status["CheckedAt"].is_null());
+        EXPECT(status["UpdateAvailable"] == false);
+
+        auto enabled = std::make_unique<FakeBackend>();
+        enabled->index = kLiveIndex;
+        SoftwareUpdateManager on(settings("4.1.0", "u"), std::move(enabled));
+        EXPECT(on.status()["CheckEnabled"] == true);
+    }
+
+    // --- single flight: a check arriving while another is fetching waits for
+    // it and returns its result without a second fetch.
+    {
+        class BlockingBackend final : public SoftwareUpdateBackend {
+        public:
+            std::mutex m;
+            std::condition_variable cv;
+            bool release = false;
+            int fetches = 0;
+            std::string fetch_url(const std::string&, std::chrono::milliseconds) override {
+                std::unique_lock<std::mutex> lock(m);
+                ++fetches;
+                cv.notify_all();
+                cv.wait(lock, [&] { return release; });
+                return "Package: alpacabridge\nVersion: 4.2.0\n";
+            }
+            void start_installer() override {}
+            InstallerState installer_state() override { return {}; }
+        };
+        auto backend = std::make_unique<BlockingBackend>();
+        auto* blocking = backend.get();
+        // No notes template: exactly one fetch per check.
+        SoftwareUpdateManager manager(settings("4.1.0", "u"), std::move(backend));
+        std::thread first([&] { manager.check(); });
+        {
+            std::unique_lock<std::mutex> lock(blocking->m);
+            blocking->cv.wait(lock, [&] { return blocking->fetches == 1; });
+        }
+        nlohmann::json second_result;
+        std::thread second([&] { second_result = manager.check(); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        {
+            std::lock_guard<std::mutex> lock(blocking->m);
+            EXPECT(blocking->fetches == 1);  // the second check did not fetch
+            blocking->release = true;
+        }
+        blocking->cv.notify_all();
+        first.join();
+        second.join();
+        EXPECT(blocking->fetches == 1);
+        EXPECT(second_result["LatestVersion"] == "4.2.0");
+        EXPECT(second_result["UpdateAvailable"] == true);
+    }
+
     std::cout << "All software update tests passed!\n";
     return 0;
 }

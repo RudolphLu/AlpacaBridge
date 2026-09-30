@@ -142,3 +142,17 @@ test('markdown inside a code span stays literal', () => {
     assert.match(html, /<a href="https:\/\/b\.example" target="_blank" rel="noopener">y<\/a>/);
     assert.doesNotMatch(html, /<code>[^<]*<a /);
 });
+
+test('a NUL byte in the notes cannot reach the code-span placeholders', () => {
+    const html = renderReleaseNotes('a \u00000\u0000 b `c` d');
+    assert.doesNotMatch(html, /undefined/);
+    assert.match(html, /<p>a 0 b <code>c<\/code> d<\/p>/);
+});
+
+test('a disabled check is worded as such, before any stale result', () => {
+    assert.strictEqual(
+        updateStatusText({ InstalledVersion: '4.1.0', CheckEnabled: false, LatestVersion: null, UpdateAvailable: false }),
+        'Checking for updates is turned off in the server configuration.');
+    assert.strictEqual(updateStatusText({ InstalledVersion: '4.1.0', CheckEnabled: true, LatestVersion: null }),
+                       'Not checked yet.');
+});

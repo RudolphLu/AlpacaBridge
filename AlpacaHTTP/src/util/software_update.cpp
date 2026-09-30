@@ -451,6 +451,7 @@ nlohmann::json SoftwareUpdateManager::status_locked() {
             : nlohmann::json(nullptr);
     out["CheckError"] = check_error_ ? nlohmann::json(*check_error_) : nlohmann::json(nullptr);
     out["PackagesUrl"] = settings_.packages_url;
+    out["CheckEnabled"] = !settings_.packages_url.empty();
     out["ReleaseNotes"] = available && release_notes_ ? nlohmann::json(*release_notes_) : nlohmann::json(nullptr);
     // `available` implies latest_version_ is set; spelled out for clang-tidy.
     const std::string latest = latest_version_.value_or("");
@@ -471,13 +472,37 @@ nlohmann::json SoftwareUpdateManager::status() {
 }
 
 nlohmann::json SoftwareUpdateManager::check() {
+    if (settings_.packages_url.empty()) {
+        // Disabled by configuration (update_packages_url empty). Nothing is
+        // fetched and nothing is recorded; status() says CheckEnabled=false.
+        throw SoftwareUpdateError(ErrorCode::NOT_IMPLEMENTED,
+                                  "Checking for updates is turned off in the server configuration "
+                                  "(update_packages_url is empty)");
+    }
+    // Single flight: a check that arrives while another is fetching waits
+    // for that one and returns its result (a failure there is reported as
+    // CheckError in the returned status, not thrown here).
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (check_in_flight_) {
+            cv_.wait(lock, [&] { return !check_in_flight_; });
+            return status_locked();
+        }
+        check_in_flight_ = true;
+    }
+    struct ClearInFlight {
+        SoftwareUpdateManager& self;
+        ~ClearInFlight() {
+            std::lock_guard<std::mutex> lock(self.mutex_);
+            self.check_in_flight_ = false;
+            self.cv_.notify_all();
+        }
+    } clear_in_flight{*this};
+
     // The fetches run WITHOUT mutex_: each can take up to kFetchTimeout, and
     // a status poll from the page must not queue behind a slow mirror. The
     // settings are immutable after construction, so they are read lock-free;
-    // only the cached result is written under the lock. Two concurrent checks
-    // interleave and the last to finish wins the store; they read the same
-    // index, so the stored answers differ only if the repository changed in
-    // between, and a later check corrects that.
+    // only the cached result is written under the lock.
     std::string index;
     try {
         index = backend_->fetch_url(settings_.packages_url, kFetchTimeout);
@@ -527,11 +552,29 @@ nlohmann::json SoftwareUpdateManager::check() {
 }
 
 nlohmann::json SoftwareUpdateManager::install() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!update_available_locked()) {
-        throw SoftwareUpdateError(ErrorCode::INVALID_OPERATION,
-                                  "No update is available to install; check for updates first");
+    std::string latest;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!update_available_locked()) {
+            throw SoftwareUpdateError(ErrorCode::INVALID_OPERATION,
+                                      "No update is available to install; check for updates first");
+        }
+        if (install_in_flight_) {
+            throw SoftwareUpdateError(ErrorCode::INVALID_OPERATION, "An update is already being installed");
+        }
+        install_in_flight_ = true;
+        latest = latest_version_.value_or("");
     }
+    struct ClearInFlight {
+        SoftwareUpdateManager& self;
+        ~ClearInFlight() {
+            std::lock_guard<std::mutex> lock(self.mutex_);
+            self.install_in_flight_ = false;
+        }
+    } clear_in_flight{*this};
+
+    // sd-bus round trips outside mutex_ (a slow polkitd during boot must not
+    // block status polls); install_in_flight_ keeps a second install out.
     const InstallerState current = backend_->installer_state();
     if (current.state == "running") {
         throw SoftwareUpdateError(ErrorCode::INVALID_OPERATION, "An update is already being installed");
@@ -540,9 +583,10 @@ nlohmann::json SoftwareUpdateManager::install() {
         throw SoftwareUpdateError(ErrorCode::NOT_IMPLEMENTED,
                                   "Update install is not available on this host: " + current.detail);
     }
-    log_info("Software update: installing " + settings_.package + " " + latest_version_.value_or("") + " over " +
+    log_info("Software update: installing " + settings_.package + " " + latest + " over " +
              settings_.installed_version);
     backend_->start_installer();
+    std::lock_guard<std::mutex> lock(mutex_);
     return status_locked();
 }
 

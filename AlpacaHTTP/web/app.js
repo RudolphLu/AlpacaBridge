@@ -1803,6 +1803,8 @@ function updateRender(status) {
     if (!installed || !line || !installBtn || !installerLine || !log) return;
 
     const installer = status.Installer || {};
+    const checkBtn = updateEl('update-check');
+    if (checkBtn) checkBtn.disabled = status.CheckEnabled === false;
     installed.textContent = status.InstalledVersion || '?';
     line.textContent = updateStatusText(status);
     line.classList.toggle('update-available', !!status.UpdateAvailable);

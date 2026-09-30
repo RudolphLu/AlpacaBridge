@@ -28,7 +28,8 @@ APT_OPTS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::=--force-confold)
 
 export DEBIAN_FRONTEND=noninteractive
 
-mkdir -p "$(dirname "$LOG")"
+# The directory is the unit's LogsDirectory=; no mkdir here, so a run outside
+# the unit cannot create it with the wrong owner or mode.
 : > "$LOG"
 chmod 0644 "$LOG"
 exec >>"$LOG" 2>&1
@@ -45,6 +46,11 @@ echo "=== installed: $(dpkg-query -W -f='${Version}' "$PACKAGE" 2>/dev/null || e
 echo "=== apt-get update"
 apt-get update -o DPkg::Lock::Timeout=120
 echo "=== apt-get update exit $?"
+
+# What apt will actually pick from THIS host's sources and pinning, which can
+# differ from the version the web UI's check saw on the repository index.
+echo "=== apt-cache policy $PACKAGE"
+apt-cache policy "$PACKAGE"
 
 echo "=== apt-get install --only-upgrade $PACKAGE"
 apt-get install --only-upgrade "${APT_OPTS[@]}" "$PACKAGE"

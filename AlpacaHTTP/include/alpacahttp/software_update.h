@@ -49,6 +49,7 @@
 // SystemSoftwareUpdateBackend.
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -160,9 +161,9 @@ std::string expand_version_template(std::string url_template, const std::string&
 // construction. Two concurrent checks therefore interleave freely and the
 // last one to finish stores its answer (last writer wins; both read the same
 // index, so the answers differ only if the repository changed between
-// them). install() does hold the mutex across its two sd-bus round trips
-// (installer_state, StartUnit), which are local and fast; a status() poll
-// arriving then waits for them.
+// them, and a check arriving mid-fetch reuses the running one, see check()).
+// install() likewise makes its sd-bus calls outside the mutex, with an
+// in-flight flag refusing a second install meanwhile.
 class SoftwareUpdateManager {
 public:
     static constexpr std::chrono::milliseconds kFetchTimeout{15000};
@@ -174,7 +175,8 @@ public:
 
     SoftwareUpdateManager(SoftwareUpdateSettings settings, std::unique_ptr<SoftwareUpdateBackend> backend);
 
-    // {"InstalledVersion", "LatestVersion" (null until a check succeeded),
+    // {"InstalledVersion", "CheckEnabled" (false when packages_url is empty),
+    //  "LatestVersion" (null until a check succeeded),
     //  "UpdateAvailable", "CheckedAt" (Unix seconds, null until checked),
     //  "CheckError" (null unless the last check failed), "PackagesUrl",
     //  "ReleaseNotes" (the newer version's plain-language notes, Markdown;
@@ -184,16 +186,22 @@ public:
     nlohmann::json status();
 
     // Fetch the index, compare, cache, and return status(). Throws
-    // SoftwareUpdateError (DRIVER_ERROR) on a failed fetch or an index with
-    // no stanza for the package; the failure is also recorded as CheckError.
+    // SoftwareUpdateError (NOT_IMPLEMENTED) when packages_url is empty (the
+    // check is disabled; nothing is fetched or recorded), and (DRIVER_ERROR)
+    // on a failed fetch or an index with no stanza for the package; that
+    // failure is also recorded as CheckError. Single-flight: a check that
+    // arrives while another is fetching waits for it and returns its result
+    // instead of fetching again, so repeated presses from several tabs pin
+    // one worker thread, not one per press.
     // When a newer version is found the release notes are fetched too, best
     // effort: a failure there is logged and leaves ReleaseNotes null, since
     // the operator can still read them on the release page.
     nlohmann::json check();
 
     // Start the installer. Throws INVALID_OPERATION when no successful check
-    // has found a newer version, or when the installer is already running;
-    // otherwise whatever the backend throws. Returns status() afterwards.
+    // has found a newer version, or when the installer is already running or
+    // being started; otherwise whatever the backend throws. Returns status()
+    // afterwards. The sd-bus calls run outside mutex_ like the fetches.
     nlohmann::json install();
 
 private:
@@ -201,6 +209,11 @@ private:
     bool update_available_locked() const;
 
     std::mutex mutex_;
+    // Single-flight state for check() and install(), under mutex_; cv_ wakes
+    // waiters when a check finishes.
+    std::condition_variable cv_;
+    bool check_in_flight_ = false;
+    bool install_in_flight_ = false;
     SoftwareUpdateSettings settings_;
     std::unique_ptr<SoftwareUpdateBackend> backend_;
 

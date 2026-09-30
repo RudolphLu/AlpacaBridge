@@ -213,6 +213,9 @@ function updateStatusText(status) {
     const source = status || {};
     const installed = String(source.InstalledVersion || '');
     const latest = source.LatestVersion ? String(source.LatestVersion) : '';
+    if (source.CheckEnabled === false) {
+        return 'Checking for updates is turned off in the server configuration.';
+    }
     if (source.CheckError) {
         return 'Check failed: ' + source.CheckError;
     }
@@ -281,7 +284,9 @@ function renderNotesInline(escaped) {
 }
 
 function renderReleaseNotes(markdown) {
-    const lines = String(markdown || '').replace(/\r\n?/g, '\n').split('\n');
+    // NUL is the code-span placeholder delimiter below and has no place in
+    // notes; strip it so notes carrying it cannot confuse the placeholders.
+    const lines = String(markdown || '').replace(/\u0000/g, '').replace(/\r\n?/g, '\n').split('\n');
     const html = [];
     let paragraph = [];
     let inList = false;

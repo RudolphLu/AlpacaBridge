@@ -49,7 +49,12 @@ the updater.
 
 The helper writes its transcript to `/var/log/alpacabridge-update/update.log`
 (truncated at the start of each run, world-readable) and ends it with one of
-two markers, `=== RESULT: success` or `=== RESULT: failure`. The daemon reads
+two markers, `=== RESULT: success` or `=== RESULT: failure`. It also records
+`apt-cache policy alpacabridge` before installing, because apt installs
+whatever the host's own sources and pinning select, which can differ from
+the version the check saw on the repository index; when they differ the UI
+reports that the run finished without changing the installed version and the
+transcript shows why. The daemon reads
 the tail of that file for the UI and uses the marker as the durable record of
 the last run, because a finished oneshot unit is garbage-collected by systemd
 and reads as never-run afterwards.
@@ -95,6 +100,9 @@ are not allowed". `GET status` is exempt, like every other GET.
   }
   ```
 
+  `CheckEnabled` is `false` when `update_packages_url` is empty; the card
+  then disables Check for Updates and says so, and `POST check` answers
+  0x400 (`NotImplemented`) without fetching anything.
   `LatestVersion` and `CheckedAt` are `null` until a check has run.
   `CheckError` carries the last failed check's message and is `null`
   otherwise. `Installer.State` is one of `idle`, `running`, `succeeded`,
@@ -110,7 +118,11 @@ are not allowed". `GET status` is exempt, like every other GET.
   because the card names the version.
 
 - `POST /management/v1/update/check` fetches the index and answers the same
-  payload. A failed fetch or an index with no `alpacabridge` stanza answers
+  payload. It is single-flight: a check arriving while another is fetching
+  waits for it and returns its result rather than fetching again, so repeated
+  presses from several tabs pin one worker thread, not one per press (a
+  failure in the shared run is then reported as `CheckError` in the returned
+  payload rather than as an error envelope). A failed fetch or an index with no `alpacabridge` stanza answers
   `ErrorNumber` 0x500 (`DriverException`) with the reason, and the reason is
   also kept in `CheckError`.
 
