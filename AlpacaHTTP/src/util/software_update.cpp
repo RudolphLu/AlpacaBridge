@@ -474,8 +474,10 @@ nlohmann::json SoftwareUpdateManager::check() {
     // The fetches run WITHOUT mutex_: each can take up to kFetchTimeout, and
     // a status poll from the page must not queue behind a slow mirror. The
     // settings are immutable after construction, so they are read lock-free;
-    // only the cached result is written under the lock, and two concurrent
-    // checks simply race to store equivalent answers.
+    // only the cached result is written under the lock. Two concurrent checks
+    // interleave and the last to finish wins the store; they read the same
+    // index, so the stored answers differ only if the repository changed in
+    // between, and a later check corrects that.
     std::string index;
     try {
         index = backend_->fetch_url(settings_.packages_url, kFetchTimeout);

@@ -152,9 +152,17 @@ struct SoftwareUpdateSettings {
 // "{version}" in `url_template` replaced by `version`, every occurrence.
 std::string expand_version_template(std::string url_template, const std::string& version);
 
-// Policy over the backend. Thread-safe: every method serializes on one
-// mutex, and the check holds it across the fetches (the endpoints are
-// low-traffic and a second check racing the first would only refetch).
+// Policy over the backend. Thread-safe. The cached result (latest version,
+// check time, error, notes) is read and written under one mutex, but
+// check() performs its two network fetches (index, then notes; each bounded
+// by kFetchTimeout) WITHOUT holding it, so a status() poll never queues
+// behind a slow mirror; the settings it reads meanwhile are immutable after
+// construction. Two concurrent checks therefore interleave freely and the
+// last one to finish stores its answer (last writer wins; both read the same
+// index, so the answers differ only if the repository changed between
+// them). install() does hold the mutex across its two sd-bus round trips
+// (installer_state, StartUnit), which are local and fast; a status() poll
+// arriving then waits for them.
 class SoftwareUpdateManager {
 public:
     static constexpr std::chrono::milliseconds kFetchTimeout{15000};

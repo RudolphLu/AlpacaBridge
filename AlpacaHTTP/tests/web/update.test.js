@@ -134,3 +134,11 @@ test('empty or missing notes render nothing', () => {
 test('an unterminated fence still renders as code', () => {
     assert.match(renderReleaseNotes('```\nx < y\n'), /<pre><code>x &lt; y<\/code><\/pre>/);
 });
+
+test('markdown inside a code span stays literal', () => {
+    const html = renderReleaseNotes('Use `[x](https://a.example)` and `**not bold**` here, but [y](https://b.example) is a link.');
+    assert.match(html, /<code>\[x\]\(https:\/\/a\.example\)<\/code>/);
+    assert.match(html, /<code>\*\*not bold\*\*<\/code>/);
+    assert.match(html, /<a href="https:\/\/b\.example" target="_blank" rel="noopener">y<\/a>/);
+    assert.doesNotMatch(html, /<code>[^<]*<a /);
+});

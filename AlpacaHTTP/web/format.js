@@ -267,12 +267,17 @@ function escapeNotesHtml(text) {
 
 function renderNotesInline(escaped) {
     // Operates on already-escaped text; the patterns contain no characters
-    // that escaping changes.
-    let out = escaped.replace(/`([^`]+)`/g, '<code>$1</code>');
+    // that escaping changes. Code spans are lifted out first so that bold
+    // and link syntax inside backticks stays literal, as Markdown means it.
+    const spans = [];
+    let out = escaped.replace(/`([^`]+)`/g, (match, code) => {
+        spans.push('<code>' + code + '</code>');
+        return '\u0000' + (spans.length - 1) + '\u0000';
+    });
     out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
     out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
         '<a href="$2" target="_blank" rel="noopener">$1</a>');
-    return out;
+    return out.replace(/\u0000(\d+)\u0000/g, (match, index) => spans[Number(index)]);
 }
 
 function renderReleaseNotes(markdown) {

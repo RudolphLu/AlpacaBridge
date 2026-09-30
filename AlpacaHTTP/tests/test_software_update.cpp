@@ -18,12 +18,16 @@
 #include <alpacahttp/software_update.h>
 #include <alpacahttp/util/error_mapping.h>
 
+#include <atomic>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "test_assert.h"
@@ -505,6 +509,83 @@ int main() {
         const std::string daemon_unit = read(repo / "debian" / "alpacabridge.service");
         EXPECT(!daemon_unit.empty());
         EXPECT(daemon_unit.find("LogsDirectory=" + dir + "\n") == std::string::npos);
+    }
+
+    // --- a failed check after a successful one keeps the last good answer:
+    // UpdateAvailable stays true beside the CheckError, and install() still
+    // goes ahead (the last good answer is still valid; the page shows both).
+    {
+        auto backend = std::make_unique<FakeBackend>();
+        auto* fake = backend.get();
+        fake->index = "Package: alpacabridge\nVersion: 4.2.0\n";
+        SoftwareUpdateManager manager(settings("4.1.0", "u"), std::move(backend));
+        EXPECT(manager.check()["UpdateAvailable"] == true);
+        fake->fetch_throws = true;
+        bool threw = false;
+        try {
+            manager.check();
+        } catch (const SoftwareUpdateError&) {
+            threw = true;
+        }
+        EXPECT(threw);
+        const auto status = manager.status();
+        EXPECT(status["CheckError"].is_string());
+        EXPECT(status["LatestVersion"] == "4.2.0");
+        EXPECT(status["UpdateAvailable"] == true);
+        manager.install();
+        EXPECT(fake->starts == 1);
+    }
+
+    // --- the check's fetches run outside the manager's mutex: a status()
+    // poll from another thread returns while a fetch is still blocked.
+    // Moving the fetch back under the lock makes this case hang until the
+    // latch is released, and fail.
+    {
+        class BlockingBackend final : public SoftwareUpdateBackend {
+        public:
+            std::mutex m;
+            std::condition_variable cv;
+            bool release = false;
+            bool blocked = false;
+            std::string fetch_url(const std::string&, std::chrono::milliseconds) override {
+                std::unique_lock<std::mutex> lock(m);
+                blocked = true;
+                cv.notify_all();
+                cv.wait(lock, [&] { return release; });
+                return "Package: alpacabridge\nVersion: 4.2.0\n";
+            }
+            void start_installer() override {}
+            InstallerState installer_state() override { return {}; }
+        };
+        auto backend = std::make_unique<BlockingBackend>();
+        auto* blocking = backend.get();
+        SoftwareUpdateManager manager(settings("4.1.0", "u"), std::move(backend));
+
+        std::thread checker([&] { manager.check(); });
+        {
+            std::unique_lock<std::mutex> lock(blocking->m);
+            blocking->cv.wait(lock, [&] { return blocking->blocked; });
+        }
+        // The fetch is parked. status() must answer now, not after release.
+        std::atomic<bool> status_returned{false};
+        std::thread poller([&] {
+            const auto status = manager.status();
+            EXPECT(status["LatestVersion"].is_null());
+            status_returned = true;
+        });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!status_returned && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        EXPECT(status_returned);
+        {
+            std::lock_guard<std::mutex> lock(blocking->m);
+            blocking->release = true;
+        }
+        blocking->cv.notify_all();
+        checker.join();
+        poller.join();
+        EXPECT(manager.status()["LatestVersion"] == "4.2.0");
     }
 
     std::cout << "All software update tests passed!\n";
