@@ -261,12 +261,14 @@ public:
                               std::optional<double> site_latitude_deg, std::optional<double> site_longitude_deg,
                               std::optional<double> site_elevation_m,
                               std::unique_ptr<SkyWatcherProtocolWrapper> protocol,
-                              util::ConnectionResolver<ConnectionInfo> connection_resolver = {})
+                              util::ConnectionResolver<ConnectionInfo> connection_resolver = {},
+                              util::TaskClock& clock = util::default_task_clock())
         : AsyncConnectable("SkyWatcher"),
           device_number_(device_number),
           connection_info_(connection_info),
           connection_resolver_(std::move(connection_resolver)),
           protocol_(protocol ? std::move(protocol) : std::make_unique<SkyWatcherProtocolWrapper>()),
+          clock_(clock),
           site_latitude_(site_latitude_deg.value_or(0.0)),
           site_longitude_(site_longitude_deg.value_or(0.0)),
           site_elevation_m_(site_elevation_m.value_or(0.0)),
@@ -1196,7 +1198,7 @@ public:
             std::thread stale = std::move(slew_task_thread_);
             tlock.unlock();
             slew_task_cancel_.store(true);
-            task_cv_.notify_all();
+            notify_task_waiters();
             stale.join();
             slew_task_cancel_.store(false);
             tlock.lock();
@@ -1297,7 +1299,7 @@ public:
             std::thread stale = std::move(slew_task_thread_);
             tlock.unlock();
             slew_task_cancel_.store(true);
-            task_cv_.notify_all();
+            notify_task_waiters();
             stale.join();
             slew_task_cancel_.store(false);
             tlock.lock();
@@ -1428,7 +1430,7 @@ public:
             std::thread stale = std::move(pulse_task_thread_[ai]);
             tlock.unlock();
             pulse_task_cancel_[ai].store(true);
-            task_cv_.notify_all();
+            notify_task_waiters();
             stale.join();
             pulse_task_cancel_[ai].store(false);
             tlock.lock();
@@ -1585,7 +1587,7 @@ public:
             if (verify_dispatch_rate) {
                 // Runs unlocked (samples position across a short window):
                 // never hold mutex_ across a sleep -- see stop_axis_and_wait_locked.
-                const auto verify_start = std::chrono::steady_clock::now();
+                const auto verify_start = clock_.now();
                 // Bounded by the pulse's own duration budget, not the full
                 // kRateVerifyMaxWindow: this check samples the axis WHILE it
                 // is already running at the pulse rate, and its cost below
@@ -1597,7 +1599,7 @@ public:
                                                      : std::chrono::milliseconds(0);
                 verify_live_rate_or_rekick(kAxisRa, ra_restore_rate_deg_per_sec, ra_pulse_rate, pulse_task_cancel_[ai],
                                            dispatch_max_window);
-                verify_elapsed = std::chrono::steady_clock::now() - verify_start;
+                verify_elapsed = clock_.now() - verify_start;
             }
             // What stop_axis() actually restored, for the post-stop verify
             // below. Seeded with the dispatch-time capture so a stop that
@@ -1850,7 +1852,7 @@ public:
             std::thread stale = std::move(slew_task_thread_);
             tlock.unlock();
             slew_task_cancel_.store(true);
-            task_cv_.notify_all();
+            notify_task_waiters();
             stale.join();
             slew_task_cancel_.store(false);
             tlock.lock();
@@ -2109,16 +2111,16 @@ public:
             std::thread stale = std::move(stop_task_thread_[axis]);
             tlock.unlock();
             stop_task_cancel_[axis].store(true);
-            task_cv_.notify_all();
+            notify_task_waiters();
             stale.join();
             stop_task_cancel_[axis].store(false);
             tlock.lock();
         }
         stop_task_thread_[axis] = std::thread([this, channel, axis, stop_task_generation]() {
             auto& protocol = *protocol_;
-            auto deadline = std::chrono::steady_clock::now() + kAxisStopTimeout;
+            auto deadline = clock_.now() + kAxisStopTimeout;
             bool stopped = false;
-            while (std::chrono::steady_clock::now() < deadline) {
+            while (clock_.now() < deadline) {
                 try {
                     if (!protocol.inquire_status(channel).running) {
                         stopped = true;
@@ -2217,7 +2219,7 @@ public:
         // reap; the flag makes its waits and the refine loop exit promptly —
         // without this, the refinement re-slews after the abort's stop).
         slew_task_cancel_.store(true);
-        task_cv_.notify_all();
+        notify_task_waiters();
         std::lock_guard<std::mutex> lock(mutex_);
         check_connected();
         check_not_fully_parked_locked("AbortSlew");
@@ -3421,7 +3423,7 @@ private:
                     if (rate != 0.0) {
                         any_rate = true;
                     }
-                    auto now = std::chrono::steady_clock::now();
+                    auto now = clock_.now();
                     if (ax[i].bursting) {
                         if (rate == ax[i].rate && now < ax[i].burst_end) {
                             continue;
@@ -3479,8 +3481,8 @@ private:
                         ax[i].gen = motion_generation_;  // owned by THIS burst
                         ax[i].rate = rate;
                         ax[i].bursting = true;
-                        ax[i].burst_end = std::chrono::steady_clock::now() + on_time;
-                        ax[i].next_start = std::chrono::steady_clock::now() + kDutyPeriod;
+                        ax[i].burst_end = clock_.now() + on_time;
+                        ax[i].next_start = clock_.now() + kDutyPeriod;
                         cmd_axis_rate_deg_s_[i] = rate;
                     }
                 }
@@ -3522,7 +3524,7 @@ private:
     // task_mutex_ and joins with only the lifecycle mutex held.
     void reap_duty_locked_lifecycle() {
         duty_cancel_.store(true);
-        task_cv_.notify_all();
+        notify_task_waiters();
         std::thread prev;
         {
             std::lock_guard<std::mutex> tlock(task_mutex_);
@@ -4334,9 +4336,20 @@ private:
 
     // ── Background task threads (async slew, pulse stop) ────────────────────
 
+    // Wakes every task parked in task_wait_for after its cancel flag is stored.
+    // Passing through task_mutex_ first publishes the store to a waiter that has
+    // read its flag as false but not yet blocked: without it the notify is lost,
+    // and the waiter sleeps out its whole wait (on a FakeTaskClock, until the next
+    // advance()), holding up the reaper's join. The caller must not hold
+    // task_mutex_ (it is not recursive).
+    void notify_task_waiters() {
+        { std::lock_guard<std::mutex> publish(task_mutex_); }
+        task_cv_.notify_all();
+    }
+
     bool task_wait_for(std::chrono::milliseconds d, std::atomic<bool>& cancel) const {
         std::unique_lock<std::mutex> tlock(task_mutex_);
-        task_cv_.wait_for(tlock, d, [&] { return cancel.load(); });
+        clock_.wait_for(tlock, task_cv_, d, [&] { return cancel.load(); });
         return !cancel.load();
     }
 
@@ -4367,7 +4380,7 @@ private:
         stop_task_cancel_[0].store(true);
         stop_task_cancel_[1].store(true);
         rate_verify_cancel_.store(true);
-        task_cv_.notify_all();
+        notify_task_waiters();
         std::thread slew_thread;
         std::thread pulse_thread_ra;
         std::thread pulse_thread_dec;
@@ -4418,7 +4431,7 @@ private:
             return;  // MoveAxis will reject this axis under the lock shortly.
         }
         stop_task_cancel_[axis].store(true);
-        task_cv_.notify_all();
+        notify_task_waiters();
         std::thread prev;
         {
             std::lock_guard<std::mutex> tlock(task_mutex_);
@@ -4432,7 +4445,7 @@ private:
 
     void reap_slew_task() {
         slew_task_cancel_.store(true);
-        task_cv_.notify_all();
+        notify_task_waiters();
         std::thread prev;
         {
             std::lock_guard<std::mutex> tlock(task_mutex_);
@@ -4453,7 +4466,7 @@ private:
         }
         const int ai = axis - 1;
         pulse_task_cancel_[ai].store(true);
-        task_cv_.notify_all();
+        notify_task_waiters();
         std::thread prev;
         {
             std::lock_guard<std::mutex> tlock(task_mutex_);
@@ -4479,7 +4492,7 @@ private:
     void reap_pulse_task() {
         pulse_task_cancel_[kAxisRa - 1].store(true);
         pulse_task_cancel_[kAxisDec - 1].store(true);
-        task_cv_.notify_all();
+        notify_task_waiters();
         reap_pulse_task(kAxisRa);
         reap_pulse_task(kAxisDec);
     }
@@ -4489,7 +4502,7 @@ private:
     // never touches the hardware on the way out.
     void reap_rate_verify_task() {
         rate_verify_cancel_.store(true);
-        task_cv_.notify_all();
+        notify_task_waiters();
         std::thread prev;
         {
             std::lock_guard<std::mutex> tlock(task_mutex_);
@@ -4511,6 +4524,10 @@ private:
     util::ConnectionResolver<ConnectionInfo> connection_resolver_;
     bool connection_resolved_ = false;
     std::unique_ptr<SkyWatcherProtocolWrapper> protocol_;
+    // The clock every task wait and deadline runs on (open-astro#743,
+    // decision 0005). Pointing time (UTC anchor, dead reckoning, the
+    // discipline resample) stays on steady_clock / system time.
+    util::TaskClock& clock_;
     mutable std::mutex mutex_;
     bool connected_ = false;
 
@@ -4763,21 +4780,24 @@ std::unique_ptr<TelescopeDriver> create_skywatcher_telescope(int device_number, 
                                                              std::optional<double> site_latitude_deg,
                                                              std::optional<double> site_longitude_deg,
                                                              std::optional<double> site_elevation_m,
-                                                             std::unique_ptr<SkyWatcherProtocolWrapper> protocol) {
+                                                             std::unique_ptr<SkyWatcherProtocolWrapper> protocol,
+                                                             util::TaskClock& clock) {
     return std::make_unique<SkyWatcherTelescopeDriver>(device_number, connection_info, site_latitude_deg,
-                                                       site_longitude_deg, site_elevation_m, std::move(protocol));
+                                                       site_longitude_deg, site_elevation_m, std::move(protocol),
+                                                       util::ConnectionResolver<ConnectionInfo>{}, clock);
 }
 
 std::unique_ptr<TelescopeDriver> create_skywatcher_telescope_deferred(
     int device_number, util::ConnectionResolver<ConnectionInfo> connection_resolver,
     std::optional<double> site_latitude_deg, std::optional<double> site_longitude_deg,
-    std::optional<double> site_elevation_m, std::unique_ptr<SkyWatcherProtocolWrapper> protocol) {
+    std::optional<double> site_elevation_m, std::unique_ptr<SkyWatcherProtocolWrapper> protocol,
+    util::TaskClock& clock) {
     if (!connection_resolver) {
         throw AlpacaException("Sky-Watcher telescope: a connection resolver is required", AlpacaError::InvalidValue);
     }
     return std::make_unique<SkyWatcherTelescopeDriver>(device_number, ConnectionInfo{}, site_latitude_deg,
                                                        site_longitude_deg, site_elevation_m, std::move(protocol),
-                                                       std::move(connection_resolver));
+                                                       std::move(connection_resolver), clock);
 }
 
 ConnectionInfo resolve_skywatcher_auto(int mount_index) {
