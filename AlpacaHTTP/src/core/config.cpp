@@ -417,20 +417,9 @@ void Config::apply_environment_overrides() {
         }
     }
 
-    // open-astro#392: replaces the file's list; an empty variable clears it.
-    if (const char* v = std::getenv("ALPACAHTTP_ALLOWED_HOSTS")) {
-        allowed_hosts_ = split_host_list(v);
-        allowed_hosts_env_fixed_ = true;
-    }
-    if (const char* v = std::getenv("ALPACAHTTP_HOST_CHECK")) {
-        bool enabled = host_check_enabled_;
-        if (parse_bool_value(v, enabled)) {
-            host_check_enabled_ = enabled;
-        }
-        // A present variable owns the field even when its value is not a
-        // boolean; the file's value then stands.
-        host_check_env_fixed_ = true;
-    }
+    // open-astro#787: http.allowed_hosts and http.host_check_enabled have no
+    // environment override. The web UI edits them and writes the file, so
+    // the file is their only source; a variable would hide the UI's value.
 
     const char* packages_url_env = std::getenv("ALPACAHTTP_UPDATE_PACKAGES_URL");
     if (packages_url_env) {

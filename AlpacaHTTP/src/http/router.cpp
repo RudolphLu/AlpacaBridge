@@ -2049,8 +2049,7 @@ Response Router::handle_management(const Request& request, const RouteMatch& mat
 nlohmann::json Router::build_description_payload() const {
     nlohmann::json desc;
 
-    // open-astro#392: the Host check settings the web UI edits, and which of
-    // them the environment owns (read-only there).
+    // open-astro#392: the Host check settings the web UI edits.
     auto add_host_check_fields = [this](nlohmann::json& target) {
         std::shared_ptr<const std::vector<std::string>> hosts;
         {
@@ -2059,8 +2058,6 @@ nlohmann::json Router::build_description_payload() const {
         }
         target["HostCheckEnabled"] = host_check_enabled_.load(std::memory_order_acquire);
         target["AllowedHosts"] = join_host_list(*hosts);
-        target["HostCheckEnabledFixedByEnvironment"] = host_check_env_fixed_.load(std::memory_order_acquire);
-        target["AllowedHostsFixedByEnvironment"] = allowed_hosts_env_fixed_.load(std::memory_order_acquire);
     };
 
     if (management_driver_) {
@@ -2314,24 +2311,6 @@ Response Router::handle_description(const Request& request, std::uint32_t server
                 current_hosts = *allowed_hosts_;
             }
             const bool current_host_check = host_check_enabled_.load(std::memory_order_acquire);
-
-            // The environment owns a fixed field: a different value is
-            // refused, the same one is a no-op, and a fixed value is never
-            // written to the file (it would outlive the variable).
-            if (host_check_env_fixed_.load(std::memory_order_acquire) && new_host_check) {
-                if (*new_host_check != current_host_check) {
-                    return refuse_with_400(
-                        "HostCheckEnabled is fixed by the ALPACAHTTP_HOST_CHECK environment variable");
-                }
-                new_host_check.reset();
-            }
-            if (allowed_hosts_env_fixed_.load(std::memory_order_acquire) && new_allowed_hosts) {
-                if (*new_allowed_hosts != current_hosts) {
-                    return refuse_with_400(
-                        "AllowedHosts is fixed by the ALPACAHTTP_ALLOWED_HOSTS environment variable");
-                }
-                new_allowed_hosts.reset();
-            }
 
             // No self-lockout: the request that turns the check on, or edits
             // the list while it is on, must itself pass the new settings.

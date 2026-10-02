@@ -377,7 +377,7 @@ const HOST_CHECK_ALWAYS_ALLOWED =
 
 // What the two Host check rows render from the description Value. null when
 // the server does not report the setting (an older build), so no row shows a
-// toggle that reads as "off". A field is read-only only for a literal true.
+// toggle that reads as "off". Both rows are always editable (open-astro#787).
 function hostCheckSettings(desc) {
     if (!desc || typeof desc.HostCheckEnabled !== 'boolean') {
         return null;
@@ -385,8 +385,6 @@ function hostCheckSettings(desc) {
     return {
         enabled: desc.HostCheckEnabled,
         hosts: typeof desc.AllowedHosts === 'string' ? desc.AllowedHosts : '',
-        enabledFixed: desc.HostCheckEnabledFixedByEnvironment === true,
-        hostsFixed: desc.AllowedHostsFixedByEnvironment === true,
     };
 }
 

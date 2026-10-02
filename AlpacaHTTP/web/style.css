@@ -1217,7 +1217,7 @@ header > .server-clock {
 #update-status-line.update-available { color: var(--accent); font-weight: 600; }
 #update-message.error, #update-installer-line.error { color: #f08a7a; }
 
-/* Help and "fixed by the environment" lines under a server setting. */
+/* Help lines under a server setting. */
 .info-note {
     display: block;
     margin-top: 4px;

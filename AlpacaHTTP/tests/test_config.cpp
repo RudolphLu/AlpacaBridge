@@ -297,11 +297,9 @@ int main() {
         ::unlink(path.c_str());
     }
 
-    // open-astro#392: http.allowed_hosts, one comma-separated string, and its
-    // env override. Entries are trimmed and empty ones dropped; the router
-    // normalizes them.
+    // open-astro#392: http.allowed_hosts, one comma-separated string. Entries
+    // are trimmed and empty ones dropped; the router normalizes them.
     {
-        ::unsetenv("ALPACAHTTP_ALLOWED_HOSTS");
         alpacahttp::Config fresh;
         EXPECT(fresh.allowed_hosts().empty());
 
@@ -332,25 +330,19 @@ int main() {
         EXPECT(from_file_empty_entries.load(path));
         EXPECT((from_file_empty_entries.allowed_hosts() == std::vector<std::string>{"a", "b"}));
 
+        // open-astro#787: the web UI owns the list, so the file is its only
+        // source; the old ALPACAHTTP_ALLOWED_HOSTS variable is ignored.
         ::setenv("ALPACAHTTP_ALLOWED_HOSTS", " .fritz.box ,, pi.lan ", 1);
-        alpacahttp::Config from_env;
-        EXPECT(from_env.load(path));
-        EXPECT((from_env.allowed_hosts() == std::vector<std::string>{".fritz.box", "pi.lan"}));
-
-        // An explicitly empty variable overrides the file with no entries.
-        ::setenv("ALPACAHTTP_ALLOWED_HOSTS", "", 1);
-        alpacahttp::Config from_env_empty;
-        EXPECT(from_env_empty.load(path));
-        EXPECT(from_env_empty.allowed_hosts().empty());
+        alpacahttp::Config env_ignored;
+        EXPECT(env_ignored.load(path));
+        EXPECT((env_ignored.allowed_hosts() == std::vector<std::string>{"a", "b"}));
         ::unsetenv("ALPACAHTTP_ALLOWED_HOSTS");
 
         ::unlink(path.c_str());
     }
 
-    // http.host_check_enabled: off unless set, and ALPACAHTTP_HOST_CHECK
-    // overrides the file either way.
+    // http.host_check_enabled: off unless set.
     {
-        ::unsetenv("ALPACAHTTP_HOST_CHECK");
         alpacahttp::Config fresh;
         EXPECT(!fresh.host_check_enabled());
 
@@ -377,81 +369,20 @@ int main() {
         EXPECT(file_on.load(path));
         EXPECT(file_on.host_check_enabled());
 
+        // open-astro#787: the old ALPACAHTTP_HOST_CHECK variable is ignored;
+        // the file's value stands either way.
         write_file("false");
         ::setenv("ALPACAHTTP_HOST_CHECK", "true", 1);
-        alpacahttp::Config env_on;
-        EXPECT(env_on.load(path));
-        EXPECT(env_on.host_check_enabled());
+        alpacahttp::Config env_on_ignored;
+        EXPECT(env_on_ignored.load(path));
+        EXPECT(!env_on_ignored.host_check_enabled());
 
         write_file("true");
         ::setenv("ALPACAHTTP_HOST_CHECK", "false", 1);
-        alpacahttp::Config env_off;
-        EXPECT(env_off.load(path));
-        EXPECT(!env_off.host_check_enabled());
-
-        // An unparseable variable leaves the file's value.
-        ::setenv("ALPACAHTTP_HOST_CHECK", "maybe", 1);
-        alpacahttp::Config env_bad;
-        EXPECT(env_bad.load(path));
-        EXPECT(env_bad.host_check_enabled());
+        alpacahttp::Config env_off_ignored;
+        EXPECT(env_off_ignored.load(path));
+        EXPECT(env_off_ignored.host_check_enabled());
         ::unsetenv("ALPACAHTTP_HOST_CHECK");
-
-        ::unlink(path.c_str());
-    }
-
-    // The web UI may change the two Host check settings unless the
-    // environment fixes them. Config says which: ALPACAHTTP_ALLOWED_HOSTS
-    // fixes the list whenever it is set, even empty; ALPACAHTTP_HOST_CHECK
-    // fixes the flag whenever it is set; an unparseable value leaves the
-    // file's value in force but still keeps the web UI from changing it.
-    {
-        ::unsetenv("ALPACAHTTP_HOST_CHECK");
-        ::unsetenv("ALPACAHTTP_ALLOWED_HOSTS");
-        alpacahttp::Config fresh;
-        EXPECT(!fresh.host_check_env_fixed());
-        EXPECT(!fresh.allowed_hosts_env_fixed());
-
-        char path_template[] = "/tmp/alpacahttp_test_host_env_fixed_XXXXXX";
-        int fd = ::mkstemp(path_template);
-        EXPECT(fd >= 0);
-        const std::string path = path_template;
-        ::close(fd);
-        {
-            // The quoted form the description PUT writes.
-            std::ofstream out(path);
-            out << "http:\n"
-                   "  host_check_enabled: \"true\"\n"
-                   "  allowed_hosts: \".lan, astropi.home\"\n";
-        }
-
-        alpacahttp::Config from_file;
-        EXPECT(from_file.load(path));
-        EXPECT(from_file.host_check_enabled());
-        EXPECT((from_file.allowed_hosts() == std::vector<std::string>{".lan", "astropi.home"}));
-        EXPECT(!from_file.host_check_env_fixed());
-        EXPECT(!from_file.allowed_hosts_env_fixed());
-
-        ::setenv("ALPACAHTTP_HOST_CHECK", "false", 1);
-        alpacahttp::Config flag_fixed;
-        EXPECT(flag_fixed.load(path));
-        EXPECT(!flag_fixed.host_check_enabled());
-        EXPECT(flag_fixed.host_check_env_fixed());
-        EXPECT(!flag_fixed.allowed_hosts_env_fixed());
-
-        ::setenv("ALPACAHTTP_HOST_CHECK", "maybe", 1);
-        alpacahttp::Config flag_unparseable;
-        EXPECT(flag_unparseable.load(path));
-        EXPECT(flag_unparseable.host_check_enabled());
-        EXPECT(flag_unparseable.host_check_env_fixed());
-        ::unsetenv("ALPACAHTTP_HOST_CHECK");
-
-        ::setenv("ALPACAHTTP_ALLOWED_HOSTS", "", 1);
-        alpacahttp::Config list_fixed;
-        EXPECT(list_fixed.load(path));
-        EXPECT(list_fixed.allowed_hosts().empty());
-        EXPECT(list_fixed.allowed_hosts_env_fixed());
-        EXPECT(!list_fixed.host_check_env_fixed());
-        ::unsetenv("ALPACAHTTP_ALLOWED_HOSTS");
 
         ::unlink(path.c_str());
     }
@@ -459,8 +390,6 @@ int main() {
     // open-astro#392: a '#' inside a double-quoted value is data; one outside
     // starts a comment.
     {
-        ::unsetenv("ALPACAHTTP_HOST_CHECK");
-        ::unsetenv("ALPACAHTTP_ALLOWED_HOSTS");
         char path_template[] = "/tmp/alpacahttp_test_hash_quoted_XXXXXX";
         int fd = ::mkstemp(path_template);
         EXPECT(fd >= 0);

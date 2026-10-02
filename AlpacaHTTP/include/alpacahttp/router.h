@@ -168,15 +168,6 @@ public:
     // may be flipped while requests run; the next request sees the new value.
     void set_host_check_enabled(bool enabled) { host_check_enabled_.store(enabled, std::memory_order_release); }
 
-    // Which of the two settings the environment owns (ALPACAHTTP_HOST_CHECK /
-    // ALPACAHTTP_ALLOWED_HOSTS, see Config::host_check_env_fixed()). A
-    // description PUT that would change a fixed one is refused with 400, and
-    // GET reports it. Server sets it from Config at construction.
-    void set_host_settings_env_fixed(bool host_check_fixed, bool allowed_hosts_fixed) {
-        host_check_env_fixed_.store(host_check_fixed, std::memory_order_release);
-        allowed_hosts_env_fixed_.store(allowed_hosts_fixed, std::memory_order_release);
-    }
-
     // open-astro#547: check every registered telescope for client silence
     // during motion and stop any that have gone quiet past the configured
     // interval. Called once a second from the server's existing low-
@@ -216,8 +207,6 @@ private:
     std::shared_ptr<const std::vector<std::string>> allowed_hosts_ = std::make_shared<const std::vector<std::string>>();
     mutable std::mutex allowed_hosts_mutex_;
     std::atomic<bool> host_check_enabled_{false};
-    std::atomic<bool> host_check_env_fixed_{false};
-    std::atomic<bool> allowed_hosts_env_fixed_{false};
     // Serializes a description PUT's validate, persist and apply, so two
     // writes cannot interleave and leave the file and memory disagreeing.
     // route() never takes it.

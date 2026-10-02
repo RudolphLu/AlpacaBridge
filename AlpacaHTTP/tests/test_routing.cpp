@@ -6787,8 +6787,6 @@ int main() {
     // A PUT whose own Host the resulting settings would refuse changes
     // nothing, so the operator cannot lock the web UI out from the web UI.
     {
-        ::unsetenv("ALPACAHTTP_HOST_CHECK");
-        ::unsetenv("ALPACAHTTP_ALLOWED_HOSTS");
         const std::string description = "/management/v1/description";
         const std::string apiversions = "/management/apiversions";
 
@@ -6844,18 +6842,16 @@ int main() {
         alpacahttp::Router router;
         router.set_config_path(config_path);
 
-        // GET reports both values and whether the environment fixes each.
+        // GET reports both values. open-astro#787: nothing marks either one
+        // read-only; the web UI can always change them.
         {
             const auto v = settings(router, "astropi.lan");
             EXPECT(v.contains("HostCheckEnabled") && v["HostCheckEnabled"].is_boolean());
             EXPECT(v["HostCheckEnabled"].get<bool>() == false);
             EXPECT(v.contains("AllowedHosts") && v["AllowedHosts"].is_string());
             EXPECT(v["AllowedHosts"].get<std::string>().empty());
-            EXPECT(v.contains("HostCheckEnabledFixedByEnvironment") &&
-                   v["HostCheckEnabledFixedByEnvironment"].is_boolean());
-            EXPECT(v["HostCheckEnabledFixedByEnvironment"].get<bool>() == false);
-            EXPECT(v.contains("AllowedHostsFixedByEnvironment") && v["AllowedHostsFixedByEnvironment"].is_boolean());
-            EXPECT(v["AllowedHostsFixedByEnvironment"].get<bool>() == false);
+            EXPECT(!v.contains("HostCheckEnabledFixedByEnvironment"));
+            EXPECT(!v.contains("AllowedHostsFixedByEnvironment"));
         }
 
         // Turning the check on from a name the list does not hold: 400,
@@ -7105,73 +7101,6 @@ int main() {
             EXPECT(
                 is_host_refusal(route_with_host(no_file, "GET", apiversions, "attacker.example"), "attacker.example"));
             EXPECT(route_with_host(no_file, "GET", apiversions, "pi.lan").status_code() == 200);
-        }
-
-        // Fixed by the environment (ALPACAHTTP_HOST_CHECK /
-        // ALPACAHTTP_ALLOWED_HOSTS; Server passes Config's answer on): GET
-        // says so, a PUT that changes the field gets 400 and changes nothing,
-        // and a fixed field is never written to the file.
-        {
-            const std::string fixed_path = config_path + ".fixed";
-            const std::string fixed_file = "http:\n  port: 6811\n";
-            {
-                std::ofstream out(fixed_path);
-                out << fixed_file;
-            }
-            const auto fixed_text = [&fixed_path]() {
-                std::ifstream in(fixed_path);
-                std::stringstream buf;
-                buf << in.rdbuf();
-                return buf.str();
-            };
-            const std::string flag_fixed =
-                "HostCheckEnabled is fixed by the ALPACAHTTP_HOST_CHECK environment variable";
-            const std::string list_fixed = "AllowedHosts is fixed by the ALPACAHTTP_ALLOWED_HOSTS environment variable";
-
-            alpacahttp::Router fixed;
-            fixed.set_config_path(fixed_path);
-            fixed.set_allowed_hosts({".lan"});
-            fixed.set_host_check_enabled(true);
-            fixed.set_host_settings_env_fixed(true, true);
-            {
-                const auto v = settings(fixed, "pi.lan");
-                EXPECT(v.value("HostCheckEnabled", false) == true);
-                EXPECT(v.value("AllowedHosts", "") == ".lan");
-                EXPECT(v.value("HostCheckEnabledFixedByEnvironment", false) == true);
-                EXPECT(v.value("AllowedHostsFixedByEnvironment", false) == true);
-            }
-            EXPECT(is_refused_save(
-                route_with_host(fixed, "PUT", description, "pi.lan", R"({"HostCheckEnabled": false})"), flag_fixed));
-            EXPECT(is_refused_save(
-                route_with_host(fixed, "PUT", description, "pi.lan", R"({"AllowedHosts": ".lan, x.example"})"),
-                list_fixed));
-            // The fixed field refuses the whole request.
-            EXPECT(is_refused_save(route_with_host(fixed, "PUT", description, "pi.lan",
-                                                   R"({"ProfileName": "Fixed", "HostCheckEnabled": false})"),
-                                   flag_fixed));
-            EXPECT(settings(fixed, "pi.lan").value("ProfileName", "") != "Fixed");
-            EXPECT(is_host_refusal(route_with_host(fixed, "GET", apiversions, "attacker.example"), "attacker.example"));
-            EXPECT(settings(fixed, "pi.lan").value("AllowedHosts", "") == ".lan");
-            EXPECT(fixed_text() == fixed_file);
-            // The value it already has is not a change: accepted, and still
-            // not written to the file.
-            EXPECT(error_number(route_with_host(fixed, "PUT", description, "pi.lan",
-                                                R"({"HostCheckEnabled": true, "AllowedHosts": " .LAN "})")) == 0);
-            EXPECT(fixed_text() == fixed_file);
-
-            // Only the flag fixed: the list is still editable, still judged
-            // against the fixed flag, and only the list reaches the file.
-            fixed.set_host_settings_env_fixed(true, false);
-            EXPECT(settings(fixed, "pi.lan").value("AllowedHostsFixedByEnvironment", true) == false);
-            EXPECT(is_refused_save(
-                route_with_host(fixed, "PUT", description, "pi.lan", R"({"AllowedHosts": ".fritz.box"})"),
-                lockout_message("pi.lan")));
-            EXPECT(error_number(route_with_host(fixed, "PUT", description, "pi.lan",
-                                                R"({"AllowedHosts": ".lan, .fritz.box"})")) == 0);
-            EXPECT(route_with_host(fixed, "GET", apiversions, "astropi.fritz.box").status_code() == 200);
-            EXPECT(fixed_text().find("  allowed_hosts: \".lan, .fritz.box\"\n") != std::string::npos);
-            EXPECT(fixed_text().find("host_check_enabled") == std::string::npos);
-            ::unlink(fixed_path.c_str());
         }
     }
 

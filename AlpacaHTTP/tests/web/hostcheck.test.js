@@ -40,39 +40,28 @@ test('a description without the fields renders no Host check rows', () => {
 
 test('the rows load the current values', () => {
     assert.deepStrictEqual(
-        hostCheckSettings({
-            HostCheckEnabled: true,
-            AllowedHosts: '.lan, astropi.home',
-            HostCheckEnabledFixedByEnvironment: false,
-            AllowedHostsFixedByEnvironment: false,
-        }),
-        { enabled: true, hosts: '.lan, astropi.home', enabledFixed: false, hostsFixed: false });
+        hostCheckSettings({ HostCheckEnabled: true, AllowedHosts: '.lan, astropi.home' }),
+        { enabled: true, hosts: '.lan, astropi.home' });
     assert.deepStrictEqual(
         hostCheckSettings({ HostCheckEnabled: false }),
-        { enabled: false, hosts: '', enabledFixed: false, hostsFixed: false });
+        { enabled: false, hosts: '' });
 });
 
-test('a field fixed by the environment is marked read-only, each on its own', () => {
+// open-astro#787: the web UI is where the Host check is set, so neither row
+// is ever read-only, whatever an older server reports.
+test('both rows stay editable even if an older server reports them fixed', () => {
     assert.deepStrictEqual(
         hostCheckSettings({
             HostCheckEnabled: true,
             AllowedHosts: '.lan',
             HostCheckEnabledFixedByEnvironment: true,
-            AllowedHostsFixedByEnvironment: false,
-        }),
-        { enabled: true, hosts: '.lan', enabledFixed: true, hostsFixed: false });
-    assert.deepStrictEqual(
-        hostCheckSettings({
-            HostCheckEnabled: false,
-            AllowedHosts: '',
-            HostCheckEnabledFixedByEnvironment: false,
             AllowedHostsFixedByEnvironment: true,
         }),
-        { enabled: false, hosts: '', enabledFixed: false, hostsFixed: true });
-    // Only a literal true fixes a field.
-    assert.strictEqual(
-        hostCheckSettings({ HostCheckEnabled: true, HostCheckEnabledFixedByEnvironment: 'false' }).enabledFixed,
-        false);
+        { enabled: true, hosts: '.lan' });
+    const app = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'app.js'), 'utf8');
+    assert.ok(!/enabledFixed|hostsFixed|Fixed by the ALPACAHTTP_/.test(app),
+              'app.js still locks a Host check row');
+    assert.ok(app.includes('<button id="server-allowed-hosts-save"'), 'the Save button is not rendered');
 });
 
 test('a refused save shows the server message, not the status code', () => {
