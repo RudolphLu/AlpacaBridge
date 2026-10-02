@@ -72,7 +72,10 @@ void Response::set_body(const std::string& body) {
 
 void Response::set_body(const AlpacaResponse& alpaca_response) {
     auto json = to_json(alpaca_response);
-    body_ = json.dump();
+    // Issue #764: any string value (e.g. Wi-Fi SSIDs) can be arbitrary octets. The strict
+    // default throws type_error.316 and fails the whole response; replace
+    // invalid bytes with U+FFFD instead.
+    body_ = json.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
     set_content_type("application/json");
     set_content_length(body_.size());
 }
