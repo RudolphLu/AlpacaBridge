@@ -88,7 +88,7 @@ own redistribution terms still apply to the SDK files themselves.
 | Player One (camera + filter wheel) | Vendor `license.txt` ("develop any products without any restrictions", keep the notice) | Permitted with notice retained |
 | QHY | None for `libqhyccd` itself; bundled Cypress `fxload` loader is GPL-2 (`COPYING` in the SDK) | Redistributed unmodified, as downloaded from QHY's official SDK page, for turnkey device support |
 | ToupTek | None in the vendored subset | Redistributed unmodified, as downloaded from ToupTek's official SDK page, for turnkey device support |
-| Altair (`altaircamsdk.20260531/`, the ToupTek SDK under Altair's name) | None in the vendor archive or the vendored subset | Redistributed unmodified: the arm64 glibc `libaltaircam.so`, `altaircam.h` and `99-altaircam.rules` from `altaircamsdk_20260531_60.31589.20260531.zip`(https://www.altairastro.help/downloads/) |
+| Altair (camera) | None in the vendored subset | Redistributed unmodified from Altair's SDK download (altairastro.help, login required), version 60.31589.20260531, for turnkey device support |
 | SVBONY | None (`readme.txt` is a changelog) | Redistributed unmodified, as downloaded from SVBONY's official SDK page, for turnkey device support |
 | libgpiod (source tarball) | LGPL-2.1-or-later library, GPL-2.0-or-later tools (`LICENSES/` in the tarball) | Unmodified upstream source tarball, built at package build time for the GPIO switch drivers |
 | WandererAstro (docs only) | None — vendor-authored serial-protocol doc + user manual | Redistributed unmodified as a driver-development reference; no SDK binaries |
