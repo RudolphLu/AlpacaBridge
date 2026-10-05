@@ -1684,6 +1684,21 @@ public:
                     restore = tracking_;
                     restore_still_wanted = restore;
                 }
+                // open-astro#821: the mirror case. A pulse dispatched with
+                // Tracking off, then Tracking=true landed mid-pulse; the end of
+                // the pulse must leave RA on the drive, not stop it. The drive
+                // is re-applied the way set_tracking() applies it, not left
+                // alone: the dispatch may have run after the setter and left
+                // RA at the pulse rate. Decided and applied under one lock, so
+                // a Tracking=false after the read is the setter's stop to make
+                // (#770), not undone by this restart.
+                if (!restore && axis == kAxisRa) {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    if (tracking_) {
+                        apply_ra_drive_locked(lock);
+                        return;
+                    }
+                }
                 if (restore) {
                     std::lock_guard<std::mutex> lock(mutex_);
                     ra_restore_rate_deg_per_sec = effective_ra_rate_locked();
