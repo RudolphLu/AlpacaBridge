@@ -890,6 +890,30 @@ def self_test():
     check("unlisted file without an override stays unresolved",
           factory_device_type("AlpacaCore/src/vendors/fakevendor/x_driver.cpp", set()) is None)
 
+    # Both STALE DELEGATING FACTORY paths through find_drivers(): a listed file
+    # that now has its own get_device_type() override, and a listed file that
+    # is no longer tracked. Real globals are swapped back in `finally`.
+    own = "AlpacaCore/src/vendors/fakevendor/own_driver.cpp"
+    gone = "AlpacaCore/src/vendors/fakevendor/gone_driver.cpp"
+    real_tracked, real_types = globals()["tracked_files"], globals()["driver_device_types"]
+    saved_factories = dict(DELEGATING_FACTORIES)
+    try:
+        globals()["tracked_files"] = lambda pattern: [own] if pattern.endswith("_driver.cpp") else []
+        globals()["driver_device_types"] = lambda path: {"camera"}
+        DELEGATING_FACTORIES.clear()
+        DELEGATING_FACTORIES.update({own: ("camera", "self-test"), gone: ("camera", "self-test")})
+        drivers, findings = find_drivers()
+    finally:
+        globals()["tracked_files"], globals()["driver_device_types"] = real_tracked, real_types
+        DELEGATING_FACTORIES.clear()
+        DELEGATING_FACTORIES.update(saved_factories)
+    check("STALE: a listed factory with its own override is a finding",
+          any("STALE DELEGATING FACTORY" in f and own in f and "get_device_type()" in f for f in findings))
+    check("STALE: a listed factory that is not tracked is a finding",
+          any("STALE DELEGATING FACTORY" in f and gone in f and "not a tracked" in f for f in findings))
+    check("STALE: the overriding file still counts under its own device type",
+          drivers.get(("fakevendor", "camera")) == [own])
+
     missing = missing_message("fakevendor", "camera", ["AlpacaCore/src/vendors/fakevendor/x_driver.cpp"])
     check("MISSING message points at /driver-build Step 7b",
           "/driver-build Step 7b" in missing and "test_fakevendor_concurrency_stress.cpp" in missing)

@@ -99,9 +99,6 @@
 #include <alpacacore/vendor/wandererastro/wandererastro_filterwheel_driver.h>
 #include <alpacacore/vendor/wandererastro/wandererastro_rotator_driver.h>
 #endif
-#ifdef ALPACACORE_ENABLE_SVBONY
-#include <alpacacore/vendor/svbony/svbony_camera_driver.h>
-#endif
 #ifdef ALPACACORE_ENABLE_GPHOTO
 #include <alpacacore/vendor/gphoto/gphoto_camera_driver.h>
 #endif
@@ -1172,7 +1169,7 @@ bool is_expected_validation_error(const alpacacore::AlpacaException& e) {
 }
 
 void log_alpaca_exception(const std::string& context, const alpacacore::AlpacaException& e) {
-    std::string message = context + ": " + std::string(e.what());
+    std::string message = context + ": " + alpacahttp::util::escape_for_log(e.what(), 4096);
     if (is_expected_not_implemented(e) || is_expected_validation_error(e)) {
         alpacahttp::util::log_debug(message);
     } else {
@@ -8254,8 +8251,9 @@ bool Router::register_device_from_config(const nlohmann::json& config, std::stri
         device_type_key = string_to_device_type(device_type_str);
     } catch (const std::exception& ex) {
         // Unknown device_type_str: fall through to the arm chain.
-        util::log_debug("register_device_from_config: device type \"" + device_type_str +
-                        "\" is not catalog-recognized (" + ex.what() + "); falling through to the arm chain");
+        util::log_debug("register_device_from_config: device type \"" + util::escape_for_log(device_type_str) +
+                        "\" is not catalog-recognized (" + util::escape_for_log(ex.what()) +
+                        "); falling through to the arm chain");
     }
     if (device_type_key) {
         const alpacacore::catalog::DeviceKey key{vendor, *device_type_key};
@@ -9406,25 +9404,6 @@ bool Router::register_device_from_config(const nlohmann::json& config, std::stri
 #endif
     }
 
-    if (vendor == "svbony" && device_type_str == "camera") {
-#ifdef ALPACACORE_ENABLE_SVBONY
-        int camera_index = config_get(config, "cameraIndex", 0);
-
-        auto camera = alpacacore::vendor::svbony::create_svbony_camera(device_number, camera_index);
-
-        if (registry.register_device(std::shared_ptr<alpacacore::AlpacaDriver>(std::move(camera)))) {
-            util::log_info("Registered SVBONY camera");
-            return true;
-        }
-
-        error_message = "Failed to register device. Device may already exist.";
-        return false;
-#else
-        error_message = "SVBONY support not enabled. Rebuild with -DALPACACORE_ENABLE_SVBONY=ON";
-        return false;
-#endif
-    }
-
     if (vendor == "gphoto" && device_type_str == "camera") {
 #ifdef ALPACACORE_ENABLE_GPHOTO
         int camera_index = config_get(config, "cameraIndex", 0);
@@ -10061,8 +10040,9 @@ nlohmann::json Router::sanitize_device_config(const nlohmann::json& config) cons
         }
     } catch (const std::exception& ex) {
         // Unknown device_type: fall through to the vendor-specific chain.
-        util::log_debug("sanitize_device_config: device type \"" + device_type + "\" is not catalog-recognized (" +
-                        ex.what() + "); falling through to the vendor-specific chain");
+        util::log_debug("sanitize_device_config: device type \"" + util::escape_for_log(device_type) +
+                        "\" is not catalog-recognized (" + util::escape_for_log(ex.what()) +
+                        "); falling through to the vendor-specific chain");
     }
 
     if (catalog_handled) {
@@ -10211,7 +10191,7 @@ nlohmann::json Router::sanitize_device_config(const nlohmann::json& config) cons
     } else if (vendor == "qhy") {
         copy_if_present("cameraIndex");
         copy_if_present("cameraId");
-    } else if (vendor == "svbony" || vendor == "gphoto") {
+    } else if (vendor == "gphoto") {
         copy_if_present("cameraIndex");
     } else if (vendor == "touptek") {
         if (device_type == "switch") {

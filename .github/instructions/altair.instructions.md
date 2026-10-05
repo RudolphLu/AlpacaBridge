@@ -21,7 +21,8 @@ download is vendored. The SDK ships no static library.
   value. Recheck that claim when either SDK is bumped: rename the prefixes in a
   copy of `altaircam.h` and diff it against `toupcam.h`.
 - **One wrapper implementation for both brands.** `ToupcamFamilySDK<Api>`
-  (`alpacacore/vendor/touptek/toupcam_family_sdk.h`) holds every SDK
+  (`AlpacaCore/src/vendors/touptek/toupcam_family_sdk.h`, private to the
+  vendor sources: it is not installed) holds every SDK
   interaction; `AltairSDKWrapper` (`altair_sdk_wrapper.cpp`) and
   `ToupTekSDKWrapper` supply only a traits struct generated from the
   `ALPACACORE_TOUPCAM_FAMILY_FUNCTIONS` / `_CONSTANTS` X-macro lists. A

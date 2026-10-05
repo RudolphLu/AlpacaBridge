@@ -10,25 +10,22 @@
 // license text and the vendor-SDK linking exception, or the license online at:
 // https://www.gnu.org/licenses/agpl-3.0.html
 
-// The Altair camera factory. Construction runs one enumeration (a failure is
-// logged), nothing is opened until connect. This file
-// (unlike altair_schema.cpp) is compiled only under ALPACACORE_ENABLE_ALTAIR,
-// and is not in the layering gate's catalog file set (only *_schema.cpp is),
-// so the vendor header here is fine.
+// The SVBONY camera factory. create_svbony_camera() is hardware-free (the SDK
+// is touched at connect). This file (unlike svbony_schema.cpp) is compiled
+// only under ALPACACORE_ENABLE_SVBONY, so the vendor header here is fine.
 
-#include <alpacacore/vendor/altair/altair_camera_driver.h>
+#include <alpacacore/vendor/svbony/svbony_camera_driver.h>
 
 #include "../../catalog/builtin_descriptors.h"
-#include "altair_fields.h"
+#include "svbony_fields.h"
 
 namespace alpacacore::catalog {
 
-void register_altair_factory(DeviceCatalog& catalog) {
+void register_svbony_factory(DeviceCatalog& catalog) {
     Factory factory;
-    factory.key = DeviceKey{"altair", DeviceType::Camera};
+    factory.key = DeviceKey{"svbony", DeviceType::Camera};
     factory.create = [](const DeviceConfig& config, int device_number) {
-        const int camera_index = static_cast<int>(config.get(kAltairCameraIndex));
-        return vendor::altair::create_altair_camera(device_number, camera_index);
+        return vendor::svbony::create_svbony_camera(device_number, static_cast<int>(config.get(kSvbonyCameraIndex)));
     };
     catalog.add(std::move(factory));
 }

@@ -21,7 +21,7 @@ namespace alpacacore::vendor::altair {
  *
  * Altair Astro cameras are ToupTek OEM hardware and altaircam is the ToupTek
  * SDK under Altair's name, so this is the shared ToupcamFamilySDK
- * (touptek/toupcam_family_sdk.h) over Altaircam_* calls, presented through the
+ * (src/vendors/touptek/toupcam_family_sdk.h) over Altaircam_* calls, presented through the
  * same touptek::ToupTekSDK seam the ToupTek drivers and their fakes use.
  * Driver code reaches it only through that interface.
  *

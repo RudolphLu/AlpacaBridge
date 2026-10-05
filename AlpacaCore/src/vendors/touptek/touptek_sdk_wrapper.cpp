@@ -10,9 +10,10 @@
 // license text and the vendor-SDK linking exception, or the license online at:
 // https://www.gnu.org/licenses/agpl-3.0.html
 
-#include <alpacacore/vendor/touptek/toupcam_family_sdk.h>
 #include <alpacacore/vendor/touptek/touptek_sdk_wrapper.h>
 #include <toupcam.h>
+
+#include "toupcam_family_sdk.h"
 
 namespace alpacacore::vendor::touptek {
 

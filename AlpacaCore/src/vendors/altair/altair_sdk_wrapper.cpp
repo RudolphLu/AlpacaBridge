@@ -11,10 +11,11 @@
 // https://www.gnu.org/licenses/agpl-3.0.html
 
 #include <alpacacore/vendor/altair/altair_sdk_wrapper.h>
-#include <alpacacore/vendor/touptek/toupcam_family_sdk.h>
 #include <altaircam.h>
 
 #include <type_traits>
+
+#include "../touptek/toupcam_family_sdk.h"
 
 namespace alpacacore::vendor::altair {
 

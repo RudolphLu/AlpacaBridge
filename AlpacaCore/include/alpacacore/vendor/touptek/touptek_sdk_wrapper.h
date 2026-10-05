@@ -260,7 +260,7 @@ public:
 /**
  * The production ToupTek SDK (toupcamsdk 20260128, libtoupcam).
  *
- * The implementation is ToupcamFamilySDK (toupcam_family_sdk.h) over
+ * The implementation is ToupcamFamilySDK (src/vendors/touptek/toupcam_family_sdk.h) over
  * Toupcam_* calls, shared with the Altair wrapper, which runs the same code
  * over Altair's renamed copy of this SDK. Driver code reaches it only through
  * the ToupTekSDK interface above.

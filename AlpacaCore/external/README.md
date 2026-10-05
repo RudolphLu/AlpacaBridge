@@ -5,7 +5,7 @@ This directory contains vendor SDKs required to build vendor-specific drivers fo
 ## Quick Start
 
 1. **Download the vendor SDK** from the vendor's official website
-2. **Read the SDK root** that vendor's `src/vendors/<vendor>/CMakeLists.txt` sets and hard-fails on. Nothing searches for the SDK: the path is literal and its shape differs per vendor. Most vendors keep the extracted folder as a level of its own (`external/ZWO/ASI_Camera_SDK/`, `external/QHY/sdk_linux_arm64_26.06.04/`, `external/ToupTek/toupcamsdk.20260128/`, `external/PlayerOne/PlayerOne_Camera_SDK_Linux_V3.10.0/`); SVBONY does not: `SVB_SDK_ROOT` is `external/SVBONY/` itself, and CMake looks for `external/SVBONY/include/SVBCameraSDK.h` and `external/SVBONY/lib/`, one level below that root
+2. **Read the SDK root** that vendor's `src/vendors/<vendor>/CMakeLists.txt` sets and hard-fails on. Nothing searches for the SDK: the path is literal and its shape differs per vendor. Most vendors keep the extracted folder as a level of its own (`external/ZWO/ASI_Camera_SDK/`, `external/QHY/sdk_linux_arm64_26.06.04/`, `external/ToupTek/toupcamsdk.20260128/`, `external/Altair/altaircamsdk.20260531/`, `external/PlayerOne/PlayerOne_Camera_SDK_Linux_V3.10.0/`); SVBONY does not: `SVB_SDK_ROOT` is `external/SVBONY/` itself, and CMake looks for `external/SVBONY/include/SVBCameraSDK.h` and `external/SVBONY/lib/`, one level below that root
 3. **Extract the SDK archive** so that its contents land at exactly that root
    - Two-level vendors: place the vendor-named folder under `external/<Vendor>/`
    - SVBONY: place the archive's `include/`, `lib/` and the rest directly in `external/SVBONY/`, with no extra folder level
@@ -88,13 +88,14 @@ own redistribution terms still apply to the SDK files themselves.
 | Player One (camera + filter wheel) | Vendor `license.txt` ("develop any products without any restrictions", keep the notice) | Permitted with notice retained |
 | QHY | None for `libqhyccd` itself; bundled Cypress `fxload` loader is GPL-2 (`COPYING` in the SDK) | Redistributed unmodified, as downloaded from QHY's official SDK page, for turnkey device support |
 | ToupTek | None in the vendored subset | Redistributed unmodified, as downloaded from ToupTek's official SDK page, for turnkey device support |
+| Altair (`altaircamsdk.20260531/`, the ToupTek SDK under Altair's name) | None in the vendor archive or the vendored subset | Redistributed unmodified: the arm64 glibc `libaltaircam.so`, `altaircam.h` and `99-altaircam.rules` from `altaircamsdk_20260531_60.31589.20260531.zip`(https://www.altairastro.help/downloads/) |
 | SVBONY | None (`readme.txt` is a changelog) | Redistributed unmodified, as downloaded from SVBONY's official SDK page, for turnkey device support |
 | libgpiod (source tarball) | LGPL-2.1-or-later library, GPL-2.0-or-later tools (`LICENSES/` in the tarball) | Unmodified upstream source tarball, built at package build time for the GPIO switch drivers |
 | WandererAstro (docs only) | None — vendor-authored serial-protocol doc + user manual | Redistributed unmodified as a driver-development reference; no SDK binaries |
 | Astroasis (docs only) | None found in the installer | `external/oasisastro/README.md` is a protocol reference reverse-engineered (decompilation/disassembly) from the vendor's public ASCOM installer. The installer itself is not committed (`*.exe` is gitignored) — it was only an analysis input. The driver speaks the USB HID protocol directly via `hidapi`; no vendor SDK binary is extracted, redistributed, or linked. |
 | Protocol docs: Bisque, Celestron, iOptron, Losmandy, SynScan, ZWO mounts (docs only) | None — vendor-authored protocol references, converted to Markdown | Redistributed as driver-development references; no SDK binaries, drivers speak the documented protocols directly |
 
-The QHY/ToupTek/SVBONY subsets carry no written redistribution grant from the
+The QHY/ToupTek/Altair/SVBONY subsets carry no written redistribution grant from the
 vendor; they are vendored unmodified from the vendors' public SDK downloads so
 builds are turnkey. If any vendor objects, the subset will be removed and that
 vendor's driver will return to download-the-SDK-yourself builds.

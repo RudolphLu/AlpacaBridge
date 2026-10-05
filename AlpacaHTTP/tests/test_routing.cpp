@@ -954,6 +954,37 @@ int main() {
         }
         EXPECT(!raw_byte_logged('\x1b'));
 
+        // A validation message that quotes a decoded client value (the UTCDate
+        // text) reaches the DEBUG log escaped too: %0A in a form value decodes
+        // to a newline that would otherwise start a forged log line.
+        {
+            const std::string utc_body = "UTCDate=nope%0AHTTP+GET+/forged";
+            send_raw("PUT /api/v1/telescope/" + std::to_string(kStubNumber) +
+                     "/utcdate HTTP/1.1\r\nHost: localhost\r\n"
+                     "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: " +
+                     std::to_string(utc_body.size()) + "\r\n\r\n" + utc_body);
+            EXPECT(count_logged("AlpacaException in telescope method 'utcdate': Invalid UTC date format: "
+                                "nope\\x0aHTTP GET /forged") == 1);
+            EXPECT(!raw_byte_logged('\n'));
+        }
+
+        // configuredevice with a deviceType carrying a newline: the DEBUG
+        // lines in register_device_from_config / sanitize_device_config quote
+        // it and the exception text, both client text.
+        {
+            const std::string cfg_body =
+                "{\"vendor\":\"zwo\",\"deviceType\":\"cam\\nHTTP GET /forged\","
+                "\"deviceNumber\":0}";
+            send_raw(
+                "POST /management/v1/configuredevice HTTP/1.1\r\nHost: localhost\r\n"
+                "Content-Type: application/json\r\nContent-Length: " +
+                std::to_string(cfg_body.size()) + "\r\n\r\n" + cfg_body);
+            EXPECT(count_logged("register_device_from_config: device type \"cam\\x0aHTTP GET /forged\" is not "
+                                "catalog-recognized (Unknown device type: cam\\x0aHTTP GET /forged); falling "
+                                "through to the arm chain") == 1);
+            EXPECT(!raw_byte_logged('\n'));
+        }
+
         registry.unregister_device(alpacacore::DeviceType::Telescope, kStubNumber);
         registry.unregister_device(alpacacore::DeviceType::Camera, kStubNumber);
     }
@@ -2525,10 +2556,10 @@ int main() {
 
 #ifdef ALPACACORE_ENABLE_ALTAIR
     {
-        // altair / camera — cameraIndex survives the catalog-sanitized save,
-        // and the factory constructs without touching the SDK's USB scan (the
-        // driver enumerates at connect), so it registers with no camera
-        // attached.
+        // case: altair camera cameraIndex survives the config round-trip
+        // altair / camera — cameraIndex survives the catalog-sanitized save.
+        // Construction runs one enumeration (a failure is logged), nothing is
+        // opened until connect, so it registers with no camera attached.
         const auto cfg = roundtrip_config(
             router, {{"vendor", "altair"}, {"deviceType", "camera"}, {"deviceNumber", 9666}, {"cameraIndex", 2}},
             "Camera", 9666);
@@ -6579,7 +6610,7 @@ int main() {
     // catalog in the management envelope. The shape is pinned by the committed
     // fixture tests/fixtures/devicecatalog.json (a fixture change is a
     // deliberate commit). The catalog under test holds the built-in Altair,
-    // Astroasis, SkyWatcher (open-astro#744) and WeeWX descriptors plus the "zzz"
+    // Astroasis, SkyWatcher (open-astro#744), SVBONY and WeeWX descriptors plus the "zzz"
     // test descriptor, schema only, so its `available` is false.
     {
         alpacahttp::Router router;
@@ -6590,7 +6621,7 @@ int main() {
         std::ifstream fixture_in(fixture_path);
         EXPECT(fixture_in.good());
         nlohmann::json fixture = nlohmann::json::parse(fixture_in, nullptr, false);
-        EXPECT(!fixture.is_discarded() && fixture.is_array() && fixture.size() == 5);
+        EXPECT(!fixture.is_discarded() && fixture.is_array() && fixture.size() == 6);
         // The fixture is written for the all-vendors build. `available` is the
         // one value that depends on the build (true with the vendor on, false
         // with ALPACACORE_ENABLE_<VENDOR>=OFF), so it is set from this build
@@ -6612,6 +6643,13 @@ int main() {
             }
             if (entry.value("vendor", "") == "skywatcher") {
 #ifdef ALPACACORE_ENABLE_SKYWATCHER
+                entry["available"] = true;
+#else
+                entry["available"] = false;
+#endif
+            }
+            if (entry.value("vendor", "") == "svbony") {
+#ifdef ALPACACORE_ENABLE_SVBONY
                 entry["available"] = true;
 #else
                 entry["available"] = false;
@@ -6773,6 +6811,7 @@ int main() {
     // With the vendor built out, the catalog path reports "<label> support not
     // enabled", the label being the display name's first word.
     {
+        // case: altair built out reports support not enabled
         alpacahttp::Router router;
         const auto off = api_attempt(
             router,
@@ -7507,6 +7546,49 @@ int main() {
         EXPECT(off.message == "WeeWX support not enabled. Rebuild with -DALPACACORE_ENABLE_WEEWX=ON");
         EXPECT(off.error_number == 0x400);  // NotImplemented
         EXPECT(listed_entry(router, "ObservingConditions", 9264).is_null());
+    }
+#endif
+
+    {
+        // Persisted: the wrong-type refusal is thrown before normalize() and the
+        // availability check, so the entry fails to load (listed as failed) in
+        // every build, where the deleted arm loaded 1.5 as index 1.
+        const auto persisted = persisted_attempt(
+            nlohmann::json::parse(R"({"vendor":"svbony","deviceType":"camera","deviceNumber":9269,"cameraIndex":1.5})"),
+            "Camera");
+        EXPECT(!persisted.listed);
+        EXPECT(persisted.failed_listed);
+        EXPECT(any_warning_contains(persisted.errors, "cameraIndex"));
+    }
+
+#ifdef ALPACACORE_ENABLE_SVBONY
+    // The catalog's Int field refuses what the deleted arm's config_get<int>()
+    // truncated (1.5) or coerced (true): not registered, InvalidValue.
+    {
+        const char* const kBadIndexes[] = {"1.5", "true"};
+        int number = 9266;
+        for (const char* bad : kBadIndexes) {
+            nlohmann::json entry = nlohmann::json::parse(std::string(R"({"cameraIndex":)") + bad + "}");
+            entry.update({{"vendor", "svbony"}, {"deviceType", "camera"}, {"deviceNumber", ++number}});
+            alpacahttp::Router router;
+            const auto api = api_attempt(router, entry, "Camera");
+            EXPECT(!api.ok);
+            EXPECT(api.message.find("cameraIndex") != std::string::npos);
+            EXPECT(api.error_number == 0x401);  // InvalidValue
+            EXPECT(listed_entry(router, "Camera", number).is_null());
+        }
+    }
+#else
+    // With the vendor built out, the catalog path reports the deleted arm's text.
+    {
+        alpacahttp::Router router;
+        const auto off = api_attempt(
+            router, nlohmann::json::parse(R"({"vendor":"svbony","deviceType":"camera","deviceNumber":9265})"),
+            "Camera");
+        EXPECT(!off.ok);
+        EXPECT(off.message == "SVBONY support not enabled. Rebuild with -DALPACACORE_ENABLE_SVBONY=ON");
+        EXPECT(off.error_number == 0x400);  // NotImplemented
+        EXPECT(listed_entry(router, "Camera", 9265).is_null());
     }
 #endif
 
