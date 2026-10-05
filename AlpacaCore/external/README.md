@@ -88,14 +88,14 @@ own redistribution terms still apply to the SDK files themselves.
 | Player One (camera + filter wheel) | Vendor `license.txt` ("develop any products without any restrictions", keep the notice) | Permitted with notice retained |
 | QHY | None for `libqhyccd` itself; bundled Cypress `fxload` loader is GPL-2 (`COPYING` in the SDK) | Redistributed unmodified, as downloaded from QHY's official SDK page, for turnkey device support |
 | ToupTek | None in the vendored subset | Redistributed unmodified, as downloaded from ToupTek's official SDK page, for turnkey device support |
-| Altair (camera) | None in the vendored subset | Redistributed unmodified from Altair's SDK download (altairastro.help, login required), version 60.31589.20260531, for turnkey device support |
+| Altair (camera) | MIT (`license.txt` in the SDK tree, text from Altair Support) | Redistribution and linking permitted with the notice retained; SDK from Altair's download (altairastro.help, login required), version 60.31589.20260531 |
 | SVBONY | None (`readme.txt` is a changelog) | Redistributed unmodified, as downloaded from SVBONY's official SDK page, for turnkey device support |
 | libgpiod (source tarball) | LGPL-2.1-or-later library, GPL-2.0-or-later tools (`LICENSES/` in the tarball) | Unmodified upstream source tarball, built at package build time for the GPIO switch drivers |
 | WandererAstro (docs only) | None — vendor-authored serial-protocol doc + user manual | Redistributed unmodified as a driver-development reference; no SDK binaries |
 | Astroasis (docs only) | None found in the installer | `external/oasisastro/README.md` is a protocol reference reverse-engineered (decompilation/disassembly) from the vendor's public ASCOM installer. The installer itself is not committed (`*.exe` is gitignored) — it was only an analysis input. The driver speaks the USB HID protocol directly via `hidapi`; no vendor SDK binary is extracted, redistributed, or linked. |
 | Protocol docs: Bisque, Celestron, iOptron, Losmandy, SynScan, ZWO mounts (docs only) | None — vendor-authored protocol references, converted to Markdown | Redistributed as driver-development references; no SDK binaries, drivers speak the documented protocols directly |
 
-The QHY/ToupTek/Altair/SVBONY subsets carry no written redistribution grant from the
+The QHY/ToupTek/SVBONY subsets carry no written redistribution grant from the
 vendor; they are vendored unmodified from the vendors' public SDK downloads so
 builds are turnkey. If any vendor objects, the subset will be removed and that
 vendor's driver will return to download-the-SDK-yourself builds.

@@ -11,8 +11,16 @@ guard) applies to an Altair camera unchanged, because it is the same driver.
 
 SDK location: `AlpacaCore/external/Altair/altaircamsdk.20260531/` (altaircam
 60.31589.20260531; `inc/altaircam.h`, `linux/arm64/glibc/libaltaircam.so`,
-`linux/udev/99-altaircam.rules`). Only the arm64 glibc subset of Altair's
-download is vendored. The SDK ships no static library.
+`linux/udev/99-altaircam.rules`, `license.txt`). Only the arm64 glibc subset
+of Altair's download is vendored. The SDK ships no static library.
+
+- **License: MIT.** Altair Support confirmed (2026-10) that the SDK may be
+  redistributed provided the copyright notice ("Copyright 2026 Altair Astro
+  Limited") and the license text are included. `license.txt` holds that text,
+  and `debian/copyright` carries the `Files: AlpacaCore/external/Altair/*`
+  entry that installs it with the `.deb`. Keep both when the SDK is bumped: a
+  new SDK directory needs its `license.txt`, and the `debian/copyright` path
+  and year must follow.
 
 - **altaircam is the ToupTek SDK renamed.** Against `toupcam.h` 59.30701 it
   differs only in the `Altaircam_` / `ALTAIRCAM_` prefixes, comments, four GigE

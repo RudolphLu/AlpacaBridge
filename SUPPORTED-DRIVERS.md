@@ -48,7 +48,7 @@ This document lists all hardware vendors and device types that are verified to w
 <details>
 <summary><strong>Altair Camera Driver Notes</strong></summary>
 
-- **SDK**: Altair altaircamsdk 60.31589.20260531 (`libaltaircam.so`, shipped in the `.deb` with its udev rule `99-altaircam.rules`). Altair Astro cameras are ToupTek OEM hardware, and the driver is the ToupTek camera driver running over Altair's own SDK, so readout modes, Offset (black level), binning and cooling behave as in the ToupTek notes below.
+- **SDK**: Altair altaircamsdk 60.31589.20260531 (`libaltaircam.so`, shipped in the `.deb` with its udev rule `99-altaircam.rules`), MIT licensed (`license.txt` in the SDK tree). Altair Astro cameras are ToupTek OEM hardware, and the driver is the ToupTek camera driver running over Altair's own SDK, so readout modes, Offset (black level), binning and cooling behave as in the ToupTek notes below.
 - **Connection**: USB. Select vendor **Altair** in the web UI, not ToupTek: the ToupTek SDK does not list Altair cameras (USB vendor id `16d0`), and each camera should be configured under one vendor only.
 - **Validated models**: the table above is the list; every validated row links to its own ConformU report, which carries the ConformU version and pass counts for that model.
 - **Tested model**: ALTAIR178M3 (uncooled mono, IMX178, 3040x2048, 2.4 micron pixels, firmware 3.5.0.20230826, ST4 guide port) on an OrangePi 3 LTS (Allwinner H6, Armbian trixie), ConformU 4.5.1 run on the board against AlpacaBridge over localhost, 2026-10-05.
