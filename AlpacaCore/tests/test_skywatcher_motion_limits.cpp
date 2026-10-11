@@ -88,6 +88,15 @@ bool wait_until(const std::function<bool()>& pred, int timeout_ms) {
     return pred();
 }
 
+// Lets the status poll (decision 0010) sample the mount at least once after a
+// test moved its axes behind the driver's back: two whole polls, so one that was
+// already in flight when the jump landed is followed by one that was not. Each
+// poll asks ':j' once per axis.
+void settle_status_poll(FakeSkyWatcherMount& mount) {
+    const int anchors = mount.frames_seen('j');
+    REQUIRE(mount.wait_for_frames('j', anchors + 4, std::chrono::milliseconds(3000)));
+}
+
 // A target half a degree from the pole at HA +5.5 h: altitude ~39-40 deg at
 // this latitude whatever the time of day, and a short goto from home.
 double near_pole_ra(const alpacacore::TelescopeDriver& driver) {
@@ -539,6 +548,95 @@ TEST_CASE("SkyWatcher limits - MoveAxis carrying the tube below the floor is sto
     driver->set_connected(false);
 }
 
+// The guard reads the polled frame only while it is fresh. With the poll
+// stalled the frame is stale, so the guard must keep its direct read of the
+// board: serving the frozen frame would leave it blind to the moving axis.
+TEST_CASE("SkyWatcher limits - a stale frame is not served to the guard and it reads the board",
+          "[skywatcher][telescope][limits][guard]") {
+    FakeSkyWatcherMount mount;
+    REQUIRE(mount.ok());
+    mount.jump_axis_degrees(2, kGuardDecAxisDeg);
+    auto driver = connected_driver(mount, floor_deg(kGuardAltitudeDeg - 1.5));
+    REQUIRE(std::abs(driver->get_altitude() - kGuardAltitudeDeg) < 0.2);
+
+    // A slow MoveAxis: the dead-reckoned model alone never reaches the floor
+    // in this test, so only a direct read of the board can see the jump.
+    driver->move_axis(1, kMaxMoveAxisRate / 10.0);
+    REQUIRE(wait_until([&] { return mount.axis_running(2); }, 2000));
+    sw::set_status_poll_paused_for_testing(*driver, true);
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));  // past the freshness bound
+    const int reads_before = mount.frames_seen('j');
+    mount.jump_axis_degrees(2, kGuardDecAxisDeg + 10.0);  // about 4 deg below the floor, behind the frozen frame
+    CHECK(wait_until([&] { return !mount.axis_running(2); }, 6000));
+    CHECK(mount.frames_seen('j') > reads_before);
+    sw::set_status_poll_paused_for_testing(*driver, false);
+    CHECK(wait_until([&] { return !driver->get_slewing(); }, 6000));
+    driver->set_connected(false);
+}
+
+// No getter clears the slewing flag (decision 0010): a synchronous slew that a
+// MoveAxis supersedes clears it, or the guard lets the MoveAxis cross the floor.
+TEST_CASE("SkyWatcher limits - a MoveAxis that supersedes a synchronous slew is guarded",
+          "[skywatcher][telescope][limits][guard]") {
+    FakeSkyWatcherMount mount;
+    REQUIRE(mount.ok());
+    mount.jump_axis_degrees(2, kGuardDecAxisDeg);
+    auto driver = connected_driver(mount, floor_deg(kGuardAltitudeDeg - 1.5));
+    REQUIRE(std::abs(driver->get_altitude() - kGuardAltitudeDeg) < 0.2);
+    const double ra = driver->get_right_ascension();  // same hour angle: a Dec-only goto that raises the tube
+    std::atomic<int> result{-1};
+    std::jthread sync_slew([&] {
+        try {
+            driver->slew_to_coordinates(ra, 80.0);
+            result.store(0);
+        } catch (const alpacacore::AlpacaException& ex) {
+            result.store(ex.error_code());
+        } catch (...) {
+            result.store(-2);
+        }
+    });
+    REQUIRE(wait_until([&] { return mount.axis_running(2); }, 5000));
+
+    driver->move_axis(1, kMaxMoveAxisRate);
+    sync_slew.join();
+    CHECK(result.load() == alpacacore::AlpacaError::InvalidOperation);
+    CHECK(wait_until([&] { return !mount.axis_running(2); }, 10000));
+    CHECK(driver->get_altitude() < kGuardAltitudeDeg - 1.5);
+    driver->set_connected(false);
+}
+
+// Tracking off supersedes the slew without touching its flags, so the slew ends
+// them itself, or Slewing reads true for the rest of the session.
+TEST_CASE("SkyWatcher limits - Tracking off that supersedes a synchronous slew lets Slewing end",
+          "[skywatcher][telescope][limits]") {
+    FakeSkyWatcherMount mount;
+    REQUIRE(mount.ok());
+    auto driver = connected_driver(mount);
+    mount.jump_axis_degrees(2, 20.0);
+    driver->set_tracking(true);
+    const double ra = near_pole_ra(*driver);
+    std::atomic<int> result{-1};
+    std::jthread sync_slew([&] {
+        try {
+            driver->slew_to_coordinates(ra, kNearPoleDec);
+            result.store(0);
+        } catch (const alpacacore::AlpacaException& ex) {
+            result.store(ex.error_code());
+        } catch (...) {
+            result.store(-2);
+        }
+    });
+    REQUIRE(wait_until([&] { return mount.axis_running(2); }, 5000));  // the goto: Dec does not track
+
+    driver->set_tracking(false);
+    sync_slew.join();
+    CHECK(result.load() == alpacacore::AlpacaError::InvalidOperation);
+    REQUIRE(wait_until([&] { return !mount.axis_running(2); }, 15000));  // the board ends the Dec goto
+    settle_status_poll(mount);
+    CHECK_FALSE(driver->get_slewing());
+    driver->set_connected(false);
+}
+
 // The mount crosses the floor between the position the driver last knew and
 // the guard's first sample (the cache still holds the inside position, the
 // board is already outside). The baseline must come from before the dispatch,
@@ -721,6 +819,7 @@ TEST_CASE("SkyWatcher limits - a motion started from rest takes no baseline from
 
     driver->set_tracking(false);
     mount.jump_axis_degrees(1, 95.0);  // 20 min past the meridian
+    settle_status_poll(mount);         // the status poll takes the jump into the model
     driver->set_tracking(true);
     REQUIRE(wait_until([&] { return mount.axis_running(1); }, 2000));
     std::this_thread::sleep_for(std::chrono::milliseconds(4500));  // two 2 s polls
@@ -744,6 +843,7 @@ TEST_CASE("SkyWatcher limits - a MoveAxis started from rest takes no baseline fr
 
     driver->set_tracking(false);
     mount.jump_axis_degrees(1, 95.0);
+    settle_status_poll(mount);
     driver->move_axis(1, kMaxMoveAxisRate / 10.0);
     REQUIRE(wait_until([&] { return mount.axis_running(2); }, 2000));
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));  // four 250 ms polls
