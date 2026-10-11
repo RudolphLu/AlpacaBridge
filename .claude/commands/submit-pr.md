@@ -126,16 +126,20 @@ git checkout -B "${HEAD_BRANCH}" "origin/stable/${SRC}"
 # Before the merge, so rerere records the conflicts it starts (per clone, set once).
 git config rerere.enabled true
 git merge --no-ff --no-commit "origin/${BASE_BRANCH}" || true   # VERSION/README conflicts are expected
-git rerere status   # files whose resolution rerere replayed from an earlier merge down
+git rerere remaining   # conflicted paths rerere did not resolve: these still need hand work
 ```
 
-**rerere.** Every merge down conflicts in the same places (`VERSION`, the README badge line,
-changelog fragments), so the block turns on `rerere`: Git records how each conflict was resolved
-when the merge commit is made, and replays that resolution the next time the same conflict
-appears. It is per clone, and it records only conflicts that start after it is enabled. Leave
-`rerere.autoupdate` off: a replayed file stays unstaged, so read it (`git diff`) before
-`git add`. The version-file steps and `check_docs_drift.py` below still decide what is right. A
-code conflict is new every time; resolve it by hand.
+**rerere.** The block turns on `rerere`: Git records how each conflict was resolved when the merge
+commit is made, and replays that resolution when the exact same conflict hunk appears again. The
+merge output names every replay (`Resolved '<path>' using previous resolution.`), and
+`git rerere remaining` lists the conflicted paths it did not resolve. The gain is on hunks that
+repeat byte for byte, such as changelog fragments and code conflicts already resolved in an
+earlier merge down. `VERSION` and the badge line rarely repeat (the beta number changes) and are
+overwritten by the steps below anyway. Leave `rerere.autoupdate` off: a replayed path stays
+unmerged until `git add`, so the `--diff-filter=U` guard below still stops an unread replay from
+being committed. Read a replayed code file as carefully as a hand resolution. The setting is per
+clone and permanent there; to scope it to one merge, use `git -c rerere.enabled=true merge ...`
+instead.
 
 **Version files.** The receiving branch keeps its own `VERSION` and README badge line: `main` names
 the newest stable release, never a beta, and `stable/X.Z` keeps its own beta. The one exception is
