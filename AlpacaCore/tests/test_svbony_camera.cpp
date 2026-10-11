@@ -15,6 +15,7 @@
 #include <alpacacore/version.h>
 
 #include <functional>
+#include <limits>
 
 #include "catch2_compat.h"
 
@@ -60,7 +61,7 @@ TEST_CASE("SVBONY Camera Driver - Not connected throws", "[svbony][camera][unit]
     CHECK_THROWS_AS(driver->set_gain(100), alpacacore::AlpacaException);
     CHECK_THROWS_AS(driver->get_offset(), alpacacore::AlpacaException);
     CHECK_THROWS_AS(driver->start_exposure(1.0, true), alpacacore::AlpacaException);
-    CHECK_THROWS_AS(driver->stop_exposure(), alpacacore::AlpacaException);
+    require_alpaca_error([&]() { driver->stop_exposure(); }, alpacacore::AlpacaError::MethodNotImplemented);
     CHECK_THROWS_AS(driver->abort_exposure(), alpacacore::AlpacaException);
     CHECK_THROWS_AS(driver->pulse_guide(0, 100), alpacacore::AlpacaException);
     CHECK_THROWS_AS(driver->get_image_array(), alpacacore::AlpacaException);
@@ -73,7 +74,7 @@ TEST_CASE("SVBONY Camera Driver - Disconnected state", "[svbony][camera][unit]")
     require_alpaca_error([&]() { driver->get_image_ready(); }, alpacacore::AlpacaError::NotConnected);
     CHECK(driver->get_is_pulse_guiding() == false);
     CHECK(driver->get_can_abort_exposure() == true);
-    CHECK(driver->get_can_stop_exposure() == true);
+    CHECK(driver->get_can_stop_exposure() == false);
     CHECK(driver->get_can_asymmetric_bin() == false);
     CHECK(driver->get_has_shutter() == false);
 }
@@ -99,12 +100,18 @@ TEST_CASE("SVBONY Camera Driver - Sub-exposure not supported", "[svbony][camera]
 TEST_CASE("SVBONY Camera Driver - ASCOM Error Codes", "[svbony][camera][unit]") {
     auto driver = alpacacore::vendor::svbony::create_svbony_camera(0, 0);
 
+    require_alpaca_error([&]() { driver->start_exposure(-1.0, true); }, alpacacore::AlpacaError::InvalidValue);
+    require_alpaca_error([&]() { driver->start_exposure(std::numeric_limits<double>::quiet_NaN(), true); },
+                         alpacacore::AlpacaError::InvalidValue);
+    require_alpaca_error([&]() { driver->start_exposure(std::numeric_limits<double>::infinity(), true); },
+                         alpacacore::AlpacaError::InvalidValue);
+    require_alpaca_error([&]() { driver->start_exposure(1e30, true); }, alpacacore::AlpacaError::InvalidValue);
     require_alpaca_error([&]() { driver->get_ccd_temperature(); }, alpacacore::AlpacaError::NotConnected);
     require_alpaca_error([&]() { driver->get_gain(); }, alpacacore::AlpacaError::NotConnected);
     require_alpaca_error([&]() { driver->set_gain(100); }, alpacacore::AlpacaError::NotConnected);
     require_alpaca_error([&]() { driver->get_offset(); }, alpacacore::AlpacaError::NotConnected);
     require_alpaca_error([&]() { driver->start_exposure(1.0, true); }, alpacacore::AlpacaError::NotConnected);
-    require_alpaca_error([&]() { driver->stop_exposure(); }, alpacacore::AlpacaError::NotConnected);
+    require_alpaca_error([&]() { driver->stop_exposure(); }, alpacacore::AlpacaError::MethodNotImplemented);
     require_alpaca_error([&]() { driver->abort_exposure(); }, alpacacore::AlpacaError::NotConnected);
     require_alpaca_error([&]() { driver->pulse_guide(0, 100); }, alpacacore::AlpacaError::NotConnected);
     require_alpaca_error([&]() { driver->get_image_array(); }, alpacacore::AlpacaError::NotConnected);
@@ -117,5 +124,5 @@ TEST_CASE("SVBONY Camera Driver - State Machine Contracts", "[svbony][camera][un
     require_alpaca_error([&]() { driver->get_image_ready(); }, alpacacore::AlpacaError::NotConnected);
     REQUIRE(driver->get_is_pulse_guiding() == false);
     REQUIRE(driver->get_can_abort_exposure() == true);
-    REQUIRE(driver->get_can_stop_exposure() == true);
+    REQUIRE(driver->get_can_stop_exposure() == false);
 }
