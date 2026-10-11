@@ -342,6 +342,16 @@
                     </div>
 
                     <div class="form-group">
+                        <label for="synscan-alignment-mode">Alignment Mode:</label>
+                        <select id="synscan-alignment-mode" name="synscanAlignmentMode">
+                            <option value="auto">Auto (from the handset)</option>
+                            <option value="altaz">Alt-Az</option>
+                            <option value="equatorial">Equatorial</option>
+                        </select>
+                        <small>For an AZ-EQ5 or AZ-EQ6, which reports only its model: pick how the mount is set up. Other mounts ignore this.</small>
+                    </div>
+
+                    <div class="form-group">
                         <label for="synscan-connection-type">Connection Type:</label>
                         <select id="synscan-connection-type" name="synscanConnectionType" required>
                             <option value="auto">Auto-Detect</option>
@@ -484,12 +494,21 @@
                     <div class="form-group">
                         <label for="skywatcher-min-altitude">Minimum altitude limit (deg):</label>
                         <input type="number" id="skywatcher-min-altitude" name="skywatcherMinAltitudeDeg" min="-90" max="90" step="any" placeholder="off">
-                        <small>Optional. Clear the field to switch the limit off. A goto to a target below this altitude is refused. It is a soft limit: set it at least 3 degrees above the real clearance of your tube and tripod.</small>
+                        <small>Optional. Clear the field to switch the limit off. A goto to a target below this altitude is refused, and MoveAxis or tracking that carries the tube below it is stopped. Motion that starts below the limit is not stopped, so you can move back up; Park and FindHome are not limited. It is a soft limit: set it at least 3 degrees above the real clearance of your tube and tripod.</small>
                     </div>
                     <div class="form-group">
-                        <label for="skywatcher-meridian-limit">Meridian limit (minutes past the meridian, not enforced yet):</label>
+                        <label for="skywatcher-meridian-limit">Meridian limit (minutes past the meridian):</label>
                         <input type="number" id="skywatcher-meridian-limit" name="skywatcherMeridianLimitMinutes" min="0" max="360" step="any" placeholder="off">
-                        <small>Optional. Clear the field to switch the limit off. AlpacaBridge does not yet stop motion or refuse gotos at this limit.</small>
+                        <small>Optional. Clear the field to switch the limit off. MoveAxis or tracking that carries the counterweight past this limit is stopped. Motion that starts past it is not stopped, and gotos are not refused at this limit.</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="skywatcher-dec-axis-sense">Dec axis sense:</label>
+                        <select id="skywatcher-dec-axis-sense" name="skywatcherDecAxisSense">
+                            <option value="auto" selected>Auto (measured for known mounts)</option>
+                            <option value="normal">Normal</option>
+                            <option value="reversed">Reversed</option>
+                        </select>
+                        <small>Leave on Auto unless the mount points 12 hours out in hour angle. Only mounts that have not been measured need this; see the troubleshooting guide for the reading that tells you which to pick.</small>
                     </div>
                 </div>
 
@@ -540,6 +559,16 @@
                 <!-- Celestron NexStar Telescope Configuration -->
                 <div id="celestron-config" class="vendor-config" style="display: none;">
                     <h3>Celestron NexStar Telescope Configuration</h3>
+
+                    <div class="form-group">
+                        <label for="celestron-alignment-mode">Alignment Mode:</label>
+                        <select id="celestron-alignment-mode" name="celestronAlignmentMode">
+                            <option value="auto">Auto (from the handset)</option>
+                            <option value="altaz">Alt-Az</option>
+                            <option value="equatorial">Equatorial</option>
+                        </select>
+                        <small>For a fork mount on a wedge, pick Equatorial. German equatorial mounts ignore this.</small>
+                    </div>
 
                     <div class="form-group">
                         <label for="celestron-connection-type">Connection Type:</label>
@@ -809,6 +838,13 @@
                             <input type="number" id="camera-id" name="cameraId" min="0">
                             <small>If set, overrides the camera index.</small>
                         </div>
+                        <!-- Identity the server learned (#914). Carried through an edit,
+                             which removes and re-adds the entry; see zwoCameraIdentityFields(). -->
+                        <input type="hidden" id="zwo-camera-serial" name="zwoCameraSerial">
+                        <input type="hidden" id="zwo-camera-name" name="zwoCameraName">
+                        <input type="hidden" id="zwo-camera-unique-id" name="zwoCameraUniqueId">
+                        <input type="hidden" id="zwo-camera-loaded-index">
+                        <input type="hidden" id="zwo-camera-loaded-id">
                     </div>
 
                     <div id="zwo-filterwheel-fields" style="display: none;">
@@ -1880,7 +1916,7 @@
         </div>
     </div>
 
-    <script src="/web/format.js?v=7"></script>
-    <script src="/web/app.js?v=40"></script>
+    <script src="/web/format.js?v=12"></script>
+    <script src="/web/app.js?v=43"></script>
 </body>
 </html>

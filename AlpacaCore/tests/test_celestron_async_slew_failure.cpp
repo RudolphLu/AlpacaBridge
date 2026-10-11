@@ -31,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -38,14 +39,37 @@
 #include "catch2_compat.h"
 #include "concurrency_stress.h"  // settle_connected
 #include "fake_mount_server.h"
+#include "fake_task_clock.h"
 
 namespace {
 
 using Clock = std::chrono::steady_clock;
 
+// The fake mount reports pier W at longitude 0, and the driver takes a forced
+// meridian flip (two passthrough GOTOs, never the plain one) whenever the target's
+// hour angle is negative. A fixed RA made that depend on the wall clock, so the
+// cases failed for about half of every UTC day. One hour west of the local
+// sidereal time (HA = +1 h, the driver's own GMST formula) never flips.
+double no_flip_ra_hours() {
+    const double days =
+        std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count() / 86400.0;
+    const double d = 2440587.5 + days - 2451545.0;
+    const double lst_hours = std::fmod(std::fmod(280.46061837 + 360.98564736629 * d, 360.0) + 360.0, 360.0) / 15.0;
+    return std::fmod(lst_hours - 1.0 + 24.0, 24.0);
+}
+
 struct FakeCelestronState {
+    // The GOTO timer reads this clock. A case that steps the driver on a
+    // FakeTaskClock points it there, so the slew runs in virtual time too.
+    alpacacore::util::TaskClock* clock = &alpacacore::util::default_task_clock();
+    alpacacore::util::TaskClock::clock::time_point now() const { return clock->now(); }
     std::atomic<bool> reject_goto{false};  // true: swallow the GOTO -> the wrapper times out and throws
+    std::atomic<bool> goto_cancelled{false};  // set by the cancel-goto command, cleared by the next GOTO
     std::atomic<bool> shifted_position{false};
+    std::atomic<bool> mute{false};
+    std::atomic<unsigned char> model_id{24};  // CGX-L
+    std::atomic<unsigned char> firmware_major{5};
+    std::atomic<unsigned char> firmware_minor{35};
     std::atomic<int> goto_count{0};
     std::atomic<Clock::rep> goto_started{0};
     std::mutex command_mutex;
@@ -70,15 +94,16 @@ struct FakeCelestronState {
     }
     static constexpr auto kGotoDuration = std::chrono::milliseconds(1500);
     bool goto_in_progress() const {
-        if (goto_count.load() == 0) return false;
+        if (goto_count.load() == 0 || goto_cancelled.load()) return false;
         const auto started = Clock::time_point(Clock::duration(goto_started.load()));
-        return Clock::now() - started < kGotoDuration;
+        return now() - started < kGotoDuration;
     }
     std::string goto_reply() {
         if (reject_goto.load()) {
             return "";  // no reply at all: the response timeout fires inside the slew task
         }
-        goto_started.store(Clock::now().time_since_epoch().count());
+        goto_cancelled.store(false);
+        goto_started.store(now().time_since_epoch().count());
         goto_count.fetch_add(1);
         return "#";
     }
@@ -86,11 +111,21 @@ struct FakeCelestronState {
 
 alpacacore::test::FakeMountServer::Responder celestron_responder(const std::shared_ptr<FakeCelestronState>& st) {
     return [st](const std::string& chunk) -> std::string {
+        if (st->mute.load()) return "";
         if (chunk.empty()) return "0#";
-        if (chunk[0] == 'T' || chunk[0] == 'P') {
+        if (chunk[0] == 'T' || chunk[0] == 'P' || chunk[0] == 'M') {
             st->record(chunk);
         }
         switch (chunk[0]) {
+            case 'm':
+                return std::string(1, static_cast<char>(st->model_id.load())) + "#";
+            case 'V':
+                return std::string(1, static_cast<char>(st->firmware_major.load())) +
+                       static_cast<char>(st->firmware_minor.load()) + "#";
+            case 'w':
+                return std::string(8, '\0') + "#";
+            case 'W':
+                return "#";
             case 'e':
             case 'E':
             case 'z':
@@ -104,6 +139,7 @@ alpacacore::test::FakeMountServer::Responder celestron_responder(const std::shar
             case 'L':
                 return st->goto_in_progress() ? "1#" : "0#";
             case 'M':  // cancel goto
+                st->goto_cancelled.store(true);
                 return "#";
             case 'J':  // alignment complete (the slew-safety gate requires it)
                 return "1#";
@@ -137,12 +173,12 @@ alpacacore::test::FakeMountServer::Responder celestron_responder(const std::shar
     };
 }
 
-alpacacore::vendor::celestron::ConnectionInfo endpoint(int port) {
+alpacacore::vendor::celestron::ConnectionInfo endpoint(int port, int timeout_ms = 1000) {
     alpacacore::vendor::celestron::ConnectionInfo info;
     info.type = alpacacore::vendor::celestron::ConnectionType::Network;
     info.host = "127.0.0.1";
     info.tcp_port = port;
-    info.response_timeout_ms = 1000;
+    info.response_timeout_ms = timeout_ms;
     return info;
 }
 
@@ -150,7 +186,22 @@ bool wait_until(const std::function<bool()>& pred, int timeout_ms) {
     const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
     while (Clock::now() < deadline) {
         if (pred()) return true;
+        // Real time: the fake mount and the test's own polling run on the host clock, not the driver's task clock.
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return pred();
+}
+
+// Steps the fake clock one `step` at a time, once a driver task is parked on
+// it, until `pred` holds or `max_steps` steps pass. Each step waits for the
+// woken task to settle, so no step lands between two of its waits.
+bool advance_until(alpacacore::test::FakeTaskClock& clock, const std::function<bool()>& pred,
+                   std::chrono::milliseconds step = std::chrono::milliseconds(250), int max_steps = 200) {
+    for (int i = 0; i < max_steps; ++i) {
+        if (pred()) return true;
+        clock.wait_for_waiters(1, std::chrono::milliseconds(100));
+        clock.advance(step);
+        clock.wait_for_woken_settled(std::chrono::seconds(2));
     }
     return pred();
 }
@@ -180,7 +231,7 @@ TEST_CASE("Celestron async - a GOTO the hand controller never acknowledges surfa
     REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
 
     st->reject_goto.store(true);
-    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(5.5, 20.0));
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0));
     // True: published before the task ran. Threw: the task won mutex_ first
     // and its dispatch already failed -- never a silent False.
     const SlewingRead first = read_slewing(*driver);
@@ -194,9 +245,9 @@ TEST_CASE("Celestron async - a GOTO the hand controller never acknowledges surfa
 
     // A retried initiator against a responsive controller clears it.
     st->reject_goto.store(false);
-    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(5.5, 20.0));
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0));
     CHECK(read_slewing(*driver) == SlewingRead::True);
-    REQUIRE(wait_until([&] { return st->goto_count.load() == 1; }, 5000));
+    REQUIRE(wait_until([&] { return st->goto_count.load() > 0; }, 5000));
     REQUIRE(wait_until([&] { return read_slewing(*driver) == SlewingRead::False; }, 15000));
     driver->set_connected(false);
 }
@@ -210,7 +261,7 @@ TEST_CASE("Celestron async - AbortSlew clears a stored slew failure (#575)",
     REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
 
     st->reject_goto.store(true);
-    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(5.5, 20.0));
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0));
     REQUIRE(wait_until([&] { return read_slewing(*driver) == SlewingRead::Threw; }, 10000));
 
     REQUIRE_NOTHROW(driver->abort_slew());
@@ -227,9 +278,10 @@ TEST_CASE("Celestron async - AbortSlew fences a pending GOTO", "[celestron][tele
 
     for (int i = 0; i < 50; ++i) {
         const int before = st->goto_count.load();
-        REQUIRE_NOTHROW(driver->slew_to_coordinates_async(5.5, 20.0));
+        REQUIRE_NOTHROW(driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0));
         REQUIRE_NOTHROW(driver->abort_slew());
         const int at_abort_return = st->goto_count.load();
+        // Real time: the fake mount and the test's own polling run on the host clock, not the driver's task clock.
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         INFO("iteration " << i << ", GOTO count before=" << before << " at abort return=" << at_abort_return
                           << " after=" << st->goto_count.load());
@@ -251,26 +303,165 @@ TEST_CASE("Celestron AbortSlew - a stop failure still reaps the cancelled slew t
     REQUIRE_NOTHROW(driver->set_connected(false));
     REQUIRE_NOTHROW(driver->set_connected(true));
     const int before = st->goto_count.load();
-    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(5.5, 20.0));
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0));
     CHECK(wait_until([&] { return st->goto_count.load() > before; }, 5000));
+    driver->set_connected(false);
+}
+
+namespace {
+
+void refuse_slot_threads(alpacacore::TelescopeDriver& driver) {
+    alpacacore::vendor::celestron::set_slew_spawn_for_testing(driver, [](std::function<void()>) -> std::thread {
+        throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+    });
+}
+
+// Starts a goto and lets it dispatch, then issues `second` while the slot's
+// thread factory refuses (EAGAIN). The initiator has by then cancelled the
+// goto body in flight, so nobody else will stop the mount: the refusal path
+// has to cancel the GOTO itself and publish the AbortSlew state.
+void refused_slot_start_stops_mount(const std::function<void(alpacacore::TelescopeDriver&)>& second) {
+    alpacacore::test::FakeTaskClock clock;
+    auto st = std::make_shared<FakeCelestronState>();
+    st->clock = &clock;
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope_with_site(
+        0, endpoint(server.port()), std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        alpacacore::vendor::celestron::CelestronAlignmentSetting::Auto, clock);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0);
+    REQUIRE(wait_until([&] { return st->goto_count.load() == 1; }, 5000));
+    REQUIRE(driver->get_slewing());
+    const int cancels_before = st->command_count('M');
+
+    refuse_slot_threads(*driver);
+    CHECK_THROWS_AS(second(*driver), alpacacore::AlpacaException);
+
+    CHECK(st->command_count('M') == cancels_before + 1);  // the GOTO was cancelled
+    CHECK(read_slewing(*driver) == SlewingRead::False);
+    CHECK_FALSE(driver->get_at_park());
+    CHECK_FALSE(driver->get_at_home());
+    driver->set_connected(false);
+}
+
+// A refused start that replaced nothing in the slot must put back every field
+// the initiator's locked block wrote, not only Slewing: a MoveAxis in motion
+// stays reported as Slewing (no stop is sent, so the axis is still driven).
+void refused_start_keeps_move_axis(const std::function<void(alpacacore::TelescopeDriver&)>& second) {
+    alpacacore::test::FakeTaskClock clock;
+    auto st = std::make_shared<FakeCelestronState>();
+    st->clock = &clock;
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope_with_site(
+        0, endpoint(server.port()), std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        alpacacore::vendor::celestron::CelestronAlignmentSetting::Auto, clock);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    driver->move_axis(0, 0.5);
+    REQUIRE(read_slewing(*driver) == SlewingRead::True);
+    const int cancels_before = st->command_count('M');
+    const int passthrough_before = st->command_count('P');
+
+    refuse_slot_threads(*driver);
+    CHECK_THROWS_AS(second(*driver), alpacacore::AlpacaException);
+
+    CHECK(st->command_count('M') == cancels_before);  // nothing in the slot: nothing to cancel
+    CHECK(st->command_count('P') == passthrough_before);
+    CHECK(read_slewing(*driver) == SlewingRead::True);  // axis 0 is still driven
+    driver->set_connected(false);
+}
+
+}  // namespace
+
+TEST_CASE("Celestron slot - a refused goto start keeps a MoveAxis in motion reported",
+          "[celestron][telescope][async][slot]") {
+    refused_start_keeps_move_axis([](alpacacore::TelescopeDriver& d) { d.slew_to_coordinates_async(6.5, 25.0); });
+}
+
+TEST_CASE("Celestron slot - a refused park start keeps a MoveAxis in motion reported",
+          "[celestron][telescope][async][slot]") {
+    refused_start_keeps_move_axis([](alpacacore::TelescopeDriver& d) { d.park(); });
+}
+
+TEST_CASE("Celestron slot - a refused park start keeps AtHome after FindHome", "[celestron][telescope][async][slot]") {
+    alpacacore::test::FakeTaskClock clock;
+    auto st = std::make_shared<FakeCelestronState>();
+    st->clock = &clock;
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope_with_site(
+        0, endpoint(server.port()), std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        alpacacore::vendor::celestron::CelestronAlignmentSetting::Auto, clock);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    driver->find_home();
+    REQUIRE(read_slewing(*driver) == SlewingRead::False);  // the poll completes the homing
+    REQUIRE(driver->get_at_home());
+
+    refuse_slot_threads(*driver);
+    CHECK_THROWS_AS(driver->park(), alpacacore::AlpacaException);
+
+    CHECK(driver->get_at_home());
+    CHECK_FALSE(driver->get_at_park());
+    driver->set_connected(false);
+}
+
+TEST_CASE("Celestron slot - a refused goto start stops the mount when it replaced a goto",
+          "[celestron][telescope][async][slot]") {
+    refused_slot_start_stops_mount([](alpacacore::TelescopeDriver& d) { d.slew_to_coordinates_async(6.5, 25.0); });
+}
+
+TEST_CASE("Celestron slot - a refused park start stops the mount when it replaced a goto",
+          "[celestron][telescope][async][slot]") {
+    refused_slot_start_stops_mount([](alpacacore::TelescopeDriver& d) { d.park(); });
+}
+
+TEST_CASE("Celestron slot - a refused goto start on an idle mount cancels nothing",
+          "[celestron][telescope][async][slot]") {
+    alpacacore::test::FakeTaskClock clock;
+    auto st = std::make_shared<FakeCelestronState>();
+    st->clock = &clock;
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope_with_site(
+        0, endpoint(server.port()), std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        alpacacore::vendor::celestron::CelestronAlignmentSetting::Auto, clock);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    const int cancels_before = st->command_count('M');
+
+    refuse_slot_threads(*driver);
+    CHECK_THROWS_AS(driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0), alpacacore::AlpacaException);
+    CHECK_THROWS_AS(driver->park(), alpacacore::AlpacaException);
+
+    CHECK(st->command_count('M') == cancels_before);  // nothing was in flight: nothing to stop
+    CHECK(st->goto_count.load() == 0);
+    CHECK(read_slewing(*driver) == SlewingRead::False);
+    CHECK_FALSE(driver->get_at_park());
     driver->set_connected(false);
 }
 
 TEST_CASE("Celestron async - MoveAxis owns motion after superseding an async slew",
           "[celestron][telescope][async][ownership]") {
+    alpacacore::test::FakeTaskClock clock;
     auto st = std::make_shared<FakeCelestronState>();
+    st->clock = &clock;
     alpacacore::test::FakeMountServer server(celestron_responder(st));
     REQUIRE(server.ok());
-    auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope_with_site(
+        0, endpoint(server.port()), std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        alpacacore::vendor::celestron::CelestronAlignmentSetting::Auto, clock);
     REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
     driver->set_tracking(true);
 
     const int before = st->goto_count.load();
-    driver->slew_to_coordinates_async(5.5, 20.0);
+    driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0);
     REQUIRE(wait_until([&] { return st->goto_count.load() > before; }, 3000));
     driver->move_axis(0, 0.5);
     const int tracking_writes_after_move = st->command_count('T');
-    std::this_thread::sleep_for(std::chrono::milliseconds(1700));
+    // Virtual time past the superseded slew task's longest wait; a stray tracking write would show.
+    clock.advance(std::chrono::milliseconds(1700));
+    clock.wait_for_woken_settled(std::chrono::seconds(2));
 
     CHECK(st->command_count('T') == tracking_writes_after_move);
     driver->set_connected(false);
@@ -278,20 +469,33 @@ TEST_CASE("Celestron async - MoveAxis owns motion after superseding an async sle
 
 TEST_CASE("Celestron sync - a blocking slew reaps a prior async slew task",
           "[celestron][telescope][async][ownership]") {
+    alpacacore::test::FakeTaskClock clock;
     auto st = std::make_shared<FakeCelestronState>();
+    st->clock = &clock;
     alpacacore::test::FakeMountServer server(celestron_responder(st));
     REQUIRE(server.ok());
-    auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope_with_site(
+        0, endpoint(server.port()), std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        alpacacore::vendor::celestron::CelestronAlignmentSetting::Auto, clock);
     REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
     driver->set_tracking(true);
     const int tracking_writes_before = st->command_count('T');
 
     const int before = st->goto_count.load();
-    driver->slew_to_coordinates_async(5.5, 20.0);
+    driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0);
     REQUIRE(wait_until([&] { return st->goto_count.load() > before; }, 3000));
-    driver->slew_to_coordinates(6.0, 22.0);
+    std::atomic<bool> sync_done{false};
+    std::thread syncer([&] {
+        driver->slew_to_coordinates(6.0, 22.0);
+        sync_done.store(true);
+    });
+    const bool finished = advance_until(clock, [&] { return sync_done.load(); });
+    syncer.join();
+    REQUIRE(finished);
     const int tracking_writes_after_sync = st->command_count('T');
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // Virtual time past any stray tail of the reaped task.
+    clock.advance(std::chrono::milliseconds(200));
+    clock.wait_for_woken_settled(std::chrono::seconds(2));
 
     CHECK(tracking_writes_after_sync == tracking_writes_before + 1);
     CHECK(st->command_count('T') == tracking_writes_after_sync);
@@ -300,10 +504,14 @@ TEST_CASE("Celestron sync - a blocking slew reaps a prior async slew task",
 
 TEST_CASE("Celestron PulseGuide - overlapping axes keep independent pulse chains",
           "[celestron][telescope][pulseguiding][ownership]") {
+    alpacacore::test::FakeTaskClock clock;
     auto st = std::make_shared<FakeCelestronState>();
+    st->clock = &clock;
     alpacacore::test::FakeMountServer server(celestron_responder(st));
     REQUIRE(server.ok());
-    auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope_with_site(
+        0, endpoint(server.port()), std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        alpacacore::vendor::celestron::CelestronAlignmentSetting::Auto, clock);
     REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
     REQUIRE(driver->get_can_pulse_guide());
 
@@ -314,9 +522,11 @@ TEST_CASE("Celestron PulseGuide - overlapping axes keep independent pulse chains
     driver->pulse_guide(2, 8000);  // East: RA chain continues beyond the 2.55 s hardware limit.
     driver->pulse_guide(0, 3500);  // North: must not cancel RA's remaining chunks.
 
-    REQUIRE(wait_until([&] { return st->guide_command_count(0) >= ra_before + 2; }, 4500));
+    REQUIRE(advance_until(
+        clock, [&] { return st->guide_command_count(0) >= ra_before + 2; }, std::chrono::milliseconds(250), 18));
     REQUIRE(st->guide_command_count(1) >= dec_before + 1);
-    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    clock.advance(std::chrono::milliseconds(2500));
+    clock.wait_for_woken_settled(std::chrono::seconds(2));
     CHECK(driver->get_is_pulse_guiding());  // DEC expired; the longer RA pulse is still active.
     CHECK(std::abs(driver->get_right_ascension() - (ra_start + ra_delta)) < 1e-5);
     driver->set_connected(false);
@@ -324,10 +534,14 @@ TEST_CASE("Celestron PulseGuide - overlapping axes keep independent pulse chains
 
 TEST_CASE("Celestron MoveAxis - a jog on one axis preserves the other axis pulse chain",
           "[celestron][telescope][pulseguiding][ownership]") {
+    alpacacore::test::FakeTaskClock clock;
     auto st = std::make_shared<FakeCelestronState>();
+    st->clock = &clock;
     alpacacore::test::FakeMountServer server(celestron_responder(st));
     REQUIRE(server.ok());
-    auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope_with_site(
+        0, endpoint(server.port()), std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        alpacacore::vendor::celestron::CelestronAlignmentSetting::Auto, clock);
     REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
     REQUIRE(driver->get_can_pulse_guide());
 
@@ -335,17 +549,21 @@ TEST_CASE("Celestron MoveAxis - a jog on one axis preserves the other axis pulse
     driver->pulse_guide(2, 6000);  // RA pulse is still chaining after its first hardware chunk.
     driver->move_axis(1, 0.0);     // A Dec-axis stop must not cancel the RA pulse.
 
-    CHECK(wait_until([&] { return st->guide_command_count(0) >= ra_before + 2; }, 4500));
+    CHECK(advance_until(
+        clock, [&] { return st->guide_command_count(0) >= ra_before + 2; }, std::chrono::milliseconds(250), 18));
     driver->set_connected(false);
 }
 
 TEST_CASE("Celestron AbortSlew - stops each active pulse chain before returning",
           "[celestron][telescope][pulseguiding][abort]") {
     for (const int direction : {0, 2}) {
+        alpacacore::test::FakeTaskClock clock;
         auto st = std::make_shared<FakeCelestronState>();
         alpacacore::test::FakeMountServer server(celestron_responder(st));
         REQUIRE(server.ok());
-        auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+        auto driver = alpacacore::vendor::celestron::create_celestron_telescope_with_site(
+            0, endpoint(server.port()), std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+            alpacacore::vendor::celestron::CelestronAlignmentSetting::Auto, clock);
         REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
         REQUIRE(driver->get_can_pulse_guide());
 
@@ -357,7 +575,8 @@ TEST_CASE("Celestron AbortSlew - stops each active pulse chain before returning"
         REQUIRE_NOTHROW(driver->abort_slew());
         const int stopped_count = st->guide_command_count(axis);
         CHECK_FALSE(driver->get_is_pulse_guiding());
-        std::this_thread::sleep_for(std::chrono::milliseconds(2700));
+        clock.advance(std::chrono::milliseconds(2700));
+        CHECK(clock.wait_for_woken_settled(std::chrono::seconds(2)));
         CHECK(st->guide_command_count(axis) == stopped_count);
         driver->set_connected(false);
     }
@@ -366,27 +585,174 @@ TEST_CASE("Celestron AbortSlew - stops each active pulse chain before returning"
 TEST_CASE("Celestron PulseGuide - an expired unpolled opposite-axis pulse does not disable the hold",
           "[celestron][telescope][pulseguiding][ownership]") {
     for (const auto& [first_direction, second_direction, is_ra] : {std::tuple{2, 0, true}, std::tuple{0, 2, false}}) {
+        alpacacore::test::FakeTaskClock clock;
         auto st = std::make_shared<FakeCelestronState>();
         alpacacore::test::FakeMountServer server(celestron_responder(st));
         REQUIRE(server.ok());
-        auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+        auto driver = alpacacore::vendor::celestron::create_celestron_telescope_with_site(
+            0, endpoint(server.port()), std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+            alpacacore::vendor::celestron::CelestronAlignmentSetting::Auto, clock);
         REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
         REQUIRE(driver->get_can_pulse_guide());
 
         driver->pulse_guide(first_direction, 500);
         // Past the 500 ms pulse plus the driver's 1 s completion delay, so the
         // first pulse has expired. Do not poll IsPulseGuiding.
-        std::this_thread::sleep_for(std::chrono::milliseconds(1700));
+        clock.advance(std::chrono::milliseconds(1700));
+        CHECK(clock.wait_for_woken_settled(std::chrono::seconds(2)));
         // The first read after a pulse returns its one-shot readback correction;
         // take it now so `held` below compares hold against hold.
         (void)(is_ra ? driver->get_right_ascension() : driver->get_declination());
         driver->pulse_guide(second_direction, 1500);
         const double held = is_ra ? driver->get_right_ascension() : driver->get_declination();
         st->shifted_position.store(true);
-        std::this_thread::sleep_for(std::chrono::milliseconds(2100));  // Expire the 2 s position cache.
+        clock.advance(std::chrono::milliseconds(2100));  // Expire the 2 s position cache.
+        CHECK(clock.wait_for_woken_settled(std::chrono::seconds(2)));
 
         const double during = is_ra ? driver->get_right_ascension() : driver->get_declination();
         CHECK(std::abs(during - held) < 1e-5);
+        driver->set_connected(false);
+    }
+}
+
+TEST_CASE("Celestron position - stale cache faults after repeated failed polls and recovers",
+          "[celestron][telescope][link]") {
+    alpacacore::test::FakeTaskClock clock;
+    auto st = std::make_shared<FakeCelestronState>();
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope_with_site(
+        0, endpoint(server.port()), std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        alpacacore::vendor::celestron::CelestronAlignmentSetting::Auto, clock);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    const double ra = driver->get_right_ascension();
+    clock.advance(std::chrono::milliseconds(2100));  // expire the 2 s position cache
+    st->mute.store(true);
+
+    std::string last_error;
+    for (int i = 0; i < 3; ++i) {
+        try {
+            (void)driver->get_right_ascension();
+            FAIL("stale position must not be served after a failed mount read");
+        } catch (const alpacacore::AlpacaException& e) {
+            CHECK(e.error_code() == alpacacore::AlpacaError::DriverException);
+            last_error = e.what();
+        }
+    }
+    CHECK(driver->get_connected());
+    CHECK(last_error.find("communications compromised") != std::string::npos);
+    CHECK_FALSE(driver->get_link_fault().empty());  // surfaced to the management listing
+
+    try {
+        (void)driver->get_altitude();
+        FAIL("faulted position cache must force a hardware poll");
+    } catch (const alpacacore::AlpacaException& e) {
+        CHECK(e.error_code() == alpacacore::AlpacaError::DriverException);
+    }
+    st->mute.store(false);
+    CHECK(std::abs(driver->get_right_ascension() - ra) < 1e-6);
+    CHECK(driver->get_link_fault().empty());
+
+    st->mute.store(true);
+    clock.advance(std::chrono::milliseconds(2100));  // expire the recovered position cache
+    try {
+        (void)driver->get_right_ascension();
+        FAIL("an unavailable mount must not return cached coordinates");
+    } catch (const alpacacore::AlpacaException& e) {
+        CHECK(std::string(e.what()).find("communications compromised") == std::string::npos);
+    }
+    st->mute.store(false);
+    driver->set_connected(false);
+}
+
+TEST_CASE("Celestron tracking - mode follows mount geometry and site hemisphere", "[celestron][telescope][tracking]") {
+    struct Expected {
+        unsigned char model_id;
+        unsigned char firmware_major;
+        unsigned char firmware_minor;
+        double latitude;
+        alpacacore::AlignmentMode alignment;
+        unsigned char tracking_mode;
+    };
+    for (const auto& expected : {Expected{24, 5, 35, 41.3, alpacacore::AlignmentMode::GermanPolar, 2},
+                                 Expected{24, 5, 35, -41.3, alpacacore::AlignmentMode::GermanPolar, 3},
+                                 Expected{9, 5, 35, -41.3, alpacacore::AlignmentMode::AltAz, 1},
+                                 Expected{6, 3, 3, 41.3, alpacacore::AlignmentMode::GermanPolar, 1},
+                                 Expected{6, 3, 3, -41.3, alpacacore::AlignmentMode::GermanPolar, 2}}) {
+        auto st = std::make_shared<FakeCelestronState>();
+        st->model_id.store(expected.model_id);
+        st->firmware_major.store(expected.firmware_major);
+        st->firmware_minor.store(expected.firmware_minor);
+        alpacacore::test::FakeMountServer server(celestron_responder(st));
+        REQUIRE(server.ok());
+        auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+        REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+        driver->set_site_latitude(expected.latitude);
+        driver->set_site_longitude(174.8);
+        CHECK(driver->get_alignment_mode() == expected.alignment);
+        driver->set_tracking(true);
+
+        const auto commands = [&] {
+            std::lock_guard<std::mutex> lock(st->command_mutex);
+            return st->commands;
+        }();
+        const auto tracking = std::find_if(commands.rbegin(), commands.rend(), [](const std::string& command) {
+            return command.size() >= 2 && command[0] == 'T';
+        });
+        REQUIRE(tracking != commands.rend());
+        CHECK(static_cast<unsigned char>((*tracking)[1]) == expected.tracking_mode);
+        driver->set_connected(false);
+    }
+
+    auto st = std::make_shared<FakeCelestronState>();
+    st->model_id.store(0xff);  // unknown model has no trustworthy alignment-mode mapping
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    CHECK_THROWS_AS(driver->get_alignment_mode(), alpacacore::AlpacaException);
+    CHECK_THROWS_AS(driver->set_tracking(true), alpacacore::AlpacaException);
+    driver->set_connected(false);
+}
+
+TEST_CASE("Celestron tracking - a configured alignment mode overrides the nominal fork geometry (#860)",
+          "[celestron][telescope][tracking]") {
+    using alpacacore::vendor::celestron::CelestronAlignmentSetting;
+    struct Expected {
+        unsigned char model_id;
+        CelestronAlignmentSetting setting;
+        double latitude;
+        alpacacore::AlignmentMode alignment;
+        unsigned char tracking_mode;
+    };
+    // 9 = CPC and 22 = NexStar Evolution (forks); 24 = CGX-L (German equatorial).
+    for (const auto& expected :
+         {Expected{9, CelestronAlignmentSetting::Equatorial, 41.3, alpacacore::AlignmentMode::Polar, 2},
+          Expected{22, CelestronAlignmentSetting::Equatorial, -41.3, alpacacore::AlignmentMode::Polar, 3},
+          Expected{9, CelestronAlignmentSetting::AltAz, 41.3, alpacacore::AlignmentMode::AltAz, 1},
+          Expected{9, CelestronAlignmentSetting::Auto, 41.3, alpacacore::AlignmentMode::AltAz, 1},
+          Expected{24, CelestronAlignmentSetting::AltAz, 41.3, alpacacore::AlignmentMode::GermanPolar, 2}}) {
+        auto st = std::make_shared<FakeCelestronState>();
+        st->model_id.store(expected.model_id);
+        alpacacore::test::FakeMountServer server(celestron_responder(st));
+        REQUIRE(server.ok());
+        auto driver = alpacacore::vendor::celestron::create_celestron_telescope_with_site(
+            0, endpoint(server.port()), std::nullopt, std::nullopt, std::nullopt, std::nullopt, expected.setting);
+        REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+        driver->set_site_latitude(expected.latitude);
+        driver->set_site_longitude(174.8);
+        CHECK(driver->get_alignment_mode() == expected.alignment);
+        driver->set_tracking(true);
+
+        const auto commands = [&] {
+            std::lock_guard<std::mutex> lock(st->command_mutex);
+            return st->commands;
+        }();
+        const auto tracking = std::find_if(commands.rbegin(), commands.rend(), [](const std::string& command) {
+            return command.size() >= 2 && command[0] == 'T';
+        });
+        REQUIRE(tracking != commands.rend());
+        CHECK(static_cast<unsigned char>((*tracking)[1]) == expected.tracking_mode);
         driver->set_connected(false);
     }
 }
@@ -406,10 +772,10 @@ TEST_CASE("Celestron PulseGuide - an operation that reaps the pulse clears IsPul
         REQUIRE(driver->get_is_pulse_guiding());
         switch (op) {
             case Op::SlewToCoordinates:
-                driver->slew_to_coordinates(5.5, 20.0);
+                driver->slew_to_coordinates(no_flip_ra_hours(), 20.0);
                 break;
             case Op::SlewToCoordinatesAsync:
-                driver->slew_to_coordinates_async(5.5, 20.0);
+                driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0);
                 break;
             case Op::FindHome:
                 driver->find_home();
@@ -422,6 +788,59 @@ TEST_CASE("Celestron PulseGuide - an operation that reaps the pulse clears IsPul
         CHECK_FALSE(driver->get_is_pulse_guiding());
         driver->set_connected(false);
     }
+}
+
+// A reaper cancels the parked task and wakes it. A task that has checked its
+// stop reason but not yet blocked must not miss that, or it sleeps until the
+// next advance() and holds up the reaper's join. The pulse body waits through
+// the AsyncOperation slot, which checks and blocks under the slot mutex that
+// cancel() takes. FakeTaskClock's before_block hook holds the first parked
+// task in exactly that window while the reaper runs (same shape as the
+// Sky-Watcher case, #743).
+TEST_CASE("Celestron async - a reaper's cancel is not lost between a parked task's check and its block",
+          "[celestron][telescope][async][pulseguiding]") {
+    std::atomic<bool> at_window{false};
+    std::atomic<int> fired{0};
+    alpacacore::test::FakeTaskClock clock;
+    auto st = std::make_shared<FakeCelestronState>();
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope_with_site(
+        0, endpoint(server.port()), std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        alpacacore::vendor::celestron::CelestronAlignmentSetting::Auto, clock);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    // Nothing is parked on the clock yet, so the pulse task below is the first thread at the hook.
+    REQUIRE(clock.waiter_count() == 0);
+    clock.set_before_block([&](const std::function<bool()>& pred) {
+        if (fired.fetch_add(1) == 0) {
+            at_window.store(true);
+            // The slot runs the predicate and the block under its one mutex,
+            // so the reaper's cancel cannot reach the body until it blocks:
+            // hold the task in the window for a moment of real time.
+            const auto give_up = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+            while (!pred() && std::chrono::steady_clock::now() < give_up) {
+                std::this_thread::yield();
+            }
+        }
+    });
+    driver->pulse_guide(0, 4000);  // North: longer than one 2.55 s chunk, so a chained task parks on the clock
+    REQUIRE(wait_until([&] { return at_window.load(); }, 3000));
+
+    // The superseding pulse reaps the parked one: cancel, notify, join.
+    std::atomic<bool> reaped{false};
+    std::thread reaper([&] {
+        driver->pulse_guide(0, 300);
+        reaped.store(true);
+    });
+    CHECK(wait_until([&] { return reaped.load(); }, 2000));
+
+    // Whatever happened, reaching the timer's deadline wakes it, so the case ends instead of hanging in a join.
+    clock.advance(std::chrono::seconds(5));
+    reaper.join();
+    driver->set_connected(false);
+    driver.reset();
+    clock.set_before_block(nullptr);
 }
 
 #endif  // _WIN32

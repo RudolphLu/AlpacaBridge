@@ -54,6 +54,7 @@ if(ALPACACORE_ENABLE_ZWO)
 
     set(ZWO_SOURCES
         zwo_sdk_wrapper.cpp
+        zwo_camera_identity.cpp
         zwo_camera_driver.cpp
         zwo_switch_driver.cpp
         zwo_asiair_protocol_wrapper.cpp
@@ -68,6 +69,7 @@ if(ALPACACORE_ENABLE_ZWO)
         zwo_rotator_driver.cpp
         zwo_mount_protocol_wrapper.cpp
         zwo_telescope_driver.cpp
+        zwo_catalog.cpp
     )
 
     add_library(alpacacore_zwo STATIC ${ZWO_SOURCES})

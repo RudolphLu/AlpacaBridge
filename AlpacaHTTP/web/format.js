@@ -434,11 +434,37 @@ function asiairDuplicateGpioError(gpios) {
     return null;
 }
 
+// The alignmentMode values the SynScan and Celestron drivers accept (#860);
+// anything else reads as 'auto', as the server's sanitize drops it.
+function normalizeAlignmentMode(value) {
+    return value === 'altaz' || value === 'equatorial' ? value : 'auto';
+}
+
+// Status dot for a configureddevices row: green = driver loaded and a client
+// Connected, yellow = loaded and idle (no client connected; the hardware is not
+// probed until a connect), red = LoadError, LastConnectError, a LinkFault
+// (connected or not), or Connected missing/non-boolean (unavailable).
+// Green means a client is connected AND the device still replies, so any latched
+// LinkFault turns the device red. Each red reason carries its own label, and the
+// red text joins every reason.
+function deviceStatus(device) {
+    const d = device || {};
+    const reasons = [];
+    if (d.LoadError === true) reasons.push('Driver failed to load, see the server log');
+    if (d.LastConnectError) reasons.push('Last connect failed: ' + String(d.LastConnectError));
+    if (d.LinkFault) reasons.push('Device not responding: ' + String(d.LinkFault));
+    if (reasons.length > 0) return { state: 'error', text: reasons.join('; ') };
+    if (d.Connected === true) return { state: 'connected', text: 'Client connected' };
+    if (d.Connected === false) return { state: 'idle', text: 'Idle, no client connected' };
+    return { state: 'error', text: 'Status unavailable' };
+}
+
 // Browsers ignore this; `node --test` uses it. Guarded rather than a real
 // module so index.html can keep loading the file with a plain <script> tag.
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = { isValidClockSeconds, serverClockError, localZoneLabel, formatServerClock, buildBadgeLabel,
                        updateStatusText, installerStateText, renderReleaseNotes,
                         HOST_CHECK_ALWAYS_ALLOWED, hostCheckSettings, settingsSaveError,
-                        wifiSsidKey, wifiSsidLabel, asiairDuplicateGpioError };
+                        wifiSsidKey, wifiSsidLabel, asiairDuplicateGpioError,
+                        normalizeAlignmentMode, deviceStatus };
 }

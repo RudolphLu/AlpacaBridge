@@ -22,10 +22,10 @@ Protocol documentation: `AlpacaCore/external/SynScan/SkyWatcher_Motor_Controller
 
 Connection types: Serial (the mount's own USB port or an EQDIR-class adapter, 8N1; the scan probes
 9600 then 115200 per port, because an EQ board's built-in PL2303 port answers only at 115200,
-so a silent Prolific/FTDI/CH340-class port costs at least about 3.3 s per scan: 1.5 s at 9600, the
-300 ms SynScan echo guard, 1.5 s at 115200, and up to roughly 4.4 s because the read loops only
-check their deadline between `VTIME` reads; multiplied by every such adapter on the rig; #403
-records the measurement) and Network (built-in Wi-Fi module,
+so a silent Prolific/FTDI/CH340-class port costs about 3.3 s per scan: 1.5 s at 9600, the
+300 ms SynScan echo guard, 1.5 s at 115200, each read bounded by `poll(POLLIN)` against its
+deadline so a port that ignores `VTIME` cannot stretch it; multiplied by every such adapter on the
+rig; #403 records the measurement) and Network (built-in Wi-Fi module,
 **UDP** port 11880 — one command per datagram, one reply per datagram; AP-mode address
 192.168.4.1). The wrapper retransmits up to 3 times on UDP timeout and drains stale
 datagrams before each send so replies cannot get off-by-one.
@@ -126,7 +126,14 @@ datagrams before each send so replies cannot get off-by-one.
   classic Synta boards (EQ6, HEQ5, AZ-EQ6, EQ5 Pro) are all still unmeasured (#579).
   The Wave 150i and the EQ-AL55i Pro south of the equator follow from geometry and have
   not been measured; a board measured only in the north constrains nothing there, because
-  `s * eps = +1` in the north is also the unmeasured default. Pier side is
+  `s * eps = +1` (`k = +1`, so eps +1 in the north and -1 in the south) is also the unmeasured default. A per-device
+  `decAxisSense` setting (`auto` default, `normal` = eps +1, `reversed` = eps -1;
+  open-astro#582) overrides the table on connect and when `:e` fails; it sets eps,
+  never k, and the connect log names the source (measured table / user override /
+  unmeasured default / identify failed). The web UI shows the same source in the
+  device name (`eps: measured`, `eps: override normal|reversed`,
+  `eps: unmeasured default`, `eps: identify failed`), kept after a disconnect like the
+  model, and the Sky-Watcher form has a Dec axis sense select. Pier side is
   `k * branch > 0` -> pierEast, the same reader, since the goto picks the side from the
   sky hour angle; the Dec rate and guide signs read `branch` alone, because dec does not
   involve `eps`.
@@ -141,8 +148,8 @@ datagrams before each send so replies cannot get off-by-one.
   axis positions and reading the tube's real direction off the mount (2026-09-12); those
   rows are in the driver comment and asserted in `test_skywatcher_pointing.cpp`. Extend
   that file with a new hardware row for any change here.
-- **Motion limits (#436) are off by default and soft.** `minAltitudeDeg` and `meridianLimitMinutes` live in the catalog descriptor (`skywatcher_fields.h`); `util::MotionLimits` (`util/motion_limits.h`) is the pure decision. Only `SlewToCoordinates[Async]` (and so `SlewToTarget[Async]`) check the altitude floor, throwing `InvalidValue`; Park, FindHome, MoveAxis, Sync and PulseGuide are exempt. ConformU runs with both limits off.
-- A blocking `SlewToCoordinates` superseded by another generation-changing motion can throw `InvalidOperation` while the hardware GOTO continues to its target. The error reports that the synchronous wait lost ownership; it does not prove the mount stopped. Clients must not treat it as an abort confirmation.
+- **Motion limits (#436) are off by default and soft.** `minAltitudeDeg` and `meridianLimitMinutes` live in the catalog descriptor (`skywatcher_fields.h`); `util::MotionLimits` (`util/motion_limits.h`) is the pure decision. Only `SlewToCoordinatesAsync` (and so `SlewToTargetAsync`; the router refuses the synchronous forms with `MethodNotImplemented`) check the altitude floor, throwing `InvalidValue`; Park, FindHome, MoveAxis, Sync and PulseGuide are exempt from that check. The live guard (`run_limit_guard()`, its own `util::AsyncOperation` slot) watches MoveAxis and tracking while a limit is set and stops them on an inside-to-outside crossing through `set_tracking(false)` and `move_axis(axis, 0.0)` with `mutex_` released; it is edge-triggered, skips gotos, Park and FindHome, and `cancel_async_tasks()` joins it first. ConformU runs with both limits off.
+- The driver's blocking `slew_to_coordinates()` is not reachable over HTTP (the router refuses the synchronous slews with `MethodNotImplemented`). Called directly, one superseded by another generation-changing motion can throw `InvalidOperation` while the hardware GOTO continues to its target; the error reports that the synchronous wait lost ownership and does not prove the mount stopped.
 - **Sync** uses the controller's own `:E` set-position command (motors must be fully
   stopped — the driver pauses tracking around the write), never a driver-side offset.
 - **Pulse guiding**: RA pulses while tracking are done by changing the RA step period
@@ -169,11 +176,15 @@ datagrams before each send so replies cannot get off-by-one.
   pulse task (the window is deducted from the pulse; shorter pulses rely on the kick alone,
   or on 0x09 on the bare `:I`);
   the `RightAscensionRate`/`TrackingRate` setters cannot wait 450 ms inside a property call,
-  so they spawn a one-shot background task (`rate_verify_thread_`, open-astro #248). That
-  task never takes `mutex_`, which is what lets every RA-taking path reap it WITH `mutex_`
-  held (setters, Tracking off, `stop_axis_and_wait_locked`, pulse dispatch, AbortSlew,
-  disconnect) — a lock-free reap would leave a window for a setter to spawn one between an
-  initiator's reap and its lock, and the resend would land mid-pulse or on a stopped axis.
+  so they start a one-shot body on the `rate_verify_` slot (open-astro #248). Every RA-taking
+  path ends it WITH `mutex_` held through `cancel_rate_verify_locked()` (setters, Tracking
+  off, `stop_axis_and_wait_locked`, pulse dispatch, AbortSlew; disconnect cancels and joins
+  the slot): `cancel()` never joins, so the body takes `mutex_` for its resend and sends
+  it only while the epoch it was started with (`rate_verify_epoch_`, bumped under `mutex_`
+  by every start and cancel) still matches. A cancel landing between the body's last wait
+  and its resend therefore cannot put `:I`+`:J` into an axis a pulse or a stop now owns.
+  The pulse body's own post-dispatch and post-restore checks resend the same way, gated on
+  its slot context.
 - **EQ-AL55i Pro motor-board firmware release notes** (Sky-Watcher's own changelog, copied
   verbatim; append each new version here). Both versions on record ran on the same mount.
   3.48 lists no motor-control change, so motor behaviour measured on either version is
@@ -272,15 +283,52 @@ datagrams before each send so replies cannot get off-by-one.
   asks the board on every poll (`get_hardware_slewing_locked(false)`) instead of waiting out
   an 8 s window, so a short goto lands when the board stops. The one window left is
   `SlewToCoordinatesAsync`'s, covering only the gap before its task sets `goto_in_progress_`;
-  every exit of that task clears it, the early return of a reaped task included.
+  every exit of that body clears it, the early return of a cancelled body included (a
+  superseded body leaves it to the operation that replaced it).
 - **Reap the pulse task at every motion boundary** (slews, park, home,
-  moveaxis, sync, abort): ConformU's dual-axis pulse test leaves a live pulse
+  sync, abort): ConformU's dual-axis pulse test leaves a live pulse
   timer that otherwise fires its stop/step-period restore into the middle of
   the next goto. A CANCELLED pulse task must not touch the hardware -- the
-  canceller stops or re-commands the axes itself.
-- **AbortSlew must cancel the async slew task** (set `slew_task_cancel_`,
-  join later via reap) or the landing refinement re-slews after the abort;
-  every slew entry point reaps first, which also resets the flag.
+  canceller stops or re-commands the axes itself, so a path that commands one
+  axis reaps only that axis's pulse (PulseGuide #620, MoveAxis #630; a no-op
+  `MoveAxis(axis, 0)` reaps none) and sync stops both axes before `:E`.
+  Gate before reaping: a refused slew, MoveAxis or sync cancels nothing.
+- **AbortSlew must cancel the async slew body** (`slew_.cancel()`; the slot joins
+  it when the next body starts or on disconnect) or the landing refinement
+  re-slews after the abort. A cancelled body (AbortSlew, Unpark, disconnect)
+  stops the axes if it may have dispatched; a superseded one never touches them.
+- **Slew, goto, Park and FindHome bodies run in one `util::AsyncOperation` slot
+  (`slew_`); each axis's `MoveAxis(axis, 0)` stop-completion body has its own
+  (`stop_ops_[axis]`) with its own `OperationGeneration`** (decision 0006). Rules:
+  - A start does not wait for the body it replaces, so every initiator CLAIMS the
+    slot under `mutex_` first (`claim_slew_slot_locked()`: bump the slot generation
+    and `motion_generation_`, clear `parking_`/`homing_`), then sets its flags, then
+    calls `start_slew_body()` WITHOUT `mutex_`. A replaced body is Superseded: it
+    checks `owns_slew_state_locked(ctx)` under `mutex_` before touching a flag or
+    the axes. `MoveAxis` bumps `stop_generation_[axis]` under `mutex_` the same way.
+  - The four goto initiators (`SlewToCoordinates[Async]`, `SlewToTarget[Async]`)
+    share one start path, `start_goto()`, which is also where the #436 altitude
+    check runs; Park and FindHome claim the slot themselves and are exempt.
+  - A stop on one axis must not supersede the other axis's stop body, hence one
+    generation per axis (the same-axis refinement near the stop body's tail stays
+    on `motion_generation_`). Test: `SkyWatcher slot - a stop on one axis does not
+    supersede the other axis's stop body`.
+  - Waits inside a body go through `BodyScope`'s thread-local context
+    (`body_sleep()`, `body_stopped()`), so the helpers shared with the synchronous
+    `SlewToCoordinates` (which has no body) behave the same on both.
+  - `last_slew_error_` stays a driver member, not the slot's `last_failure()`:
+    AbortSlew, MoveAxis and a reconnect must clear it without starting a body. A
+    Park or FindHome failure is only logged (open-astro#631).
+  - No body calls `start()` or `cancel_all_and_join()` on its own slot (a park
+    tail that "restarts tracking" through a slot call would join itself or wait out
+    `kStaleReapTimeout`); use `cancel()` or `ctx.stop_reason()`. `start()` and
+    `cancel_all_and_join()` run without `mutex_`; `cancel()` may run with it.
+  - `start()` raises `AlpacaException` when the stale bound does not clear
+    (`InvalidOperation`) or the OS refuses a thread (`DriverException`); both change
+    nothing in the slot, and the initiator rolls its published flags back. When the claim had replaced a
+    body in flight, that body skips its stop, so the refusal also stops both axes
+    and publishes the AbortSlew state (`tracking_` and the tracking restore
+    cleared); a refusal that replaced nothing cancels nothing.
 - Debug technique: a watchdog loop that `pkill`s ConformU at the FIRST logged
   issue preserves the exact journal window and stops the mount from grinding
   through a failed run.
@@ -315,7 +363,12 @@ datagrams before each send so replies cannot get off-by-one.
   deliberate exception to the shared "always `clear_nonblocking`" serial rule in `AGENTS.md`;
   do not revert it. Regression tests (`test_skywatcher_serial.cpp`): a muted board times out
   within the command budget (catches a revert of the read `poll()`), and a write seam that
-  reports `EAGAIN` is waited out (catches a revert of the bounded write).
+  reports `EAGAIN` is waited out (catches a revert of the bounded write). The auto-detect
+  probe follows the same rule: `probe_skywatcher_port` and the SynScan echo guard it runs at
+  115200 (`util::exchange_synscan_echo_on_fd`) keep a non-blocking fd and gate each read on
+  `poll(POLLIN)`; the `[skywatcher][serial][probe]` cases whose fake board forces
+  `VMIN=1`/`VTIME=0` (`set_reads_ignore_vtime`) fail when either goes back to the old
+  VTIME-only read loop.
 - **Disconnect all stray Alpaca clients before a ConformU run**: the per-client Connected
   registry keeps the device physically connected for other ClientIDs, so leftover test
   sessions carry state (targets, tracking) into ConformU's "first time use" checks.
@@ -473,8 +526,9 @@ below was one of them.
   check had no window left to close. The real window is the one the hardware showed -- `:f`
   clearing while the last counts still arrive -- and it needed its own seam (`land_short_by()`:
   report the landing stopped N counts short, then creep the remainder in). Goto counts could not
-  be the signal either (`refine_goto_landing()` burns all three iterations on this fake whether or
-  not a landing coasts), nor wall-clock timing (the tracking restore sits between the landing
+  be the signal either (when this case was written, `refine_goto_landing()` burned all three
+  iterations on this fake whether or not a landing coasted; since #1019 a plain landing takes one
+  goto and a coasting one four, but the WARN stays the sharper signal), nor wall-clock timing (the tracking restore sits between the landing
   and `Slewing` clearing, as the 3 s `slew_force_until_` window also did before #715). What works: coast for
   longer than `kLandingSettleTimeout` and assert the check's own give-up WARN, a string nothing
   else emits. **Rule:** before claiming a change is covered, delete it and run the suite; if it
@@ -602,9 +656,9 @@ then drifts at 1.0x sidereal — the signature of a stationary mount — instead
 This is the dangerous shape: a sequencer that waits for `Slewing` to clear before
 exposing hangs forever, and one that does not wait images on an untracked mount.
 
-**Mechanism.** `move_axis()` uses a SINGLE shared `stop_task_thread_` for both axes.
-When a new stop supersedes a pending one, the old task is cancelled
-(`stop_task_cancel_.store(true)`) and returns early from `task_wait_for()` — before
+**Mechanism.** (As the code stood then.) `move_axis()` used a SINGLE shared stop thread
+for both axes. When a new stop superseded a pending one, the old task was cancelled
+and returned early from its wait — before
 reaching `manual_axis_slewing_[axis] = false` and the restore-tracking tail. Its axis's
 flag is stranded set, and `get_hardware_slewing_locked()` returns true forever because
 it ORs both `manual_axis_slewing_` entries.
@@ -618,9 +672,9 @@ reproduced it reliably.
 flag and restores tracking, because a stop on an axis whose flag is set spawns a fresh
 task that runs to completion.
 
-**Fix (done).** `stop_task_thread_` and `stop_task_cancel_` are now per-axis arrays;
-`reap_stop_task(axis)` and the spawn/retry-join block only ever race with a prior task
-for the SAME axis. A new loopback regression reproduces the exact scenario (RA stop
+**Fix (done).** The stop task became per-axis, and is now one `util::AsyncOperation`
+slot per axis (`stop_ops_[axis]`, each with its own generation), so a start only ever
+replaces a prior body for the SAME axis. A new loopback regression reproduces the exact scenario (RA stop
 dispatched, Dec stop dispatched while RA's stop task is still mid-ramp) and asserts
 `Slewing` clears promptly. The generation guard
 (`motion_generation_ == stop_task_generation`) is unchanged and still gates the
@@ -646,8 +700,8 @@ command on EITHER axis (see its declaration: "bumped by every motion command"). 
 stop dispatched while RA's stop task is polling bumps the shared counter for a reason
 that has nothing to do with RA, so the RA task's tail reads a mismatch and silently
 skips restoring RA's tracking — even though nothing actually superseded the RA stop
-itself (which is correctly detected via the now-per-axis `stop_task_cancel_[0]`, a
-separate and correctly-scoped check).
+itself (which is correctly detected by the axis's own stop slot, a separate and
+correctly-scoped check).
 
 The codebase already has the right idiom for this elsewhere: the duty-cycle worker
 (`apply_ra_drive_locked`'s burst path, guarding sub-floor rate duty-cycling) computes a
@@ -708,7 +762,7 @@ two, so every existing caller is unchanged. `set_site_latitude()` decides each h
 separately: re-apply the RA drive unless RA is busy, re-apply the Dec offset unless Dec
 is busy, and skip entirely only when both are. A sub-floor RA rate is pre-armed into
 `ra_duty_rate_deg_s_` when RA is busy, the way `set_right_ascension_rate()`'s busy branch
-already does, because the duty worker resumes from that stored rate and no restore path
+already does, because the duty body resumes from that stored rate and no restore path
 re-derives it. Two loopback regressions (`test_skywatcher_async.cpp`) drive the
 declination-pulse and declination-`MoveAxis` variants and were confirmed to fail on the
 pre-fix setter with the RA axis still counting the old way.
@@ -911,3 +965,4 @@ probes link health first. The late-loss branch needs a deterministic probe seam 
 outstanding fake-board task; assert that the old task never sends commands to the new link.
 Zero-byte reads are not themselves proof of removal; back off within the response deadline
 so a hung-up-but-present tty cannot busy-spin, while retaining the quiet-board timeout policy.
+- **The session open claims the tty with `TIOCEXCL` and re-applies the termios settings after every silent timeout** (#912): an outside open (a GPS probe at 9600) reprograms the shared line, and without the re-apply the latched link fault never cleared. `disconnect_locked()` issues `TIOCNXCL` explicitly, because the flag survives our close while any other fd holds the tty open. The echo-guard/probe opens are short-lived and do not claim.

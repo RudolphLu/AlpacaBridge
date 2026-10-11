@@ -129,7 +129,7 @@ This keeps Alpaca timestamps correct even with no NTP reachable. The hardware RT
 
 **It will never fire on a mount that is only tracking or guiding.** The watchdog arms only while `Slewing` is true (a goto/park/home/MoveAxis in progress); ordinary sidereal tracking and `PulseGuide` never set `Slewing`, so a quietly tracking mount with a disconnected client is left alone.
 
-**Any request to the device resets the timer**, including a client's own routine `Slewing` polls — normal NINA/PHD2/ConformU polling (every few seconds) never comes close to the limit. A synchronous request (a plain, non-async `SlewToCoordinates`) that itself blocks past the limit is also covered: it counts as activity for its whole duration, not just when it started, so a long deliberate goto does not get aborted out from under the very client that is waiting on it. A genuine trip means requests really did stop arriving for that long — which also means a request from any OTHER client still addressing the same telescope (a planetarium app polling position, say) keeps the watchdog disarmed even after the client that started the motion has gone away.
+**Any request to the device resets the timer**, including a client's own routine `Slewing` polls — normal NINA/PHD2/ConformU polling (every few seconds) never comes close to the limit. Any request that itself blocks past the limit is also covered: it counts as activity for its whole duration, not just when it started, so a long call does not get aborted out from under the client that is waiting on it. (The synchronous slews `SlewToCoordinates`, `SlewToTarget` and `SlewToAltAz` are refused with `MethodNotImplemented`; use the `...Async` forms, which return at once and are watched through `Slewing`.) A genuine trip means requests really did stop arriving for that long — which also means a request from any OTHER client still addressing the same telescope (a planetarium app polling position, say) keeps the watchdog disarmed even after the client that started the motion has gone away.
 
 **To change the limit or turn it off**: set `motion_watchdog_seconds` under `server:` in the server config file (default 30; 0 disables it). A slower-polling client may want a longer value; disabling it removes this backstop entirely, so only do that if you have another way to guarantee a hung client's slew gets stopped.
 
@@ -152,6 +152,25 @@ The value is read once at start, so apply it with `sudo systemctl restart alpaca
 [Service]
 Environment=ALPACAHTTP_MOTION_WATCHDOG_SECONDS=0
 ```
+
+### A Sky-Watcher direct mount points 12 hours out in hour angle (Dec axis sense)
+
+**Symptom**: after a goto, the Sky-Watcher direct (motor controller) mount ends up with the telescope on the wrong side of the sky, and the pier side and the real direction disagree by 12 hours of hour angle.
+
+**Cause**: the driver knows the direction of the Dec axis counts (`eps`) only for boards that were measured: EQ-AL55i Pro (mount code `0x09`), EQM-35 Pro (`0x32`) and Wave 150i (`0x45`). Any other board keeps the shipped model `k = +1` (the home term sign, `eps` times the hemisphere sign), which is `eps = +1` in the north and `eps = -1` in the south, and is wrong for a board wired the other way (issue #582, #579). The connect log says where `eps` came from: `from the measured table`, `from the user override`, `from the unmeasured-board default`, or `Motor board not identified`.
+
+**Fix**: set **Dec axis sense** (`decAxisSense` in the device config) from one reading on your own mount. With the mount bare (no telescope), at its home position and tracking off, send a Dec-only `MoveAxis` until the Dec axis has turned about +90 degrees (`a2 = +90`), keeping the RA axis at home. Then look at which way the dovetail points:
+
+| Dovetail points | Your site | Dec axis sense |
+| --- | --- | --- |
+| West | Northern hemisphere | `normal` |
+| East | Northern hemisphere | `reversed` |
+| West | Southern hemisphere | `reversed` |
+| East | Southern hemisphere | `normal` |
+
+`auto` (the default) keeps the measured table, and `k = +1` (eps +1 north, -1 south) for a board that is not in it. `normal` and `reversed` set `eps` only, never the hemisphere term, so a mount you move to the other hemisphere stays right without a change. The setting is used on connect, also when the board does not identify itself, and the device name in the web UI shows where `eps` came from (`eps: measured`, `eps: override normal`, `eps: override reversed`, `eps: unmeasured default` or `eps: identify failed`). Pick the value in the Dec axis sense list of the Sky-Watcher form; saving the form keeps it. An override that disagrees with a measured board logs a WARN and is used anyway.
+
+If you set it, please post your reading (mount code from the connect log, dovetail side, latitude) on issue #579 so the board can join the measured table.
 
 ## Clean build
 

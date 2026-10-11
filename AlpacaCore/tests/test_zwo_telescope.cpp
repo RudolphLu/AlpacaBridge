@@ -452,4 +452,86 @@ TEST_CASE(
     CHECK(alpacacore::test::settle_connected(*driver, false));
 }
 
+TEST_CASE("ZWO Telescope Driver - MoveAxis stop on one axis leaves the other axis moving",
+          "[zwo][telescope][unit][moveaxis]") {
+    // Thread-safe counters: the fake answers on its own thread.
+    struct Counts {
+        std::atomic<int> stop_all{0};
+        std::atomic<int> stop_ew{0};
+        std::atomic<int> stop_ns{0};
+        std::atomic<int> tracking_on{0};
+        std::atomic<bool> tracking{true};
+    };
+    for (const int stopped_axis : {0, 1}) {
+        auto counts = std::make_shared<Counts>();
+        alpacacore::test::FakeMountServer server([counts](const std::string& chunk) -> std::string {
+            const auto count = [&chunk](const std::string& command) {
+                int n = 0;
+                for (auto p = chunk.find(command); p != std::string::npos;
+                     p = chunk.find(command, p + command.size())) {
+                    ++n;
+                }
+                return n;
+            };
+            counts->stop_all += count(":Q#");
+            counts->stop_ew += count(":Qe#") + count(":Qw#");
+            counts->stop_ns += count(":Qn#") + count(":Qs#");
+            counts->tracking_on += count(":Te");
+            // Like the mount: a jog drops tracking, ":Te" brings it back.
+            if (chunk.find(":Me") != std::string::npos || chunk.find(":Mw") != std::string::npos ||
+                chunk.find(":Mn") != std::string::npos || chunk.find(":Ms") != std::string::npos) {
+                counts->tracking = false;
+            }
+            if (chunk.find(":Te") != std::string::npos) {
+                counts->tracking = true;
+            }
+            if (chunk.find(":SMTI") != std::string::npos) {
+                return "1";
+            }
+            if (chunk.find(":GAT") != std::string::npos) {
+                return counts->tracking.load() ? "1#" : "0#";
+            }
+            // :GU carries the "n" (not tracking) flag the cache refresh reads.
+            if (chunk.find(":GU") != std::string::npos) {
+                return counts->tracking.load() ? "0#" : "n#";
+            }
+            return "0#";
+        });
+        REQUIRE(server.ok());
+        alpacacore::vendor::zwo::ConnectionInfo conn;
+        conn.type = alpacacore::vendor::zwo::ConnectionType::Network;
+        conn.host = "127.0.0.1";
+        conn.tcp_port = server.port();
+        conn.response_timeout_ms = 250;
+        auto driver = alpacacore::vendor::zwo::create_zwo_telescope(0, conn);
+        REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(5)));
+
+        driver->move_axis(0, 1.0);
+        driver->move_axis(1, 1.0);
+        REQUIRE(driver->get_slewing());
+        // Outlast the driver's 2 s fast-tracking cache so the restore asks the
+        // mount (tracking now off) instead of returning early.
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+
+        const int tracking_on_before_stop = counts->tracking_on.load();
+        driver->move_axis(stopped_axis, 0.0);
+        // Let the fake see the blind command before counting.
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        CHECK(counts->stop_all.load() == 0);
+        CHECK((stopped_axis == 0 ? counts->stop_ew : counts->stop_ns).load() > 0);
+        CHECK((stopped_axis == 0 ? counts->stop_ns : counts->stop_ew).load() == 0);
+        CHECK(driver->get_slewing());
+        // The other axis still jogs: the saved tracking state is handed to it,
+        // not restored yet.
+        CHECK(counts->tracking_on.load() == tracking_on_before_stop);
+
+        driver->move_axis(1 - stopped_axis, 0.0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        CHECK(counts->tracking_on.load() > tracking_on_before_stop);
+        // The other axis is idle now, so the generic stop is sent.
+        CHECK(counts->stop_all.load() > 0);
+        CHECK(alpacacore::test::settle_connected(*driver, false));
+    }
+}
+
 #endif  // _WIN32

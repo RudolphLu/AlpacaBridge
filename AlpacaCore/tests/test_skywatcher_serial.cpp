@@ -23,12 +23,14 @@
 #include <alpacacore/util/serial_port_registry.h>
 #include <alpacacore/vendor/skywatcher/skywatcher_protocol_wrapper.h>
 #include <alpacacore/vendor/skywatcher/skywatcher_telescope_driver.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <chrono>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -331,6 +333,66 @@ TEST_CASE("SkyWatcher serial - the dual-baud probe finds a Synta EQ board at 115
     }
 }
 
+TEST_CASE("SkyWatcher serial - the probe gives up within its budget when reads ignore VTIME",
+          "[skywatcher][serial][probe]") {
+    // #836 bounded the connected link's reads with poll() because some USB
+    // CDC-ACM ports ignore VMIN/VTIME and a bare read() then parks forever.
+    // The ":e1" probe must hold its 1500 ms budget on such a port too: a
+    // silent candidate must not hang the auto-detect scan.
+    FakeSkyWatcherSerialBoard board;
+    board.set_muted(true);
+    board.set_reads_ignore_vtime(true);
+
+    std::promise<std::string> result;
+    auto done = result.get_future();
+    const auto start = std::chrono::steady_clock::now();
+    std::thread prober([&] { result.set_value(sw::probe_skywatcher_port(board.slave_path(), 9600)); });
+    // Budget 1500 ms plus margin; a parked read never gets there.
+    const bool finished = done.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready;
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    if (!finished) {
+        board.release_blocked_reader();  // unpark the read so the thread can be joined
+    }
+    prober.join();
+    INFO("probe elapsed " << elapsed << " ms");
+    REQUIRE(finished);
+    CHECK(done.get().empty());
+    CHECK(board.count_frames('e') == 1);  // the probe was sent and went unanswered
+}
+
+TEST_CASE("SkyWatcher serial - the dual-baud scan gives up within its budget when reads ignore VTIME",
+          "[skywatcher][serial][probe]") {
+    // The scan always reaches 115200 after a silent 9600 attempt, and that
+    // attempt first runs the SynScan echo guard (util/synscan_handset_probe.h)
+    // on its own fd: its read must be poll()-bounded too, or the scan parks
+    // there on the same silent port.
+    FakeSkyWatcherSerialBoard board;
+    board.set_muted(true);
+    board.set_reads_ignore_vtime(true);
+
+    std::promise<bool> result;
+    auto done = result.get_future();
+    const auto start = std::chrono::steady_clock::now();
+    std::thread prober([&] {
+        sw::MotorBoardInfo info;
+        int baud = 0;
+        result.set_value(sw::probe_skywatcher_port_any_baud(board.slave_path(), info, baud));
+    });
+    // Budget 1500 (9600 :e1) + 300 (echo guard) + 1500 (115200 :e1) ms plus margin.
+    const bool finished = done.wait_for(std::chrono::milliseconds(5000)) == std::future_status::ready;
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    if (!finished) {
+        board.release_blocked_reader();  // unpark the read so the thread can be joined
+    }
+    prober.join();
+    INFO("scan elapsed " << elapsed << " ms");
+    REQUIRE(finished);
+    CHECK_FALSE(done.get());
+    CHECK(board.count_frames('e') == 2);  // :e1 went out at both bauds, unanswered
+}
+
 // ── open-astro#445: Connected follows the serial link ──────────────────────
 
 namespace {
@@ -392,15 +454,20 @@ TEST_CASE("SkyWatcher serial - Connected drops when the adapter is pulled, with 
 
     board.sever_link();
     CHECK_FALSE(driver->get_connected());
+    // A link lost under a connected client is a fault, not an idle device: the
+    // Devices dot must not read like a mount nobody opened.
+    CHECK(driver->get_link_fault().find("lost") != std::string::npos);
     // The stale descriptor is what kept the kernel from handing the returning
     // adapter its old name (/dev/ttyUSB0 -> ttyUSB1); noticing the loss
     // releases it, and the port's registry claim with it.
     CHECK_FALSE(alpacacore::util::is_serial_port_in_use(key));
     require_not_connected_error([&] { driver->get_right_ascension(); });
 
-    // An explicit disconnect of the dead link still completes cleanly.
+    // An explicit disconnect of the dead link still completes cleanly, and
+    // the client's own disconnect settles the fault.
     driver->set_connected(false);
     CHECK_FALSE(driver->get_connected());
+    CHECK(driver->get_link_fault().empty());
 }
 
 TEST_CASE("SkyWatcher serial - an operation that hits a dead link fails NotConnected and drops Connected",
@@ -671,6 +738,66 @@ TEST_CASE("SkyWatcher serial - a silent board latches a link fault after three e
     protocol.disconnect();
 }
 
+TEST_CASE("SkyWatcher serial - the connected port is claimed exclusively and released on disconnect",
+          "[skywatcher][serial][exclusive]") {
+    // open-astro#912: an outside open reprograms the line and makes a reconnect
+    // fail EBUSY. TIOCEXCL refuses a non-root open while we hold the port.
+    if (geteuid() == 0) {
+        SUCCEED("root bypasses TIOCEXCL");
+        return;
+    }
+    FakeSkyWatcherSerialBoard board;
+    sw::SkyWatcherProtocolWrapper protocol;
+    REQUIRE(protocol.connect(serial_info(board.slave_path())));
+
+    errno = 0;
+    int fd = open(board.slave_path().c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    const int err = errno;
+    if (fd >= 0) close(fd);
+    CHECK(fd < 0);
+    CHECK(err == EBUSY);
+
+    protocol.disconnect();
+    fd = open(board.slave_path().c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    CHECK(fd >= 0);
+    if (fd >= 0) close(fd);
+}
+
+TEST_CASE("SkyWatcher serial - a latched fault from a reprogrammed line recovers without a reconnect",
+          "[skywatcher][serial][linkhealth]") {
+    // open-astro#912: line settings belong to the tty. After an outside open
+    // leaves it at the wrong rate the board is unreachable until the driver
+    // re-applies its own settings.
+    FakeSkyWatcherSerialBoard board;
+    board.answer_only_at_baud(9600);
+    sw::SkyWatcherProtocolWrapper protocol;
+    REQUIRE(protocol.connect(serial_info(board.slave_path())));
+    REQUIRE(protocol.inquire_position(sw::kAxisRa) == 0x800000);
+
+    board.set_muted(true);
+    for (int i = 0; i < 3; ++i) {
+        CHECK_THROWS_AS(protocol.inquire_position(sw::kAxisRa), alpacacore::AlpacaException);
+    }
+    CHECK(protocol.link_faulted());
+
+    // An outside open leaves the shared line at the wrong rate, then the board
+    // answers again. The first exchange may still time out; the driver
+    // re-applies its settings, so a later one succeeds without a reconnect.
+    board.set_line_baud(115200);
+    board.set_muted(false);
+    bool recovered = false;
+    for (int i = 0; i < 3 && !recovered; ++i) {
+        try {
+            recovered = protocol.inquire_position(sw::kAxisRa) == 0x800000;
+        } catch (const alpacacore::AlpacaException&) {
+        }
+    }
+    CHECK(recovered);
+    CHECK_FALSE(protocol.link_faulted());
+    CHECK(protocol.is_connected());
+    protocol.disconnect();
+}
+
 TEST_CASE("SkyWatcher serial - a faulted link refuses the position cache instead of serving it",
           "[skywatcher][serial][linkhealth]") {
     FakeSkyWatcherSerialBoard board;
@@ -698,12 +825,14 @@ TEST_CASE("SkyWatcher serial - a faulted link refuses the position cache instead
     require_driver_error([&] { driver->get_right_ascension(); }, "communications compromised");
     require_driver_error([&] { driver->get_declination(); }, "communications compromised");
     CHECK(driver->get_connected());  // DriverException, not NotConnected
+    CHECK_FALSE(driver->get_link_fault().empty());  // surfaced to the management listing
 
     board.set_muted(false);
     // Recovery is automatic: no reconnect, no client action.
     const double ra_after = driver->get_right_ascension();
     CHECK(std::abs(ra_after - ra_before) < 0.01);
     CHECK(driver->get_connected());
+    CHECK(driver->get_link_fault().empty());
     driver->set_connected(false);
 }
 
@@ -738,11 +867,15 @@ TEST_CASE("SkyWatcher serial - a board that restarted while the link was down is
     // nothing else would ever raise this again.
     require_driver_error([&] { driver->get_right_ascension(); }, "restarted");
     CHECK(driver->get_connected());
+    // The link latch cleared on the good reply, but every read still fails:
+    // the management listing must keep reporting a fault.
+    CHECK(driver->get_link_fault().find("restarted") != std::string::npos);
 
     // A reconnect re-runs the ":F" init, which is what actually fixes it.
     driver->set_connected(false);
     driver->set_connected(true);
     CHECK_NOTHROW(driver->get_right_ascension());
+    CHECK(driver->get_link_fault().empty());
     driver->set_connected(false);
 }
 
@@ -1109,6 +1242,34 @@ TEST_CASE("SkyWatcher serial - a Dec pulse whose ':K' is lost stops before the f
     CHECK(stopped_after_ms < kPulseMs + kIssue559ReplyTimeoutMs);
 
     driver->set_connected(false);
+}
+
+TEST_CASE("FakeSkyWatcherSerialBoard - a steady reply latency is paid by every transaction and counted",
+          "[skywatcher][serial]") {
+    FakeSkyWatcherSerialBoard board;
+    sw::SkyWatcherProtocolWrapper protocol;
+    REQUIRE(protocol.connect(serial_info(board.slave_path())));
+
+    const auto timed_reads = [&](int n) {
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < n; ++i) (void)protocol.inquire_position(sw::kAxisRa);
+        return std::chrono::steady_clock::now() - start;
+    };
+    const int before = board.transactions_served();
+    board.set_reply_latency(40);
+    const auto slow = timed_reads(5);
+    for (int i = 0; i < 40 && board.transactions_served() - before != 5; ++i)  // count follows the send
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(board.transactions_served() - before == 5);
+    CHECK(slow >= std::chrono::milliseconds(5 * 40));
+
+    board.set_reply_latency(0);
+    const auto fast = timed_reads(5);
+    for (int i = 0; i < 40 && board.transactions_served() - before != 10; ++i)  // count follows the send
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(board.transactions_served() - before == 10);
+    CHECK(fast < std::chrono::milliseconds(5 * 40));
+    protocol.disconnect();
 }
 
 #endif  // _WIN32

@@ -92,6 +92,21 @@ public:
         muted_ = muted;
     }
 
+    /// A muted board on an adapter whose driver does not honour VMIN/VTIME
+    /// (#836): a read with no data parks instead of timing out. Whenever
+    /// bytes arrive (a `:` frame or the SynScan echo guard's bare "KB") the
+    /// fake rewrites the line to VMIN=1 / VTIME=0 (every slave fd shares one
+    /// termios), after the reader's own tcsetattr, so any blocking read on
+    /// it waits for a byte. Only a poll()-bounded read keeps its budget.
+    void set_reads_ignore_vtime(bool ignore) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        reads_ignore_vtime_ = ignore;
+    }
+
+    /// Release a reader parked by set_reads_ignore_vtime(): one CR ends the
+    /// probe's read loop, so a test that saw the hang can still join.
+    void release_blocked_reader() { pty_write_bounded(pty_.master_fd(), std::string("\r"), stop_); }
+
     /// open-astro#521: start an axis in the running state, as a board whose
     /// motion outlived the driver's link does. @p speed_mode true models a
     /// MoveAxis or tracking drive — the case the driver classifies as NOT
@@ -134,6 +149,12 @@ public:
         delay_ms_ = ms;
         delay_command_ = command;
     }
+
+    /// Steady state, until set back to zero: every reply is held for @p ms
+    /// before it is sent (delay_next_reply() is the one-shot form).
+    /// transactions_served() counts the replies sent, readable from a test.
+    void set_reply_latency(int ms) { latency_ms_.store(ms); }
+    int transactions_served() const { return served_.load(); }
 
     /// open-astro#559: LOSE the next @p times frames of @p command on the
     /// wire -- the board neither applies them nor answers, as a frame that
@@ -183,6 +204,16 @@ public:
     void answer_only_at_baud(int baud) {
         std::lock_guard<std::mutex> lock(mutex_);
         answer_baud_ = baud;
+    }
+
+    /// open-astro#912: another process reprograms the shared tty. Sets the
+    /// speed on the keep-alive slave fd, which every fd of the slave sees.
+    void set_line_baud(int baud) {
+        struct termios tty {};
+        if (pty_.keepalive_fd() < 0 || tcgetattr(pty_.keepalive_fd(), &tty) != 0) return;
+        cfsetispeed(&tty, baud == 115200 ? B115200 : B9600);
+        cfsetospeed(&tty, baud == 115200 ? B115200 : B9600);
+        tcsetattr(pty_.keepalive_fd(), TCSANOW, &tty);
     }
 
     /// Refuse ":i" with "!0" (Unknown command), as a board without the
@@ -249,6 +280,14 @@ private:
             default:
                 return -1;
         }
+    }
+
+    void force_blocking_reads() const {
+        struct termios tty {};
+        if (pty_.keepalive_fd() < 0 || tcgetattr(pty_.keepalive_fd(), &tty) != 0) return;
+        tty.c_cc[VMIN] = 1;
+        tty.c_cc[VTIME] = 0;
+        tcsetattr(pty_.keepalive_fd(), TCSANOW, &tty);
     }
 
     // Returns the reply for one frame (without the trailing CR), or an empty
@@ -361,6 +400,10 @@ private:
             const int r = poll(&pfd, 1, 10);
             if (r <= 0) continue;
             const ssize_t n = read(pty_.master_fd(), buf, sizeof(buf));
+            if (n > 0) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (muted_ && reads_ignore_vtime_) force_blocking_reads();
+            }
             for (ssize_t i = 0; i < n; ++i) {
                 const char ch = buf[i];
                 if (ch == ':') {
@@ -390,7 +433,11 @@ private:
                 if (delay > 0) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(delay));
                 }
+                if (const int latency_ms = latency_ms_.load(); latency_ms > 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(latency_ms));
+                }
                 pty_write_bounded(pty_.master_fd(), reply, stop_);
+                served_.fetch_add(1);
                 std::string straggler;
                 int straggler_ms = 0;
                 {
@@ -414,6 +461,8 @@ private:
     PtyPair pty_;
     std::thread worker_;
     std::atomic<bool> stop_{false};
+    std::atomic<int> latency_ms_{0};
+    std::atomic<int> served_{0};
     mutable std::mutex mutex_;
     uint32_t counts_[2] = {0x800000, 0x800000};
     uint32_t t1_[2] = {0, 0};
@@ -433,6 +482,7 @@ private:
     // Defaults reproduce the fixed "=101" this fake used to answer for ":f":
     // speed mode, not running, initialized.
     bool muted_ = false;
+    bool reads_ignore_vtime_ = false;
     bool running_[2] = {false, false};
     bool speed_mode_[2] = {true, true};
     bool init_done_[2] = {true, true};

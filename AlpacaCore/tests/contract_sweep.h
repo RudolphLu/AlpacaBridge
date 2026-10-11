@@ -195,9 +195,6 @@ inline const char* invalid_probe_reason_for(DeviceType t) {
         case DeviceType::Focuser:
             return "no argument with a static out-of-range value that is validated before the connection check "
                    "(assumption)";
-        case DeviceType::ObservingConditions:
-            return "weewx answers every sensor name it is not currently serving with PropertyNotImplemented, "
-                   "including unknown ones (assumption, not checked against ConformU)";
         default:
             return "";
     }
@@ -248,7 +245,12 @@ inline constexpr const char* kSrcAgentsAxis =
 inline ContractEntry contract_entry_zwo_camera() {
     return make_entry(
         "zwo_camera", "zwo", "camera", DeviceType::Camera,
-        [](int n) -> std::unique_ptr<AlpacaDriver> { return vendor::zwo::create_zwo_camera_by_index(n, 0); },
+        [](int n) -> std::unique_ptr<AlpacaDriver> {
+            vendor::zwo::ZwoCameraBinding binding;
+            binding.identity.camera_index = 0;
+            binding.unique_id = vendor::zwo::generate_zwo_unique_id();
+            return vendor::zwo::create_zwo_camera_bound(n, binding);
+        },
         kSrcAgents);
 }
 inline ContractEntry contract_entry_zwo_telescope() {
@@ -334,7 +336,7 @@ inline ContractEntry contract_entry_qhy_filterwheel() {
         [](int n) -> std::unique_ptr<AlpacaDriver> { return vendor::qhy::create_qhy_filterwheel_by_index(n, 0); },
         kSrcAgents);
 }
-// Second backend behind the same (qhy, filterwheel) router pair: the standalone CFW3 on a serial port.
+// Second backend behind the same (qhy, filterwheel) catalog pair: the standalone CFW3 on a serial port.
 inline ContractEntry contract_entry_qhy_filterwheel_cfw3() {
     return make_entry(
         "qhy_filterwheel_cfw3", "qhy", "filterwheel", DeviceType::FilterWheel,
@@ -527,7 +529,7 @@ inline ContractEntry contract_entry_gemini_covercalibrator() {
         },
         kSrcAgents);
 }
-// Second and third backends behind the same (gemini, covercalibrator) router pair: the Flat Panel v2 and
+// Second and third backends behind the same (gemini, covercalibrator) catalog pair: the Flat Panel v2 and
 // the Motorized Flat Panel V3 (Pro). The entry above is the Cover Lite (create_gemini_flatpanel).
 inline ContractEntry contract_entry_gemini_covercalibrator_v2() {
     return make_entry(
@@ -614,7 +616,7 @@ inline ContractEntry contract_entry_touptek_focuser() {
 #endif
 
 #ifdef ALPACACORE_ENABLE_TOUPTEK
-// Second backend behind the same (touptek, switch) router pair; needs no libgpiod.
+// Second backend behind the same (touptek, switch) catalog pair; needs no libgpiod.
 inline ContractEntry contract_entry_touptek_switch_thermal() {
     return with_switch_caps(
         make_entry(
@@ -885,8 +887,10 @@ inline constexpr FakeRosterRow kFakeConnectableRoster[] = {
     {"qhy", "camera", "fake_qhy_sdk.h"},
     {"qhy", "filterwheel", "fake_qhy_cfw3.h"},  // CFW3 serial backend: qhy_filterwheel_cfw3
     {"qhy", "focuser", "fake_qhy_qfocuser.h"},
+    {"playerone", "camera", "fake_playerone_sdk.h"},
     {"touptek", "camera", "fake_touptek_sdk.h"},
     {"altair", "camera", "fake_touptek_sdk.h"},  // the ToupTek camera driver behind the Altair factory
+    {"svbony", "camera", "fake_svbony_sdk.h"},
     {"gphoto", "camera", "fake_gphoto_sdk.h"},
     {"wandererastro", "covercalibrator", "fake_serial_streamer.h"},
     {"wandererastro", "filterwheel", "fake_serial_streamer.h"},

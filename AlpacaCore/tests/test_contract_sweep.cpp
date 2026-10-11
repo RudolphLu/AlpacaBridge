@@ -18,6 +18,7 @@
 
 #include <alpacacore/alpaca_errors.h>
 #include <alpacacore/camera_driver.h>
+#include <alpacacore/catalog/builtin_catalog.h>
 #include <alpacacore/covercalibrator_driver.h>
 #include <alpacacore/filterwheel_driver.h>
 #include <alpacacore/focuser_driver.h>
@@ -29,6 +30,7 @@
 #include <alpacacore/version.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <functional>
 #include <limits>
@@ -112,6 +114,17 @@
 #include "fake_touptek_sdk.h"
 #include "locked_touptek_sdk.h"
 #endif
+#ifdef ALPACACORE_ENABLE_SVBONY
+#include <alpacacore/vendor/svbony/svbony_camera_driver.h>
+
+#include "fake_svbony_sdk.h"
+#include "locked_svbony_sdk.h"
+#endif
+#ifdef ALPACACORE_ENABLE_PLAYERONE
+#include <alpacacore/vendor/playerone/playerone_camera_driver.h>
+
+#include "fake_playerone_sdk.h"
+#endif
 #ifdef ALPACACORE_ENABLE_GPHOTO
 #include <alpacacore/vendor/gphoto/gphoto_camera_driver.h>
 
@@ -175,6 +188,15 @@ std::vector<Probe> invalid_value_probes(AlpacaDriver& d, DeviceType type) {
         case DeviceType::CoverCalibrator: {
             auto& c = dynamic_cast<alpacacore::CoverCalibratorDriver&>(d);
             p.push_back({"calibrator_on(-1)", [&] { c.calibrator_on(-1); }});
+            break;
+        }
+        case DeviceType::ObservingConditions: {
+            // A sensor name IObservingConditions does not define is InvalidValue, never NotImplemented.
+            auto& o = dynamic_cast<alpacacore::ObservingConditionsDriver&>(d);
+            p.push_back({"get_time_since_last_update(NoSuchSensor)",
+                         [&] { (void)o.get_time_since_last_update("NoSuchSensor"); }});
+            p.push_back(
+                {"get_sensor_description(NoSuchSensor)", [&] { (void)o.get_sensor_description("NoSuchSensor"); }});
             break;
         }
         case DeviceType::Rotator: {
@@ -1216,6 +1238,76 @@ Tier2Host tier2_host_altair_camera() {
 }
 #endif
 
+#ifdef ALPACACORE_ENABLE_SVBONY
+struct SvbonySdkHold {
+    alpacacore::test::FakeSVBSDK fake;
+    alpacacore::test::LockedSVBSDK sdk{fake};
+};
+
+// Recipe of test_svbony_concurrency_stress.cpp.
+Tier2Host tier2_host_svbony_camera() {
+    Tier2Host h{"svbony_camera",
+                "svbony",
+                "camera",
+                "fake_svbony_sdk.h",
+                DeviceType::Camera,
+                "svbony_camera",
+                {},
+                true,
+                {},
+                ""};
+    h.connectable = [](bool hold) {
+        auto sdk_hold = std::make_shared<SvbonySdkHold>();
+        if (hold) {
+            sdk_hold->fake.before_call = [](const std::string& name) {
+                if (name == "open_camera") std::this_thread::sleep_for(kHold);
+            };
+        }
+        return host_over(sdk_hold, [](SvbonySdkHold& s) -> std::unique_ptr<AlpacaDriver> {
+            return alpacacore::vendor::svbony::create_svbony_camera(0, 0, s.sdk);
+        });
+    };
+    h.failing = []() {
+        auto hold = std::make_shared<SvbonySdkHold>();
+        hold->fake.throw_from.insert("open_camera");  // fake_svbony_sdk.h fault injection
+        return host_over(hold, [](SvbonySdkHold& s) -> std::unique_ptr<AlpacaDriver> {
+            return alpacacore::vendor::svbony::create_svbony_camera(0, 0, s.sdk);
+        });
+    };
+    return h;
+}
+#endif
+
+#ifdef ALPACACORE_ENABLE_PLAYERONE
+Tier2Host tier2_host_playerone_camera() {
+    Tier2Host h{"playerone_camera",
+                "playerone",
+                "camera",
+                "fake_playerone_sdk.h",
+                DeviceType::Camera,
+                "playerone_camera",
+                {},
+                true,
+                {},
+                ""};
+    h.connectable = [](bool hold) {
+        auto sdk = std::make_shared<alpacacore::test::FakePlayerOneSDK>();
+        if (hold) sdk->set_open_delay(kHold);
+        return host_over(sdk, [](alpacacore::test::FakePlayerOneSDK& fake) -> std::unique_ptr<AlpacaDriver> {
+            return alpacacore::vendor::playerone::create_playerone_camera(0, 0, fake);
+        });
+    };
+    h.failing = []() {
+        auto sdk = std::make_shared<alpacacore::test::FakePlayerOneSDK>();
+        sdk->set_no_cameras(true);
+        return host_over(sdk, [](alpacacore::test::FakePlayerOneSDK& fake) -> std::unique_ptr<AlpacaDriver> {
+            return alpacacore::vendor::playerone::create_playerone_camera(0, 0, fake);
+        });
+    };
+    return h;
+}
+#endif
+
 #ifdef ALPACACORE_ENABLE_GPHOTO
 struct GPhotoSdkHold {
     alpacacore::test::FakeGPhotoSDK fake;
@@ -1409,6 +1501,15 @@ Tier2Host tier2_host_wandererastro_switch() {
 #define CS2_ALTAIR(X) X(altair_camera, NPR)
 #else
 #define CS2_ALTAIR(X)
+#ifdef ALPACACORE_ENABLE_SVBONY
+#define CS2_SVBONY(X) X(svbony_camera, NPR)
+#else
+#define CS2_SVBONY(X)
+#endif
+#ifdef ALPACACORE_ENABLE_PLAYERONE
+#define CS2_PLAYERONE(X) X(playerone_camera, NPR)
+#else
+#define CS2_PLAYERONE(X)
 #endif
 #ifdef ALPACACORE_ENABLE_GPHOTO
 #define CS2_GPHOTO(X) X(gphoto_camera, NPR)
@@ -1431,6 +1532,8 @@ Tier2Host tier2_host_wandererastro_switch() {
     CS2_QHY(X) \
     CS2_TOUPTEK(X) \
     CS2_ALTAIR(X) \
+    CS2_SVBONY(X) \
+    CS2_PLAYERONE(X) \
     CS2_GPHOTO(X) \
     CS2_WANDERERASTRO(X)
 // clang-format on
@@ -1534,6 +1637,11 @@ TEST_CASE("Contract sweep tier 2 - hosts match kFakeConnectableRoster", "[contra
 #endif
 #ifdef ALPACACORE_ENABLE_ALTAIR
     CS2_ENABLED("altair")
+#ifdef ALPACACORE_ENABLE_SVBONY
+    CS2_ENABLED("svbony")
+#endif
+#ifdef ALPACACORE_ENABLE_PLAYERONE
+    CS2_ENABLED("playerone")
 #endif
 #ifdef ALPACACORE_ENABLE_GPHOTO
     CS2_ENABLED("gphoto")
@@ -1589,6 +1697,82 @@ TEST_CASE("Contract sweep tier 2 - hosts match kFakeConnectableRoster", "[contra
     }
 }
 #endif
+
+// Catalog pairs (fork #71): the built-in catalog itself says which (vendor, device type) pairs this
+// build constructs, so scripts/check_contract_sweep.py no longer parses *_catalog.cpp for them. A
+// descriptor is `available` when its vendor's factory is built in, which is also when that vendor's
+// registry entries compile.
+namespace {
+
+using CatalogPair = std::pair<std::string, std::string>;  // (vendor, router deviceType string)
+
+std::vector<alpacacore::catalog::DescriptorView> builtin_catalog_views(alpacacore::catalog::DeviceCatalog& catalog) {
+    alpacacore::catalog::register_builtin_schemas(catalog);
+    alpacacore::catalog::register_builtin_factories(catalog);
+    return catalog.describe();
+}
+
+CatalogPair catalog_pair(const alpacacore::catalog::DescriptorView& view) {
+    std::string type = alpacacore::device_type_to_string(view.key.type);
+    std::transform(type.begin(), type.end(), type.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return {view.key.vendor, type};
+}
+
+}  // namespace
+
+TEST_CASE("Contract sweep - every available catalog descriptor has a registry entry",
+          "[contract][contract-sweep-guard]") {
+    alpacacore::catalog::DeviceCatalog catalog;
+    const auto views = builtin_catalog_views(catalog);
+    std::set<CatalogPair> registered;
+    for (const auto& e : alpacacore::test::contract::contract_entries()) registered.insert({e.vendor, e.device_type});
+    std::set<std::string> described_vendors;
+    for (const auto& v : views) described_vendors.insert(v.key.vendor);
+
+    std::size_t compared = 0;
+    for (const auto& v : views) {
+        if (!v.available) continue;
+        ++compared;
+        const CatalogPair pair = catalog_pair(v);
+        INFO("the catalog constructs " << pair.first << "/" << pair.second << " but contract_sweep.h has no X("
+                                       << pair.first << "_" << pair.second << ") entry");
+        CHECK(registered.count(pair) == 1);
+    }
+    // Not vacuous: a build whose registry holds a catalog vendor's entries has that vendor's factory, so
+    // at least one view was compared (zero means register_builtin_factories() compiled empty).
+    const bool catalog_vendor_built = std::any_of(registered.begin(), registered.end(), [&](const CatalogPair& p) {
+        return described_vendors.count(p.first) == 1;
+    });
+    if (catalog_vendor_built) CHECK(compared > 0);
+}
+
+// The reverse direction, which the gate's ORPHAN ENTRY rule no longer covers for catalog vendors: a
+// registry entry whose vendor has descriptors or factories names one of them. A vendor counts by its
+// factories too, so dropping its whole schema registration leaves its entries checked, not skipped.
+// A vendor that builds some device types through the catalog and others through a router arm lists its
+// router pairs in `router_pairs` below. ZWO's camera stays a router arm until its catalog slice lands,
+// which removes the entry.
+TEST_CASE("Contract sweep - every registry entry of a catalog vendor has a descriptor",
+          "[contract][contract-sweep-guard]") {
+    alpacacore::catalog::DeviceCatalog catalog;
+    const auto views = builtin_catalog_views(catalog);
+    std::set<CatalogPair> described;
+    std::set<std::string> catalog_vendors;
+    for (const auto& v : views) {
+        described.insert(catalog_pair(v));
+        catalog_vendors.insert(v.key.vendor);
+    }
+    for (const auto& k : catalog.factory_keys()) catalog_vendors.insert(k.vendor);
+    const std::set<CatalogPair> router_pairs = {{"zwo", "camera"}};
+    for (const auto& e : alpacacore::test::contract::contract_entries()) {
+        if (catalog_vendors.count(e.vendor) == 0) continue;
+        if (router_pairs.count({e.vendor, e.device_type}) == 1) continue;
+        INFO(e.id << " is in the registry but the catalog has no " << e.vendor << "/" << e.device_type
+                  << " descriptor");
+        CHECK(described.count({e.vendor, e.device_type}) == 1);
+    }
+}
 
 // Non-vacuity guard. The vendor ALPACACORE_ENABLE_<V> macros are not inherited
 // from the vendor targets: tests/CMakeLists.txt must define them for

@@ -151,6 +151,14 @@ public:
         return std::chrono::milliseconds(motion_watchdog_ms_.load(std::memory_order_relaxed));
     }
 
+    // open-astro#776: how long PUT Connected=true waits for a connect task.
+    void set_connect_wait_limit(std::chrono::milliseconds limit) {
+        connect_wait_limit_ms_.store(limit.count(), std::memory_order_relaxed);
+    }
+    std::chrono::milliseconds connect_wait_limit() const {
+        return std::chrono::milliseconds(connect_wait_limit_ms_.load(std::memory_order_relaxed));
+    }
+
     // open-astro#392: extra names route() accepts as a request's Host, on
     // top of the built-in ones (IP literals, localhost, this machine's name,
     // *.local, *.home.arpa, *.internal). An entry with a leading dot is a
@@ -216,6 +224,9 @@ private:
     // open-astro#547.
     std::atomic<std::chrono::milliseconds::rep> motion_watchdog_ms_{
         std::chrono::duration_cast<std::chrono::milliseconds>(alpacacore::util::kClientSilenceStopInterval).count()};
+
+    // open-astro#776.
+    std::atomic<std::chrono::milliseconds::rep> connect_wait_limit_ms_{60000};
 
     // Lazily constructed on first /management/v1/wifi/* request so setups
     // without NetworkManager (or without a wifi adapter) pay no cost.
@@ -288,8 +299,14 @@ private:
     // anyway and left for the driver's connect-time guard to refuse.
     enum class ConfigSource : std::uint8_t { Api, Persisted };
 
+    //
+    // \p learned_config, when given, receives the keys the registration worked
+    // out about the device that the entry does not yet carry (a ZWO camera's
+    // serialNumber, cameraName and uniqueId, #914). The caller stores them
+    // with the entry: this function never writes the persisted list itself,
+    // because the API path has not added the entry to it yet.
     bool register_device_from_config(const nlohmann::json& config, std::string& error_message,
-                                     ConfigSource source = ConfigSource::Api);
+                                     ConfigSource source = ConfigSource::Api, nlohmann::json* learned_config = nullptr);
 
     // Issue #380, generalising the rule #353 introduced for the Sky-Watcher
     // site-coordinate check: what a validation failure inside

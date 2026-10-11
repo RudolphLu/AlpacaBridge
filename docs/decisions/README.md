@@ -21,3 +21,6 @@ A record is referred to by its slug until it is written, and numbered then.
 - [Task clock](0005-task-clock.md)
 - [Async operation ownership](0006-async-operation-ownership.md)
 - [LAN surface threat model](0007-lan-surface-threat-model.md)
+- [Rotator Sync offset persistence](0008-rotator-sync-offset-persistence.md)
+- [Link-loss and relink policy](0009-link-loss-and-relink-policy.md)
+- [Snapshot-served state](0010-snapshot-served-state.md)

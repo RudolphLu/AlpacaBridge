@@ -251,6 +251,11 @@ function resetDeviceForm() {
     // setEditMode(false)); call it explicitly too so this helper is
     // self-contained and doesn't silently rely on that listener existing.
     setEditMode(false);
+    // Hidden inputs keep script-set values through form.reset().
+    for (const id of ['zwo-camera-serial', 'zwo-camera-name', 'zwo-camera-unique-id',
+        'zwo-camera-loaded-index', 'zwo-camera-loaded-id']) {
+        setFormValue(id, '');
+    }
     // Re-run the vendor option/sub-section toggles against the reset values so
     // stale vendor-specific blocks are hidden and slot UIs reflect empty input.
     updateVendorOptions();
@@ -541,10 +546,11 @@ async function loadDevices() {
             const settingsHtml = renderDeviceSettings(config);
             const deviceName = device.DeviceName || device.Name || 'Unknown Device';
             const hasLoadError = device.LoadError === true;
+            const status = deviceStatus(device);
             return `
             <div class="device-card collapsed${hasLoadError ? ' device-error' : ''}">
                 <div class="device-card-header">
-                    <h3>${hasLoadError ? '&#x26a0; ' : ''}${escapeHtml(deviceName)}</h3>
+                    <h3><span class="status-dot status-${status.state}" role="img" data-device-type="${escapeHtml(device.DeviceType)}" data-device-number="${escapeHtml(String(device.DeviceNumber))}" title="${escapeHtml(status.text)}" aria-label="${escapeHtml(status.text)}"></span>${hasLoadError ? '&#x26a0; ' : ''}${escapeHtml(deviceName)}</h3>
                     <button class="device-toggle" type="button" aria-expanded="false" data-device-index="${index}">
                         <span class="device-toggle-icon" aria-hidden="true"></span>
                         <span class="device-toggle-label">Details</span>
@@ -707,6 +713,42 @@ function setEditMode(isEditing) {
     }
 }
 
+// The serial, model name and UniqueID the server learned for a ZWO camera
+// (#914). An edit removes the entry and adds it again, so the form resends
+// them; only while the index and id are the ones the form loaded. A changed
+// index or id points the entry at another body, which then learns its own.
+function zwoCameraIdentityFields(formData) {
+    const loadedIndex = String(document.getElementById('zwo-camera-loaded-index')?.value ?? '');
+    const loadedId = String(document.getElementById('zwo-camera-loaded-id')?.value ?? '');
+    const indexValue = String(formData.get('cameraIndex') ?? '');
+    const idValue = String(formData.get('cameraId') ?? '');
+    const fields = {};
+    // Only an edit of that entry resends them; an add never inherits the
+    // hidden values of a camera edited earlier.
+    const form = document.getElementById('device-form');
+    if (!form || form.dataset.editing !== 'true') {
+        return fields;
+    }
+    if (loadedIndex === '' && loadedId === '') {
+        return fields;
+    }
+    if (indexValue !== loadedIndex || idValue !== loadedId) {
+        return fields;
+    }
+    const pairs = [
+        ['serialNumber', 'zwoCameraSerial'],
+        ['cameraName', 'zwoCameraName'],
+        ['uniqueId', 'zwoCameraUniqueId'],
+    ];
+    for (const [key, name] of pairs) {
+        const value = formData.get(name);
+        if (typeof value === 'string' && value !== '') {
+            fields[key] = value;
+        }
+    }
+    return fields;
+}
+
 function setFormValue(elementId, value) {
     const element = document.getElementById(elementId);
     if (!element) {
@@ -831,6 +873,7 @@ function startEditDevice(device) {
         }
     } else if (vendor === 'synscan') {
         setFormValue('synscan-version', config.synscanVersion || 'auto');
+        setFormValue('synscan-alignment-mode', normalizeAlignmentMode(config.alignmentMode));
         const synscanConnectionType = config.connectionType || 'auto';
         setFormValue('synscan-connection-type', synscanConnectionType);
         if (synscanConnectionType === 'serial') {
@@ -865,6 +908,8 @@ function startEditDevice(device) {
         // open-astro#436: absent or null = limit off = blank field.
         setFormValue('skywatcher-min-altitude', config.minAltitudeDeg ?? '');
         setFormValue('skywatcher-meridian-limit', config.meridianLimitMinutes ?? '');
+        // open-astro#582: absent = auto.
+        setFormValue('skywatcher-dec-axis-sense', config.decAxisSense || 'auto');
         const skywatcherLearnSite = document.getElementById('skywatcher-learn-site-from-client');
         if (skywatcherLearnSite) {
             skywatcherLearnSite.checked = config.learnSiteFromClient !== false;
@@ -889,6 +934,7 @@ function startEditDevice(device) {
             onstepConnectionTypeEl.dispatchEvent(new Event('change'));
         }
     } else if (vendor === 'celestron') {
+        setFormValue('celestron-alignment-mode', normalizeAlignmentMode(config.alignmentMode));
         const celestronConnectionType = config.connectionType || 'auto';
         setFormValue('celestron-connection-type', celestronConnectionType);
         if (celestronConnectionType === 'serial') {
@@ -1200,6 +1246,14 @@ function startEditDevice(device) {
     }
     setFormValue('camera-index', config.cameraIndex);
     setFormValue('camera-id', config.cameraId);
+    // #914: remember the identity the server learned for a ZWO camera, and the
+    // index/id the form loaded it with, so the submit can resend it unchanged.
+    const keepZwoIdentity = vendor === 'zwo' && deviceType === 'camera';
+    setFormValue('zwo-camera-serial', keepZwoIdentity ? config.serialNumber : '');
+    setFormValue('zwo-camera-name', keepZwoIdentity ? config.cameraName : '');
+    setFormValue('zwo-camera-unique-id', keepZwoIdentity ? config.uniqueId : '');
+    setFormValue('zwo-camera-loaded-index', keepZwoIdentity ? config.cameraIndex : '');
+    setFormValue('zwo-camera-loaded-id', keepZwoIdentity ? config.cameraId : '');
     setFormValue('filterwheel-index', config.filterwheelIndex);
     setFormValue('filterwheel-id', config.filterwheelId);
     const filterNamesField = document.getElementById('filterwheel-names');
@@ -1299,6 +1353,50 @@ function startEditDevice(device) {
 
     // Switch to the Configure tab without resetting the form we just populated.
     showTab('configure', { preserveForm: true });
+}
+
+// Light poll of the Devices listing: updates only the status dots in place, so
+// expanded cards and scroll position survive. Runs only while the Devices tab
+// is shown and the page is visible.
+const DEVICE_STATUS_POLL_MS = 5000;
+let deviceStatusPollTimer = null;
+let deviceStatusPollInFlight = false;
+
+async function pollDeviceStatus() {
+    const tab = document.getElementById('devices-tab');
+    if (document.hidden || !tab || !tab.classList.contains('active')) {
+        return;
+    }
+    // A listing can stall behind a driver mutex during a connect; never queue a second request.
+    if (deviceStatusPollInFlight) return;
+    deviceStatusPollInFlight = true;
+    try {
+        const response = await fetch(API_BASE + '/management/v1/configureddevices?ts=' + Date.now(), { cache: 'no-store' });
+        if (!response.ok) return;
+        const data = await response.json();
+        if (data.ErrorNumber !== 0 || !Array.isArray(data.Value)) return;
+        for (const device of data.Value) {
+            const status = deviceStatus(device);
+            document.querySelectorAll('.status-dot').forEach(dot => {
+                if (dot.dataset.deviceType === String(device.DeviceType) &&
+                    dot.dataset.deviceNumber === String(device.DeviceNumber)) {
+                    dot.className = 'status-dot status-' + status.state;
+                    dot.title = status.text;
+                    dot.setAttribute('aria-label', status.text);
+                }
+            });
+        }
+    } catch (e) {
+        // Next tick retries; the dots keep their last state.
+    } finally {
+        deviceStatusPollInFlight = false;
+    }
+}
+
+function startDeviceStatusPoll() {
+    if (deviceStatusPollTimer === null) {
+        deviceStatusPollTimer = setInterval(pollDeviceStatus, DEVICE_STATUS_POLL_MS);
+    }
 }
 
 // Refresh devices
@@ -3830,6 +3928,7 @@ document.getElementById('device-form').addEventListener('submit', async function
     } else if (deviceData.vendor === 'synscan') {
         deviceData.connectionType = formData.get('synscanConnectionType') || 'auto';
         deviceData.synscanVersion = formData.get('synscanVersion') || 'auto';
+        deviceData.alignmentMode = normalizeAlignmentMode(formData.get('synscanAlignmentMode'));
         if (deviceData.connectionType === 'serial') {
             deviceData.portPath = formData.get('synscanPortPath');
             deviceData.baudRate = parseInt(formData.get('synscanBaudRate')) || 9600;
@@ -3885,6 +3984,7 @@ document.getElementById('device-form').addEventListener('submit', async function
         // open-astro#436: blank = off, sent as null so an edit can clear a limit.
         deviceData.minAltitudeDeg = readOptionalNumber(formData, 'skywatcherMinAltitudeDeg');
         deviceData.meridianLimitMinutes = readOptionalNumber(formData, 'skywatcherMeridianLimitMinutes');
+        deviceData.decAxisSense = formData.get('skywatcherDecAxisSense') || 'auto';  // open-astro#582
         const skywatcherLearnSite = document.getElementById('skywatcher-learn-site-from-client');
         if (skywatcherLearnSite) {
             deviceData.learnSiteFromClient = skywatcherLearnSite.checked;  // open-astro#444
@@ -3902,6 +4002,7 @@ document.getElementById('device-form').addEventListener('submit', async function
         }
     } else if (deviceData.vendor === 'celestron') {
         deviceData.connectionType = formData.get('celestronConnectionType') || 'auto';
+        deviceData.alignmentMode = normalizeAlignmentMode(formData.get('celestronAlignmentMode'));
         if (deviceData.connectionType === 'serial') {
             deviceData.portPath = formData.get('celestronPortPath');
             deviceData.baudRate = parseInt(formData.get('celestronBaudRate')) || 9600;
@@ -4032,6 +4133,9 @@ document.getElementById('device-form').addEventListener('submit', async function
                 if (!Number.isNaN(cameraId)) {
                     deviceData.cameraId = cameraId;
                 }
+            }
+            if (normalizedType === 'camera') {
+                Object.assign(deviceData, zwoCameraIdentityFields(formData));
             }
         }
         if (normalizedType === 'filterwheel') {
@@ -4485,6 +4589,7 @@ function renderDeviceSettings(config) {
         ['host', 'Host'],
         ['tcpPort', 'TCP Port'],
         ['synscanVersion', 'SynScan V3/V4 Version'],
+        ['alignmentMode', 'Alignment Mode'],
         ['cameraIndex', 'Camera Index'],
         ['cameraId', 'Camera ID'],
         ['filterwheelIndex', 'Filter Wheel Index'],
@@ -4597,6 +4702,7 @@ function escapeHtml(text) {
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', function() {
     loadDevices();
+    startDeviceStatusPoll();
     loadServerInfo();
     const serverClock = document.getElementById('server-clock');
     if (serverClock) {

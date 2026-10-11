@@ -19,9 +19,9 @@
 // (compiles in every build, also no vendor header); register_astroasis_factory()
 // is defined in astroasis_catalog.cpp (vendor header allowed, compiled only
 // under ALPACACORE_ENABLE_ASTROASIS). The Sky-Watcher pair (open-astro#744),
-// WeeWX (open-astro#731), SVBONY and Altair follow the same split, e.g. WeeWX
-// in weewx_schema.cpp and weewx_catalog.cpp. All are called only from
-// builtin_catalog.cpp (the alpacacore_builtins library, open-astro#710).
+// WeeWX (open-astro#731), SVBONY, gphoto, Player One, Bisque, OnStep, Celestron, SynScan, QHY, ToupTek, Gemini,
+// WandererAstro, ZWO and Altair follow the same split, e.g. WeeWX in weewx_schema.cpp and weewx_catalog.cpp. All are called
+// only from builtin_catalog.cpp (the alpacacore_builtins library, open-astro#710).
 
 #include <alpacacore/catalog/device_catalog.h>
 
@@ -37,5 +37,27 @@ void register_weewx_schema(DeviceCatalog& catalog);
 void register_weewx_factory(DeviceCatalog& catalog);
 void register_svbony_schema(DeviceCatalog& catalog);
 void register_svbony_factory(DeviceCatalog& catalog);
+void register_gphoto_schema(DeviceCatalog& catalog);
+void register_gphoto_factory(DeviceCatalog& catalog);
+void register_playerone_schema(DeviceCatalog& catalog);
+void register_playerone_factory(DeviceCatalog& catalog);
+void register_bisque_schema(DeviceCatalog& catalog);
+void register_bisque_factory(DeviceCatalog& catalog);
+void register_onstep_schema(DeviceCatalog& catalog);
+void register_onstep_factory(DeviceCatalog& catalog);
+void register_celestron_schema(DeviceCatalog& catalog);
+void register_celestron_factory(DeviceCatalog& catalog);
+void register_synscan_schema(DeviceCatalog& catalog);
+void register_synscan_factory(DeviceCatalog& catalog);
+void register_qhy_schema(DeviceCatalog& catalog);
+void register_qhy_factory(DeviceCatalog& catalog);
+void register_touptek_schema(DeviceCatalog& catalog);
+void register_touptek_factory(DeviceCatalog& catalog);
+void register_gemini_schema(DeviceCatalog& catalog);
+void register_gemini_factory(DeviceCatalog& catalog);
+void register_wandererastro_schema(DeviceCatalog& catalog);
+void register_wandererastro_factory(DeviceCatalog& catalog);
+void register_zwo_schema(DeviceCatalog& catalog);
+void register_zwo_factory(DeviceCatalog& catalog);
 
 }  // namespace alpacacore::catalog

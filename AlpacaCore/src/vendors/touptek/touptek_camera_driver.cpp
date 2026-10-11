@@ -12,6 +12,7 @@
 
 #include <alpacacore/async_connectable.h>
 #include <alpacacore/util/error_handling.h>
+#include <alpacacore/util/image_validation.h>
 #include <alpacacore/util/logging.h>
 #include <alpacacore/vendor/touptek/touptek_camera_driver.h>
 #include <alpacacore/vendor/touptek/touptek_sdk_wrapper.h>
@@ -24,6 +25,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -580,6 +582,9 @@ public:
     ImageArray get_image_array() const override {
         std::lock_guard<std::mutex> lock(mutex_);
         ensure_connected();
+        if (!exposure_failure_.empty()) {
+            throw AlpacaException(exposure_failure_, AlpacaError::DriverException);
+        }
         if (!last_exposure_valid_ || !image_ready_ || !image_cached_) {
             throw AlpacaException("Image not ready", AlpacaError::InvalidOperation);
         }
@@ -590,6 +595,9 @@ public:
     bool get_image_ready() const override {
         ensure_connected();
         std::lock_guard<std::mutex> lock(mutex_);
+        if (!exposure_failure_.empty()) {
+            throw AlpacaException(exposure_failure_, AlpacaError::DriverException);
+        }
         return last_exposure_valid_ && image_ready_ && image_cached_;
     }
 
@@ -1194,6 +1202,7 @@ public:
             last_exposure_duration_ = duration;
             last_exposure_start_ = std::chrono::system_clock::now();
             last_exposure_valid_ = true;
+            exposure_failure_.clear();
             image_ready_ = false;
             image_cached_ = false;
             exposure_deadline_ = std::chrono::steady_clock::now() +
@@ -1210,8 +1219,10 @@ public:
             exposure_active_.store(true);
         }
 
-        exposure_thread_ = std::thread([this, handle, exposure_us, active_bin, active_num_x, active_num_y, roi_x, roi_y,
-                                        roi_w, roi_h, dirty_format, dirty_roi, active_16bit]() {
+        const uint64_t abort_generation = abort_generation_.load();
+        exposure_thread_ = std::thread([this, handle, abort_generation, exposure_us, active_bin, active_num_x,
+                                        active_num_y, roi_x, roi_y, roi_w, roi_h, dirty_format, dirty_roi,
+                                        active_16bit]() {
             auto& sdk_local = sdk_;
             // Track which reconfigure stages actually completed, so the catch
             // re-marks ONLY the stage that failed — re-marking an
@@ -1231,7 +1242,15 @@ public:
                     }
                     sdk_local.put_binning(handle, active_bin);
                     sdk_local.put_trigger_mode(handle, 1);
-                    sdk_local.start_pull_mode(handle, &ToupTekCameraDriver::on_event_static, this);
+                    {
+                        // An abort that landed during the restart stopped the stream
+                        // already; starting it again would undo the abort and park
+                        // the worker in a frame wait. Check under mutex_ (the abort
+                        // bumps the generation under the same lock as its stop()).
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        if (abort_generation_.load() != abort_generation) throw ExposureAborted{};
+                        sdk_local.start_pull_mode(handle, &ToupTekCameraDriver::on_event_static, this);
+                    }
                     format_applied = true;  // flag cleared at snapshot time
                 }
 
@@ -1249,9 +1268,10 @@ public:
                 // LastExposureStartTime accuracy check.
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
+                    if (abort_generation_.load() != abort_generation) throw ExposureAborted{};
                     last_exposure_start_ = std::chrono::system_clock::now();
+                    sdk_local.trigger(handle, 1);
                 }
-                sdk_local.trigger(handle, 1);
 
                 unsigned timeout_ms = (exposure_us / 1000) + 10000;
                 // Buffer is num_x * num_y pixels at the sensor's byte depth
@@ -1282,7 +1302,9 @@ public:
                                                 got_w, got_h);
 
                 if (!got || !exposure_active_.load()) {
-                    ALPACA_LOG_WARN(branding_.label, "Exposure failed or aborted before frame arrived");
+                    const char* failure_message = got ? "A frame arrived after the exposure was no longer active"
+                                                      : "The camera failed to deliver the exposure frame";
+                    ALPACA_LOG_WARN(branding_.label, failure_message);
                     // Publish the false-transition under readout_mutex_ so the
                     // invariant "exposure_active_ only changes under readout_mutex_"
                     // holds on the exposure thread's own exit paths too (matching
@@ -1290,15 +1312,28 @@ public:
                     // thread holds neither mutex_ nor the SDK lock — so it respects
                     // the mutex_ -> readout_mutex_ order, and no join site holds
                     // readout_mutex_, so this cannot deadlock the joining thread.
-                    std::lock_guard<std::mutex> rlock(readout_mutex_);
-                    exposure_active_.store(false);
+                    {
+                        std::lock_guard<std::mutex> rlock(readout_mutex_);
+                        exposure_active_.store(false);
+                    }
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (abort_generation_.load() == abort_generation) {
+                        exposure_failure_ = failure_message;
+                    }
                     return;
+                }
+
+                if (got_w > static_cast<unsigned>(std::numeric_limits<int>::max()) ||
+                    got_h > static_cast<unsigned>(std::numeric_limits<int>::max())) {
+                    alpacacore::util::throw_invalid_camera_image("ToupTek frame dimensions exceed supported limits");
                 }
 
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    last_image_ = build_image_array(pixel_buffer, active_16bit, active_num_x, active_num_y,
-                                                    static_cast<int>(got_w), static_cast<int>(got_h));
+                    ImageArray image = build_image_array(pixel_buffer, active_16bit, active_num_x, active_num_y,
+                                                         static_cast<int>(got_w), static_cast<int>(got_h));
+                    alpacacore::util::validate_image_array(image);
+                    last_image_ = std::move(image);
                     image_cached_ = true;
                     // image_ready_ is intentionally NOT set here — it is published
                     // AFTER exposure_active_ is cleared below, so a poller never
@@ -1307,12 +1342,21 @@ public:
                     // captured, so remaining Exposing during this build is fine.
                 }
                 frame_ready = true;
+            } catch (const ExposureAborted&) {
+                // Aborted before the frame started: the abort already forced the
+                // next exposure to re-init the stream; nothing to re-mark.
+                ALPACA_LOG_DEBUG(branding_.label, "Exposure aborted before the frame started");
             } catch (const std::exception& e) {
                 ALPACA_LOG_WARN(branding_.label, "Exposure failed: " + std::string(e.what()));
                 // Re-mark only the stage that did NOT complete, so the next
                 // exposure re-applies the failed reconfigure without needlessly
                 // restarting the stream for one that already succeeded.
                 std::lock_guard<std::mutex> lock(mutex_);
+                if (abort_generation_.load() == abort_generation) {
+                    exposure_failure_ = e.what();
+                    image_ready_ = false;
+                    image_cached_ = false;
+                }
                 if (dirty_format && !format_applied) format_dirty_ = true;
                 if (dirty_roi && !roi_applied) roi_dirty_ = true;
             }
@@ -1328,7 +1372,12 @@ public:
             }
             if (frame_ready) {
                 std::lock_guard<std::mutex> lock(mutex_);
-                image_ready_ = true;
+                if (abort_generation_.load() == abort_generation) {
+                    image_ready_ = true;
+                } else {
+                    image_cached_ = false;
+                    last_image_ = {};
+                }
             }
         });
     }
@@ -1349,6 +1398,7 @@ public:
         // the frame is still live.
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            abort_generation_.fetch_add(1);
             if (handle_) {
                 try {
                     sdk_.stop(handle_);
@@ -1389,6 +1439,11 @@ private:
     std::string firmware_version_;
 
     std::atomic<bool> connected_;
+    // Bumped by stop_exposure() under mutex_, together with its stop(). The
+    // exposure worker compares it under mutex_ before restarting the stream and
+    // before the trigger, so an abort landing mid-restart is not undone.
+    std::atomic<uint64_t> abort_generation_{0};
+    struct ExposureAborted {};
     mutable std::mutex mutex_;
     // Serialises the exposure thread's LIFECYCLE: spawn (start_exposure) vs
     // join + handle close (set_connected(false)) vs join (stop_exposure). Without
@@ -1418,6 +1473,7 @@ private:
     double last_exposure_duration_;
     std::chrono::system_clock::time_point last_exposure_start_;
     bool last_exposure_valid_;
+    std::string exposure_failure_;
 
     mutable std::atomic<bool> exposure_active_;
     std::thread exposure_thread_;
@@ -1588,6 +1644,7 @@ private:
 
     void reset_exposure_state_locked() {
         image_ready_ = false;
+        exposure_failure_.clear();
         temperature_cache_valid_ = false;
         tec_cache_valid_ = false;
         tec_voltage_max_valid_ = false;
@@ -1614,6 +1671,7 @@ private:
         // exposure must restart it, so mark format/ROI dirty.
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            abort_generation_.fetch_add(1);
             if (handle_) {
                 try {
                     sdk_.stop(handle_);
@@ -1746,17 +1804,24 @@ private:
         image.width = out_width;
         image.height = out_height;
         image.rank = 2;
-        if (out_width <= 0 || out_height <= 0) {
-            image.rank = 0;
-            return image;
+        if (out_width <= 0 || out_height <= 0 || actual_width <= 0 || actual_height <= 0) {
+            alpacacore::util::throw_invalid_camera_image("invalid ToupTek frame dimensions");
         }
-        const int copy_w = std::min(out_width, actual_width > 0 ? actual_width : out_width);
-        const int copy_h = std::min(out_height, actual_height > 0 ? actual_height : out_height);
+        // start_exposure() even-pads the sensor-space ROI before binning so the
+        // SDK must deliver the requested output dimensions. Unlike QHY's SDK,
+        // ToupTek's smaller positive dimensions violate that ROI contract; do
+        // not synthesize pixels from a frame the SDK reports as truncated.
+        if (actual_width < out_width || actual_height < out_height) {
+            alpacacore::util::throw_invalid_camera_image("ToupTek frame is smaller than the requested ROI");
+        }
         const std::size_t bpp = is_16bit ? 2 : 1;
-        image.data.assign(static_cast<std::size_t>(out_width) *
-                          static_cast<std::size_t>(out_height), 0);
-        for (int row = 0; row < copy_h; ++row) {
-            for (int col = 0; col < copy_w; ++col) {
+        const std::size_t output_pixels = static_cast<std::size_t>(out_width) * static_cast<std::size_t>(out_height);
+        if (output_pixels > buffer.size() / bpp) {
+            alpacacore::util::throw_invalid_camera_image("ToupTek frame buffer is shorter than its dimensions");
+        }
+        image.data.resize(output_pixels);
+        for (int row = 0; row < out_height; ++row) {
+            for (int col = 0; col < out_width; ++col) {
                 std::size_t src_idx = static_cast<std::size_t>(row) *
                                       static_cast<std::size_t>(out_width) +
                                       static_cast<std::size_t>(col);
@@ -1769,6 +1834,7 @@ private:
                 }
             }
         }
+        alpacacore::util::validate_image_array(image);
         return image;
     }
 };

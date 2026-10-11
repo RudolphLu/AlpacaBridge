@@ -14,6 +14,7 @@
 #include <alpacacore/util/auto_detect.h>
 #include <alpacacore/util/error_handling.h>
 #include <alpacacore/util/logging.h>
+#include <alpacacore/util/rotator_sync_offset_store.h>
 #include <alpacacore/vendor/wandererastro/wandererastro_rotator_driver.h>
 #include <alpacacore/vendor/wandererastro/wandererastro_rotator_protocol_wrapper.h>
 #include <alpacacore/version.h>
@@ -135,8 +136,10 @@ public:
             }
             protocol_.connect(effective);
             {
+                // The Sync offset persists across reconnects and restarts (IRotatorV4).
+                const double saved_offset = util::RotatorSyncOffsetStore::load(get_unique_id());
                 std::lock_guard<std::mutex> lock(state_mutex_);
-                sync_offset_ = 0.0;
+                sync_offset_ = saved_offset;
                 target_position_ = 0.0;
                 has_target_position_ = false;
             }
@@ -185,7 +188,16 @@ public:
 
     bool get_is_moving() const override {
         ensure_connected();
-        return protocol_.get_state().moving;
+        const RotatorState state = protocol_.get_state();
+        if (state.completion_missing) {
+            // The move ended with no completion report; Position is the move
+            // start, so neither "moving" nor "arrived" is true. Say so.
+            throw AlpacaException(
+                "WandererRotator sent no move completion report; check the DC power supply. Position is the "
+                "last confirmed angle until the next move, Halt, Sync or reconnect",
+                AlpacaError::DriverException);
+        }
+        return state.moving;
     }
 
     double get_mechanical_position() const override {
@@ -255,10 +267,13 @@ public:
         ensure_connected();
         const double mechanical = protocol_.get_state().mechanical_angle;
         const double target = normalize_angle(position);
+        protocol_.clear_completion_missing();
         std::lock_guard<std::mutex> lock(state_mutex_);
         sync_offset_ = normalize_angle(target - mechanical);
         target_position_ = target;
         has_target_position_ = true;
+        // Best effort: a storage failure logs a WARNING and never fails Sync.
+        util::RotatorSyncOffsetStore::save(get_unique_id(), sync_offset_);
     }
 
 private:

@@ -24,6 +24,7 @@
 #ifndef _WIN32
 
 #include <alpacacore/telescope_driver.h>
+#include <alpacacore/util/motion_limits.h>
 #include <alpacacore/vendor/skywatcher/skywatcher_telescope_driver.h>
 
 #include <atomic>
@@ -51,16 +52,29 @@ sw::ConnectionInfo endpoint_for_port(int port) {
 
 sw::ConnectionInfo endpoint(const FakeSkyWatcherMount& mount) { return endpoint_for_port(mount.port()); }
 
+// open-astro#436: both limits set, so every MoveAxis and Tracking start in the
+// storm also starts (and supersedes) a live limit guard body, and every
+// disconnect and destruction must join it. The floor sits below anything the
+// storm's goto target (Dec 20) can reach here, so no goto is refused for it;
+// the meridian limit can fire on a MoveAxis and exercises the guard's stop.
+alpacacore::util::MotionLimits stress_limits() {
+    alpacacore::util::MotionLimits limits;
+    limits.min_altitude_deg = -45.0;
+    limits.meridian_limit_minutes = 15.0;
+    return limits;
+}
+
 std::unique_ptr<alpacacore::TelescopeDriver> make_driver(const FakeSkyWatcherMount& mount) {
-    return sw::create_skywatcher_telescope(0, endpoint(mount), 39.7392, -104.9903, 1609.0);
+    return sw::create_skywatcher_telescope(0, endpoint(mount), 39.7392, -104.9903, 1609.0, {}, stress_limits());
 }
 
 // Hammers every worker thread the driver's disconnect/destructor path must
-// join: slew_task_thread_, pulse_task_thread_, both per-axis
-// stop_task_thread_[axis] (MoveAxis stops issued close together — the exact
+// join: the slew slot, both per-axis pulse
+// slots, both per-axis
+// stop slots (MoveAxis stops issued close together — the exact
 // shape of the 2026-09-06 "superseded MoveAxis stop task strands Slewing"
-// bug in .github/instructions/skywatcher.instructions.md), rate_verify_thread_ (open-astro #248) and the
-// duty_thread_ that set_tracking starts and stops.
+// bug in .github/instructions/skywatcher.instructions.md), the rate-verify slot (open-astro #248) and the
+// duty-cycle slot that set_tracking starts and stops.
 //
 // The rate-verify task only spawns on an in-place rate change: tracking must
 // be on (otherwise the setter stores the value and returns), the new rate
@@ -83,7 +97,7 @@ void skywatcher_operate(alpacacore::test::StressCallGuard& guard, AlpacaDriver& 
     guard([&] { scope.set_tracking(true); });
     guard([&] { scope.set_guide_rate({0.004, 0.004}); });
     const double ra_rate = (g_rate_toggle.fetch_add(1) % 2 == 0) ? 0.25 : 0.0;
-    // in-place change spawns rate_verify_thread_ (#248)
+    // in-place change starts the rate-verify slot (#248)
     guard([&] { scope.set_right_ascension_rate(ra_rate); });
 
     guard([&] { scope.slew_to_coordinates_async(5.0, 20.0); });
@@ -170,8 +184,8 @@ TEST_CASE("SkyWatcher telescope - destruction mid-operation (slew/pulse/stop/rat
         // destroying an idle object.
         REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(5)));
         // Tracking on, then a non-zero rate on a fresh driver (stored rate
-        // 0.0) while the axes are still free: the in-place path spawns
-        // rate_verify_thread_. After the slew below the setter would only
+        // 0.0) while the axes are still free: the in-place path starts
+        // the rate-verify slot. After the slew below the setter would only
         // store the rate.
         try {
             driver->set_tracking(true);
@@ -197,7 +211,7 @@ TEST_CASE("SkyWatcher telescope - destruction mid-operation (slew/pulse/stop/rat
             driver->move_axis(1, 1.0);
         } catch (const std::exception&) {
         }
-        // MoveAxis(axis, 0) on a moving axis is what spawns stop_task_thread_[axis].
+        // MoveAxis(axis, 0) on a moving axis is what starts the axis's stop slot.
         try {
             driver->move_axis(0, 0.0);
         } catch (const std::exception&) {

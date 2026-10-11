@@ -308,6 +308,15 @@ section "Falsified-by (PR body)"
 if python3 scripts/check_falsified_by.py --self-test; then
   if [ -z "${PR_BODY_FILE:-}" ]; then
     record SKIP "falsified-by (no PR body)"
+  elif [[ "$(git branch --show-current 2>/dev/null)" == merge-down/* ]] \
+       && python3 scripts/merge_down.py --exempt --head-ref "$(git branch --show-current 2>/dev/null)" \
+            --base-ref "${BASE}" --base-rev "${MERGE_BASE}" \
+            --stable-remote "$(case "${BASE}" in */*) echo "${BASE%%/*}" ;; *) echo origin ;; esac)"; then
+    # Same exemption, same script as the falsified-by CI job: a merge down
+    # (merge-down/X.Y-to-<target> against that target, nothing that is not
+    # already on stable/X.Y) carries test cases already gated on their fix PRs
+    # (docs/beta-channel.md). Set PREFLIGHT_BASE to the PR's base.
+    record SKIP "falsified-by (merge down)"
   elif [ ! -f "${PR_BODY_FILE}" ]; then
     echo "falsified-by: PR_BODY_FILE is set but ${PR_BODY_FILE} does not exist"
     record FAIL "falsified-by"
@@ -318,6 +327,24 @@ if python3 scripts/check_falsified_by.py --self-test; then
   fi
 else
   record FAIL "falsified-by"
+fi
+
+# --- gate 2b3: PR body follows the PR template ------------------------------
+
+section "PR template (PR body)"
+if python3 scripts/check_pr_template.py --self-test; then
+  if [ -z "${PR_BODY_FILE:-}" ]; then
+    record SKIP "pr-template (no PR body)"
+  elif [ ! -f "${PR_BODY_FILE}" ]; then
+    echo "pr-template: PR_BODY_FILE is set but ${PR_BODY_FILE} does not exist"
+    record FAIL "pr-template"
+  elif python3 scripts/check_pr_template.py --body-file "${PR_BODY_FILE}"; then
+    record PASS "pr-template"
+  else
+    record FAIL "pr-template"
+  fi
+else
+  record FAIL "pr-template"
 fi
 
 # --- gate 2c: ConformU report validation ------------------------------------
@@ -336,7 +363,11 @@ if python3 scripts/check_docs_drift.py --self-test && python3 scripts/check_docs
    && python3 scripts/changelog_section.py --self-test \
    && python3 scripts/changelog_fragments.py --self-test \
    && python3 scripts/changelog_fragments.py --check \
-   && python3 scripts/changelog_to_deb.py --self-test; then
+   && python3 scripts/changelog_to_deb.py --self-test \
+   && python3 scripts/release_tag.py --self-test \
+   && python3 scripts/merge_down.py --self-test \
+   && python3 scripts/dependency_snapshot.py --self-test \
+   && python3 scripts/dependency_snapshot.py --check; then
   record PASS "docs drift check"
 else
   record FAIL "docs drift check"
@@ -372,10 +403,31 @@ fi
 # --- gate 3: build + unit tests, vendor-neutral ----------------------------
 
 section "Build + tests (vendors OFF)"
+# Catch2 probe (issue #593): without it AlpacaCore/tests/CMakeLists.txt returns
+# early and ctest can only say "No tests were found", so name the cause here.
+if ! compgen -G "/usr/lib/cmake/Catch2" >/dev/null \
+   && ! compgen -G "/usr/lib/*/cmake/Catch2" >/dev/null \
+   && ! compgen -G "/usr/local/lib/cmake/Catch2" >/dev/null \
+   && ! compgen -G "/usr/share/cmake/Catch2" >/dev/null; then
+  echo "Catch2 not found: install catch2 (apt) or the AlpacaCore tests will not configure"
+fi
 if ALPACACORE_ENABLE_ALL_VENDORS=OFF ./run_all_tests.sh; then
   record PASS "build+test (vendors OFF)"
 else
   record FAIL "build+test (vendors OFF)"
+fi
+
+# --- gate 3b: the beta VERSION split ---------------------------------------
+#
+# Mirrors the build-test CI step: the VERSION helper both CMakeLists include
+# gives project() the base version and the version defines the full string
+# (docs/beta-channel.md). cmake -P only, no configure.
+
+section "Beta VERSION split"
+if scripts/check_beta_configure.sh; then
+  record PASS "beta VERSION split"
+else
+  record FAIL "beta VERSION split"
 fi
 
 # --- gate 4: build + unit tests, all vendors -------------------------------
@@ -404,6 +456,7 @@ elif ensure_tool clang-tidy clang-tidy; then
   cmake -S AlpacaHTTP -B AlpacaHTTP/build \
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
     -DALPACAHTTP_BUILD_TESTS=ON \
+    -DALPACACORE_BUILD_TESTS=ON \
     -DALPACACORE_ENABLE_ALL_VENDORS=ON >/dev/null
   cmake --build AlpacaHTTP/build --parallel "${PARALLEL}" >/dev/null
   tidy_diff="$(dpkg -L clang-tidy 2>/dev/null | grep -m1 -E 'clang-tidy-diff.*\.py' || true)"

@@ -84,6 +84,106 @@ git remote -v | grep upstream
   > `git remote add upstream https://github.com/open-astro/AlpacaBridge.git`"
 - PRs from forks target `open-astro/AlpacaBridge:main` as the base.
 
+### Base branch (`--base`) and merge-down mode (`--merge-down`)
+
+The base is `main` unless the user passes `--base stable/X.Y`: a fix for a release in its beta
+(see `docs/beta-channel.md`). Only bug and stability fixes go there (no features, refactors or new
+drivers); say so and stop if the diff is not one. With `--base stable/X.Y`, read every `main` in
+Steps 3-7 as `stable/X.Y` (`git log stable/X.Y..HEAD`, `gh pr create --base stable/X.Y`, and
+`PREFLIGHT_BASE=origin/stable/X.Y` for the pre-flight), and the changelog fragment is still required.
+
+`--merge-down stable/X.Y [--into stable/X.Z]` opens the merge-down PR that follows each beta tag,
+the stable tag and each hotfix: `stable/X.Y` -> `main` by default, or a hotfix into a newer
+`stable/X.Z` (`--into`; a hotfix during the next beta goes to both, as two PRs). Its head is a
+short-lived branch cut from the stable branch, **never `stable/X.Y` itself**: the repository deletes
+a PR's head branch on merge (`delete_branch_on_merge`), and `/pr-checker`'s update-branch step
+merges the base into the head, which on `stable/X.Y` would put `main`'s unreleased work on the
+stable branch. The head is named per receiving branch, `merge-down/X.Y-to-main` or
+`merge-down/X.Y-to-X.Z`, so merging one of a hotfix's two PRs never deletes the other's head. First
+confirm an active ruleset protects the stable branches, or stop and ask the maintainer to add one.
+The list endpoint returns no conditions, so read each active ruleset by id:
+
+```bash
+for id in $(gh api repos/open-astro/AlpacaBridge/rulesets --jq '.[] | select(.enforcement=="active") | .id'); do
+  gh api "repos/open-astro/AlpacaBridge/rulesets/${id}" \
+    --jq '"\(.id) \((.conditions.ref_name.include // []) | join(",")) rules=\([.rules[].type] | join(","))"'
+done
+# one line must include refs/heads/stable/** (or refs/heads/stable/*) with rules deletion and non_fast_forward
+# (~DEFAULT_BRANCH is main's own ruleset, not this one)
+```
+
+Then build the head (the receiving branch is merged into it, so the version files are resolved
+before the PR exists):
+
+```bash
+SRC=X.Y; TGT=main                     # or TGT=X.Z for a hotfix into stable/X.Z
+BASE_BRANCH="$([ "${TGT}" = main ] && echo main || echo "stable/${TGT}")"
+HEAD_BRANCH="merge-down/${SRC}-to-${TGT}"
+git fetch origin "stable/${SRC}" "${BASE_BRANCH}"
+# -B: the local branch from the previous merge down survives its merge (origin deletes only the
+# remote copy); reset it to the current stable tip instead of reusing the old one.
+git checkout -B "${HEAD_BRANCH}" "origin/stable/${SRC}"
+# Before the merge, so rerere records the conflicts it starts (per clone, set once).
+git config rerere.enabled true
+# autoupdate=false: a replayed path stays unstaged even if it is on in the global config.
+git -c rerere.autoupdate=false merge --no-ff --no-commit "origin/${BASE_BRANCH}" || true   # VERSION/README conflicts are expected
+git rerere remaining   # conflicted paths rerere did not resolve: these still need hand work
+```
+
+**rerere.** The block turns on `rerere`: Git records how each conflict was resolved when the merge
+commit is made, and replays that resolution when the exact same conflict hunk appears again. The
+merge output names every replay (`Resolved '<path>' using previous resolution.`), and
+`git rerere remaining` lists the conflicted paths it did not resolve. The gain is on hunks that
+repeat byte for byte, such as changelog fragments and code conflicts already resolved in an
+earlier merge down. `VERSION` and the badge line rarely repeat (the beta number changes) and are
+overwritten by the steps below anyway. The merge runs with `rerere.autoupdate` off, so a replayed
+path stays unmerged until `git add`, and the `--diff-filter=U` guard below still stops an unread
+replay from being committed. Read a replayed code file as carefully as a hand resolution. The
+setting is per clone and stays on for every later merge there, merge downs or not. While
+`rerere.enabled` is unset, Git also turns rerere on whenever `.git/rr-cache` exists, so to turn it
+off, set `git config rerere.enabled false`.
+
+**Version files.** The receiving branch keeps its own `VERSION` and README badge line: `main` names
+the newest stable release, never a beta, and `stable/X.Z` keeps its own beta. The one exception is
+a merge into `main` that brings a stable release newer than `main`'s `VERSION` (the promotion, or a
+hotfix before the next promotion): then the stable side's `VERSION` and badge come across, because
+that release is now the newest. Everything else, `docs/releases/` notes included, comes across as
+it is (each notes file is named for its version, so none conflict). Keep the receiving side with:
+
+```bash
+KEEP="origin/${BASE_BRANCH}"
+# The promotion / hotfix-into-main exception: a newer, non-beta stable VERSION wins.
+[ "${TGT}" = main ] && python3 -c 'import sys; sys.path.insert(0, "scripts"); from changelog_fragments import is_beta, version_tuple as v; s, m = sys.argv[1:]; sys.exit(0 if not is_beta(s) and v(s) > v(m) else 1)' \
+  "$(git show "origin/stable/${SRC}:VERSION")" "$(git show origin/main:VERSION)" && KEEP="origin/stable/${SRC}"
+git checkout "${KEEP}" -- VERSION
+# Replaces the badge line, or the whole conflict hunk when both sides changed it.
+python3 -c 'import re,sys; p="README.md"; s=open(p).read(); b=r"(?:#### \[.*\n)+"; open(p,"w").write(re.sub(r"^(?:<{7} .*\n" + b + r"(?:\|{7}.*\n(?:#### \[.*\n)*)?={7}\n" + b + r">{7} .*$|#### \[.*$)", lambda m: sys.argv[1], s, count=1, flags=re.M))' \
+  "$(git show "${KEEP}:README.md" | grep -m1 '^#### \[')"
+git add VERSION README.md
+```
+
+In `CHANGELOG.md` a dated `## [X.Y.Z]` section is inserted in version order below the receiving
+branch's sections. Resolve any other conflict by hand, then check and push:
+
+```bash
+python3 scripts/check_docs_drift.py          # VERSION and badge agree (check 4)
+# Stop on an unresolved conflict: check 4 reads only the first badge line, so it passes over markers.
+[ -z "$(git diff --name-only --diff-filter=U)" ] && ! git diff --cached | grep -qE '^\+(<{7}|>{7})( |$)' &&
+git commit --no-edit
+git push -u origin "${HEAD_BRANCH}"
+gh pr create --base "${BASE_BRANCH}" --head "${HEAD_BRANCH}" --title "Merge stable/${SRC} into ${BASE_BRANCH}"
+```
+
+Run the pre-flight with `PREFLIGHT_BASE=origin/${BASE_BRANCH}`. Skip the fragment, version and
+Falsified-by questions (the commits were already reviewed on the branch). The `falsified-by` job
+and pre-flight gate 2b2 skip a merge down through `scripts/merge_down.py`, only when the head name,
+the base it names and the commits all match: a commit that is not already on `stable/X.Y` (other
+than the merge commit) puts the PR back under the gate. The body fills
+`.github/PULL_REQUEST_TEMPLATE.md` (what the tag carried; "No issue exists"). Merge it with
+`/pr-checker`, which uses the merge-commit method, **never squash**: squashing would hide the
+branch history and make the next merge down conflict again. The head is deleted on merge, as
+intended; `stable/X.Y` is untouched.
+
 ## Step 3 — Analyze the branch for PR content
 
 Gather all changes on this branch relative to `main`:
@@ -123,7 +223,10 @@ AlpacaBridge is an end-user appliance, so "breaking" means breaks an existing us
 setup. Bump relative to the last **released** version:
 
 - **MAJOR** `x.0.0` — breaks an existing user (drop a platform, remove a driver, config-format
-  change needing migration, change a default that alters behavior): `### Breaking changes`.
+  change needing migration, change a default that alters behavior, a saved config that loaded is
+  now refused at start-up, a call that succeeded is now refused): `### Breaking changes`. Apply the
+  "Breaking or not" test in `changelog.d/README.md` to every change, fixes included; a fix with a
+  breaking consequence keeps its `Fixed` bullet and adds a `Breaking changes` one.
 - **MINOR** `x.Y.0` — new backward-compatible capability: **a new driver**, new device/model
   support, a new optional feature/flag. Resets patch to 0: an unqualified `### Added`.
 - **PATCH** `x.y.Z` — no new capability: bug fix to an existing driver, ConformU re-validation,
@@ -132,7 +235,8 @@ setup. Bump relative to the last **released** version:
 A branch that adds a new driver MUST have an unqualified `### Added` entry, never only a
 `Fixed`/`Changed` one. If the fragment undershoots, flag it and recommend running `/commit` to
 correct it before opening the PR — don't open a PR whose fragment misrepresents the change. The
-branch must not edit `CHANGELOG.md`; run `python3 scripts/changelog_fragments.py --check`.
+branch must not edit `CHANGELOG.md`, except to correct a misfiled or wrong entry (say so in the PR
+description); run `python3 scripts/changelog_fragments.py --check`.
 
 ### Release version bump (ask the user — MANDATORY, every run)
 
@@ -227,10 +331,11 @@ Build the body from the branch's commits and diffs. The body is
 - Driver PRs: the vendor and device model, the unit-test case and assertion counts, the ConformU result and the report path (`AlpacaCore/conformu/<Vendor>/<Model>/<arch>/`) go under **Verification**.
 - Web UI Before / After tables go under **Verification**.
 - The body ends with `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
+- Check the shape before you submit: save the body to a file and run `python3 scripts/check_pr_template.py --body-file <file>` (pre-flight runs it when `PR_BODY_FILE` is set). The `pr-template` job in `.github/workflows/pr-body.yml` runs the same check on the PR.
 
 ### Falsified by (new test cases)
 
-Run `python3 scripts/check_falsified_by.py --base <merge-base>` first; it lists each new or renamed test case in the diff. For every one, draft a line under a `Falsified by:` heading in the body: `- "<case name>": <production path>:<line> <the one edit that makes the case fail>`. Read the code the case exercises to propose the mutation, then ask the user to confirm or correct each one. Never invent a mutation you have not read in the code. No new cases: omit the section. Before submitting, save the body to a file and run `PR_BODY_FILE=<file> ./scripts/ci_preflight.sh` (or `python3 scripts/check_falsified_by.py --body-file <file>`); the `falsified-by` job in `.github/workflows/pr-body.yml` runs the same check on the PR.
+Run `python3 scripts/check_falsified_by.py --base <merge-base>` first; it lists each new or renamed test case in the diff. For every one, draft a line under a `## Falsified by` heading placed after `## What Changed` in the body: `- "<case name>": <production path>:<line> <the one edit that makes the case fail>`. Read the code the case exercises to propose the mutation, then ask the user to confirm or correct each one. Never invent a mutation you have not read in the code. No new cases: omit the section. Before submitting, save the body to a file and run `PR_BODY_FILE=<file> ./scripts/ci_preflight.sh` (or `python3 scripts/check_falsified_by.py --body-file <file>`); the `falsified-by` job in `.github/workflows/pr-body.yml` runs the same check on the PR.
 
 ### Present for approval
 
