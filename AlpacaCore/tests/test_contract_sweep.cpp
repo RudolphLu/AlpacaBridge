@@ -1501,6 +1501,7 @@ Tier2Host tier2_host_wandererastro_switch() {
 #define CS2_ALTAIR(X) X(altair_camera, NPR)
 #else
 #define CS2_ALTAIR(X)
+#endif
 #ifdef ALPACACORE_ENABLE_SVBONY
 #define CS2_SVBONY(X) X(svbony_camera, NPR)
 #else
@@ -1637,6 +1638,7 @@ TEST_CASE("Contract sweep tier 2 - hosts match kFakeConnectableRoster", "[contra
 #endif
 #ifdef ALPACACORE_ENABLE_ALTAIR
     CS2_ENABLED("altair")
+#endif
 #ifdef ALPACACORE_ENABLE_SVBONY
     CS2_ENABLED("svbony")
 #endif
