@@ -125,7 +125,8 @@ git fetch origin "stable/${SRC}" "${BASE_BRANCH}"
 git checkout -B "${HEAD_BRANCH}" "origin/stable/${SRC}"
 # Before the merge, so rerere records the conflicts it starts (per clone, set once).
 git config rerere.enabled true
-git merge --no-ff --no-commit "origin/${BASE_BRANCH}" || true   # VERSION/README conflicts are expected
+# autoupdate=false: a replayed path stays unstaged even if it is on in the global config.
+git -c rerere.autoupdate=false merge --no-ff --no-commit "origin/${BASE_BRANCH}" || true   # VERSION/README conflicts are expected
 git rerere remaining   # conflicted paths rerere did not resolve: these still need hand work
 ```
 
@@ -135,11 +136,12 @@ merge output names every replay (`Resolved '<path>' using previous resolution.`)
 `git rerere remaining` lists the conflicted paths it did not resolve. The gain is on hunks that
 repeat byte for byte, such as changelog fragments and code conflicts already resolved in an
 earlier merge down. `VERSION` and the badge line rarely repeat (the beta number changes) and are
-overwritten by the steps below anyway. Leave `rerere.autoupdate` off: a replayed path stays
-unmerged until `git add`, so the `--diff-filter=U` guard below still stops an unread replay from
-being committed. Read a replayed code file as carefully as a hand resolution. The setting is per
-clone and permanent there; to scope it to one merge, use `git -c rerere.enabled=true merge ...`
-instead.
+overwritten by the steps below anyway. The merge runs with `rerere.autoupdate` off, so a replayed
+path stays unmerged until `git add`, and the `--diff-filter=U` guard below still stops an unread
+replay from being committed. Read a replayed code file as carefully as a hand resolution. The
+setting is per clone and stays on for every later merge there, merge downs or not. While
+`rerere.enabled` is unset, Git also turns rerere on whenever `.git/rr-cache` exists, so to turn it
+off, set `git config rerere.enabled false`.
 
 **Version files.** The receiving branch keeps its own `VERSION` and README badge line: `main` names
 the newest stable release, never a beta, and `stable/X.Z` keeps its own beta. The one exception is
