@@ -86,11 +86,16 @@ git remote -v | grep upstream
 
 ### Base branch (`--base`) and merge-down mode (`--merge-down`)
 
-The base is `main` unless the user passes `--base stable/X.Y`: a fix for a release in its beta
-(see `docs/beta-channel.md`). Only bug and stability fixes go there (no features, refactors or new
-drivers); say so and stop if the diff is not one. With `--base stable/X.Y`, read every `main` in
-Steps 3-7 as `stable/X.Y` (`git log stable/X.Y..HEAD`, `gh pr create --base stable/X.Y`, and
-`PREFLIGHT_BASE=origin/stable/X.Y` for the pre-flight), and the changelog fragment is still required.
+The base is `main` unless the user passes `--base stable/X.Y`: a fix for a release in its beta (see
+`docs/beta-channel.md`). Only a fix for a defect or regression introduced after the previous stable
+release (the last stable tag before `X.Y.0`) passes the admission test in "Rules for the stable
+branch" there: a defect that release also had, a feature, refactor, new driver, test, tooling or
+docs change targets `main`, and so does a fix that adds a new SDK seam or fake, a client-visible
+capability-flag change, a state-machine rewrite or a driver change that needs a fresh ConformU
+run, unless the maintainer admitted it by name on the promotion milestone. Say so and stop if the
+diff does not pass. With `--base stable/X.Y`, read every `main` in Steps 3-7 as `stable/X.Y` (`git log stable/X.Y..HEAD`, `gh pr
+create --base stable/X.Y`, and `PREFLIGHT_BASE=origin/stable/X.Y` for the pre-flight), and the
+changelog fragment is still required.
 
 `--merge-down stable/X.Y [--into stable/X.Z]` opens the merge-down PR that follows each beta tag,
 the stable tag and each hotfix: `stable/X.Y` -> `main` by default, or a hotfix into a newer
