@@ -104,12 +104,17 @@ jobs:
         with:
           # Subscription auth: `claude setup-token`, stored as CLAUDE_CODE_OAUTH_TOKEN.
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # TEMPORARY (2026-10-11): every run since 14:28 UTC ends 2 s after init
+          # with is_error:true, cost 0, no model usage, and the action hides the
+          # API error body by default. Print it once, then revert this line: it
+          # also prints the whole review session into the public job log.
+          show_full_output: true
           # Explicit token: the action's OIDC exchange 401s pull_request_target
           # runs. The comment then posts as github-actions[bot].
           github_token: ${{ github.token }}
           # The action also requires the TRIGGERING ACTOR to have write access,
           # so a fork contributor's own push needs their login here (never '*').
-          allowed_non_write_users: "htly9981,Knetus56,zeroastroboy,diegopereiran,kern2011"
+          allowed_non_write_users: "htly9981,Knetus56,zeroastroboy,diegopereiran,kern2011,pauleyj"
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
