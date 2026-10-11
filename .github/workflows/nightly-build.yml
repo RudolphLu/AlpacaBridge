@@ -1,5 +1,5 @@
 # Build the arm64 .deb from main every night and publish it on a moving
-# `nightly` pre-release (issue #1035).
+# `nightly-build` pre-release (issue #1035).
 #
 # Nightlies are for testers who want a fix that has merged to main before a
 # beta carries it. They are unsupported and never reach apt.openastro.net.
@@ -10,16 +10,17 @@
 # every beta of that version and below the release itself: a tester moves
 # beta -> nightly -> release without a downgrade.
 #
-# The `nightly` tag is moved to the built commit and the release's assets are
+# The `nightly-build` tag is moved to the built commit and the release's assets are
 # replaced. The tag does not match release.yml's v* filters, so it publishes
 # nothing else. The release is marked --latest=false so the repository's
 # Latest release stays the stable one.
 #
-# The cron fires only on open-astro/AlpacaBridge, so forks do not build every
-# night; a manual run works anywhere (`gh workflow run nightly.yml --ref
-# <branch> [-f force=true]`) and builds that branch.
+# Upstream builds main only (the cron, or `gh workflow run nightly-build.yml
+# -f force=true`), so the public nightly-build release always names a main
+# commit. Forks never build on the cron; a manual run there builds the branch
+# it is dispatched on, for testing the workflow itself.
 
-name: Nightly
+name: Nightly Build
 
 on:
   schedule:
@@ -27,7 +28,7 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: "Build even if the nightly tag already points at this commit"
+        description: "Build even if the nightly-build tag already points at this commit"
         required: false
         type: boolean
         default: false
@@ -36,7 +37,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: nightly
+  group: nightly-build
   cancel-in-progress: false
 
 defaults:
@@ -46,25 +47,27 @@ defaults:
 jobs:
   check:
     name: Skip if main has not moved
-    if: github.repository == 'open-astro/AlpacaBridge' || github.event_name == 'workflow_dispatch'
+    if: >-
+      (github.repository == 'open-astro/AlpacaBridge' && github.ref == 'refs/heads/main') ||
+      (github.repository != 'open-astro/AlpacaBridge' && github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     outputs:
       build: ${{ steps.compare.outputs.build }}
     steps:
-      - name: Compare HEAD with the nightly tag
+      - name: Compare HEAD with the nightly-build tag
         id: compare
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
         run: |
           set -euo pipefail
-          tagged="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/nightly" --jq .object.sha 2>/dev/null || true)"
+          tagged="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/nightly-build" --jq .object.sha 2>/dev/null || true)"
           if [ "${tagged}" = "${GITHUB_SHA}" ] && [ "${FORCE}" != "true" ]; then
-            echo "nightly already points at ${GITHUB_SHA}; nothing to build."
+            echo "nightly-build already points at ${GITHUB_SHA}; nothing to build."
             echo "build=false" >> "${GITHUB_OUTPUT}"
           else
-            echo "Building ${GITHUB_SHA} (nightly tag: ${tagged:-none})."
+            echo "Building ${GITHUB_SHA} (nightly-build tag: ${tagged:-none})."
             echo "build=true" >> "${GITHUB_OUTPUT}"
           fi
 
@@ -73,7 +76,7 @@ jobs:
     needs: check
     if: needs.check.outputs.build == 'true'
     permissions:
-      contents: write   # move the nightly tag, gh release create/edit/upload
+      contents: write   # move the nightly-build tag, gh release create/edit/upload
     runs-on: ubuntu-24.04-arm
     # Built on the target distribution so dpkg-shlibdeps derives trixie
     # package names, as release.yml's beta-deb job does.
@@ -132,19 +135,19 @@ jobs:
           dpkg-deb --info "dist/${ASSET}" | sed -n '/Package:/,/Depends:/p'
           ls -l dist
 
-      - name: Move the nightly tag
+      - name: Move the nightly-build tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/nightly" >/dev/null 2>&1; then
-            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/nightly" \
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/nightly-build" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/nightly-build" \
               -f sha="${GITHUB_SHA}" -F force=true >/dev/null
           else
             gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f ref=refs/tags/nightly -f sha="${GITHUB_SHA}" >/dev/null
+              -f ref=refs/tags/nightly-build -f sha="${GITHUB_SHA}" >/dev/null
           fi
-          echo "nightly -> ${GITHUB_SHA}"
+          echo "nightly-build -> ${GITHUB_SHA}"
 
       - name: Publish the nightly pre-release
         env:
@@ -153,9 +156,9 @@ jobs:
           ASSET: ${{ steps.version.outputs.asset }}
         run: |
           set -euo pipefail
-          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/nightly/${ASSET}"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/nightly-build/${ASSET}"
           {
-            echo "Nightly build of \`main\` at ${GITHUB_SHA} (version \`${VERSION_STR}\`)."
+            echo "Nightly build of \`${GITHUB_REF_NAME}\` at ${GITHUB_SHA} (version \`${VERSION_STR}\`)."
             echo ""
             echo "Unsupported: built from unreleased code that has not been validated on hardware. Use a beta or a stable release for observing."
             echo ""
@@ -167,20 +170,20 @@ jobs:
             echo ""
             echo "Changes since the last release: https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}/changelog.d"
           } > release-notes.md
-          if gh release view nightly --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release edit nightly --repo "${GITHUB_REPOSITORY}" --title "Nightly" \
+          if gh release view nightly-build --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit nightly-build --repo "${GITHUB_REPOSITORY}" --title "Nightly Build" \
               --notes-file release-notes.md --prerelease --latest=false
           else
-            gh release create nightly --repo "${GITHUB_REPOSITORY}" --title "Nightly" \
+            gh release create nightly-build --repo "${GITHUB_REPOSITORY}" --title "Nightly Build" \
               --notes-file release-notes.md --verify-tag --prerelease --latest=false
           fi
-          gh release upload nightly --repo "${GITHUB_REPOSITORY}" --clobber \
+          gh release upload nightly-build --repo "${GITHUB_REPOSITORY}" --clobber \
             "dist/${ASSET}" "dist/${ASSET}.sha256"
           # Upload first, then drop the previous night's assets, so the
           # release is never left without a .deb.
-          gh release view nightly --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name' |
+          gh release view nightly-build --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name' |
             while read -r name; do
               if [ "${name}" != "${ASSET}" ] && [ "${name}" != "${ASSET}.sha256" ]; then
-                gh release delete-asset nightly "${name}" --repo "${GITHUB_REPOSITORY}" --yes
+                gh release delete-asset nightly-build "${name}" --repo "${GITHUB_REPOSITORY}" --yes
               fi
             done

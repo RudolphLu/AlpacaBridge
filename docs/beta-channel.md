@@ -41,16 +41,17 @@ newest build of either kind.
 
 ## Nightly builds
 
-`.github/workflows/nightly.yml` builds `main` every night (03:17 UTC, skipped when `main` has not
-moved) and replaces the assets of the `nightly` pre-release on GitHub, whose tag moves to the built
+`.github/workflows/nightly-build.yml` builds `main` every night (03:17 UTC, skipped when `main` has not
+moved) and replaces the assets of the `nightly-build` pre-release on GitHub, whose tag moves to the built
 commit. A nightly is unreleased, unvalidated code for trying a merged fix before a beta carries it;
 it is never published to apt. Install it the way a beta is installed by hand above: download the
-`.deb` and its `.sha256` from the `nightly` release, check the sum, `sudo apt install ./<file>`.
+`.deb` and its `.sha256` from the `nightly-build` release, check the sum, `sudo apt install ./<file>`.
 
 Its version is `<next>~nightly<YYYYMMDDHHMM>.g<sha7>`, where `<next>` is what
 `changelog_fragments.py --bump` prints on `main`, so `5.0.0~beta2 < 5.0.0~nightly202610120317.gabc1234 < 5.0.0`:
-apt upgrades a nightly to the release when it ships. A maintainer can force a build with
-`gh workflow run nightly.yml --repo open-astro/AlpacaBridge -f force=true`.
+apt upgrades a nightly to the release when it ships. It also sorts above every beta of that
+version, so apt offers a tester on a nightly no later beta; install the next one by hand. A maintainer can force a build with
+`gh workflow run nightly-build.yml --repo open-astro/AlpacaBridge -f force=true`.
 
 ## Branch model
 
