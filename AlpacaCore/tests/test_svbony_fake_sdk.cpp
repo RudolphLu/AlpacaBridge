@@ -542,8 +542,10 @@ TEST_CASE("SVBONY Camera - persistent stop failure blocks reuse until a retry su
     const int reads = sdk.completed_video_data_reads();
     sdk.release_video_data();
     REQUIRE(sdk.wait_for_completed_video_data(reads + 1, 2s));
-    wait_for_driver_exception(*camera, "capture stop failed");
+    wait_for_driver_exception(*camera, "capture stop was not confirmed");
     require_array_failure(*camera);
+    CHECK(camera->get_camera_state() == alpacacore::CameraState::Error);
+    CHECK(camera->get_percent_completed() == 0.0);
 
     const int exposure_writes = sdk.call_count("set_control_value.Exposure");
     require_alpaca_error([&] { camera->start_exposure(0.001, true); }, alpacacore::AlpacaError::DriverException);
@@ -569,7 +571,7 @@ TEST_CASE("SVBONY Camera - close and reopen clears an unconfirmed capture stop",
     sdk.set_persistent_failure("stop_video_capture");
     require_alpaca_error([&] { camera->abort_exposure(); }, alpacacore::AlpacaError::DriverException);
     sdk.release_video_data();
-    wait_for_driver_exception(*camera, "capture stop failed");
+    wait_for_driver_exception(*camera, "capture stop was not confirmed");
 
     camera->set_connected(false);
     CHECK(sdk.open_count() == 0);
@@ -979,6 +981,17 @@ TEST_CASE("SVBONY Camera - invalid SDK ROI fails and a later exposure recovers",
     camera->start_exposure(0.001, true);
     wait_until_ready(*camera);
     CHECK(camera->get_image_array().data.size() == 128);
+}
+
+TEST_CASE("SVBONY Camera - pre-capture failure does not issue a stop", "[svbony][camera][unit]") {
+    alpacacore::test::FakeSVBSDK sdk;
+    auto camera = connected_camera(sdk);
+    sdk.return_roi({0, 0, 0, 8, 1});
+
+    camera->start_exposure(0.001, true);
+    wait_for_driver_exception(*camera, "invalid ROI metadata");
+    CHECK(sdk.call_count("start_video_capture") == 0);
+    CHECK(sdk.call_count("stop_video_capture") == 0);
 }
 
 TEST_CASE("SVBONY Camera - unsupported returned format is not published", "[svbony][camera][unit]") {

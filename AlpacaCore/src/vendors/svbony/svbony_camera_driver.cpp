@@ -442,6 +442,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (!connected_.load()) return CameraState::Idle;
         latch_exposure_timeout_locked();
+        if (capture_stop_failed_) return CameraState::Error;
         ensure_capture_stop_confirmed_locked();
         return exposure_active_.load() ? CameraState::Exposing : CameraState::Idle;
     }
@@ -763,6 +764,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (!connected_.load()) return 0.0;
         latch_exposure_timeout_locked();
+        if (capture_stop_failed_) return 0.0;
         ensure_capture_stop_confirmed_locked();
         if (!exposure_active_.load()) return image_ready_ ? 100.0 : 0.0;
         if (last_exposure_duration_ <= 0.0) {
@@ -1007,8 +1009,10 @@ public:
         // exposure control. Its public watchdog state may already be Idle
         // while it is still inside SVBGetVideoData.
         if (!stop_exposure_thread()) {
-            throw AlpacaException("SVBONY capture stop failed; disconnect and reconnect before another exposure",
-                                  AlpacaError::DriverException);
+            throw AlpacaException(
+                "SVBONY capture stop was not confirmed; retry AbortExposure or disconnect and reconnect before another "
+                "exposure",
+                AlpacaError::DriverException);
         }
 
         int active_camera_id = -1;
@@ -1064,6 +1068,7 @@ public:
                 bool need_speed_update = false;
                 bool roi_applied = false;
                 bool speed_applied = false;
+                bool capture_start_attempted = false;
                 try {
                     // Apply deferred SDK writes outside the mutex so
                     // get_image_ready() polls are not blocked.
@@ -1143,16 +1148,20 @@ public:
                             return;
                         }
                         if (capture_stop_failed_) {
-                            throw AlpacaException("SVBONY capture stop failed; disconnect and reconnect",
-                                                  AlpacaError::DriverException);
+                            throw AlpacaException(
+                                "SVBONY capture stop was not confirmed; retry AbortExposure or disconnect and "
+                                "reconnect",
+                                AlpacaError::DriverException);
                         }
+                        capture_start_attempted = true;
                         sdk.start_video_capture(active_camera_id);
                     }
 
                     std::vector<std::uint8_t> buffer(buffer_size);
 
-                    // Poll for frame data like the SDK demo does — SVBGetVideoData
-                    // can fail on the first attempts while the sensor integrates.
+                    // SVBGetVideoData reports no image before its finite wait as
+                    // TIMEOUT; retry that result while the sensor integrates and
+                    // surface every other SDK error without spinning.
                     const long exposure_wait_ms = exposure_us / 1000;
                     const int total_wait_ms = exposure_wait_ms > std::numeric_limits<int>::max() - 10000L
                                                   ? std::numeric_limits<int>::max()
@@ -1224,13 +1233,17 @@ public:
                     }
                 } catch (const std::exception& e) {
                     ALPACA_LOG_WARN("SVBONY", "Exposure failed: " + std::string(e.what()));
-                    bool stopped = false;
-                    try {
-                        sdk.stop_video_capture(active_camera_id);
-                        stopped = true;
-                    } catch (const std::exception&) {
-                        // Preserve uncertain capture state until Stop succeeds
-                        // or disconnect closes and reopens the physical handle.
+                    bool stopped = !capture_start_attempted;
+                    if (capture_start_attempted) {
+                        try {
+                            sdk.stop_video_capture(active_camera_id);
+                            stopped = true;
+                        } catch (const std::exception& stop_error) {
+                            // Preserve uncertain capture state until Stop succeeds
+                            // or disconnect closes and reopens the physical handle.
+                            ALPACA_LOG_WARN("SVBONY", "stop_video_capture after exposure failure failed: " +
+                                                          std::string(stop_error.what()));
+                        }
                     }
                     // Re-mark only the deferred stage that did NOT apply, so the
                     // next exposure retries it instead of running with stale
@@ -1778,8 +1791,10 @@ private:
 
     void ensure_capture_stop_confirmed_locked() const {
         if (capture_stop_failed_) {
-            throw AlpacaException("SVBONY capture stop failed; disconnect and reconnect before changing settings",
-                                  AlpacaError::DriverException);
+            throw AlpacaException(
+                "SVBONY capture stop was not confirmed; retry AbortExposure or disconnect and reconnect before "
+                "changing settings",
+                AlpacaError::DriverException);
         }
     }
 
