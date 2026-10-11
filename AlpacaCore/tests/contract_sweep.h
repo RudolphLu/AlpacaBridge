@@ -333,7 +333,7 @@ inline ContractEntry contract_entry_qhy_filterwheel() {
         [](int n) -> std::unique_ptr<AlpacaDriver> { return vendor::qhy::create_qhy_filterwheel_by_index(n, 0); },
         kSrcAgents);
 }
-// Second backend behind the same (qhy, filterwheel) router pair: the standalone CFW3 on a serial port.
+// Second backend behind the same (qhy, filterwheel) catalog pair: the standalone CFW3 on a serial port.
 inline ContractEntry contract_entry_qhy_filterwheel_cfw3() {
     return make_entry(
         "qhy_filterwheel_cfw3", "qhy", "filterwheel", DeviceType::FilterWheel,
@@ -526,7 +526,7 @@ inline ContractEntry contract_entry_gemini_covercalibrator() {
         },
         kSrcAgents);
 }
-// Second and third backends behind the same (gemini, covercalibrator) router pair: the Flat Panel v2 and
+// Second and third backends behind the same (gemini, covercalibrator) catalog pair: the Flat Panel v2 and
 // the Motorized Flat Panel V3 (Pro). The entry above is the Cover Lite (create_gemini_flatpanel).
 inline ContractEntry contract_entry_gemini_covercalibrator_v2() {
     return make_entry(
@@ -603,7 +603,7 @@ inline ContractEntry contract_entry_touptek_focuser() {
 #endif
 
 #ifdef ALPACACORE_ENABLE_TOUPTEK
-// Second backend behind the same (touptek, switch) router pair; needs no libgpiod.
+// Second backend behind the same (touptek, switch) catalog pair; needs no libgpiod.
 inline ContractEntry contract_entry_touptek_switch_thermal() {
     return with_switch_caps(
         make_entry(
@@ -870,6 +870,7 @@ inline constexpr FakeRosterRow kFakeConnectableRoster[] = {
     {"qhy", "focuser", "fake_qhy_qfocuser.h"},
     {"playerone", "camera", "fake_playerone_sdk.h"},
     {"touptek", "camera", "fake_touptek_sdk.h"},
+    {"svbony", "camera", "fake_svbony_sdk.h"},
     {"gphoto", "camera", "fake_gphoto_sdk.h"},
     {"wandererastro", "covercalibrator", "fake_serial_streamer.h"},
     {"wandererastro", "filterwheel", "fake_serial_streamer.h"},

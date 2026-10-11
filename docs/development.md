@@ -158,6 +158,15 @@ where that is too aggressive:
 CTEST_PARALLEL=4 ./run_all_tests.sh
 ```
 
+`run_all_tests.sh` also guards against a shrunken suite. `ctest --no-tests=error` fails only a
+run that finds zero tests, so a vendor target that silently stops configuring would still pass
+with most of its cases gone. After each build the script counts the tests with `ctest -N` and
+fails, naming the configuration, the count found and the floor, when AlpacaCore or AlpacaHTTP
+finds fewer than its floor. The floors sit at the top of `run_all_tests.sh`, keyed by
+`ALPACACORE_ENABLE_ALL_VENDORS` (`OFF` or `ON`), about 10% below the counts at the time they
+were set; any other value has no floor and fails. When tests are removed on purpose, lower the
+floor in the same PR; when the suite grows a lot, raise it so the guard stays tight.
+
 Or manually:
 
 ```sh
@@ -342,6 +351,12 @@ Use the [`/driver-build` skill](#driver-build--guided-driver-implementation) for
 ```
 
 For production use, prefer the apt package from [apt.openastro.net](https://apt.openastro.net).
+
+## Dependency graph
+
+GitHub's dependency graph parses only the workflow action pins. `.github/workflows/dependency-submission.yml` also submits, on every push to `main`, a snapshot built by `scripts/dependency_snapshot.py` from `debian/control` (Build-Depends as development, Depends as runtime; the first package of an `a | b` alternative; a version only for an exact `(= X)` pin), the CMake `FetchContent_Declare` entries in `AlpacaHTTP/CMakeLists.txt` (`pkg:github`), and the vendored SDKs listed in `scripts/dependency_sdk_versions.json` (`pkg:generic`; `version` is `null` where the tree holds no version). The `deb` and `generic` entries document what ships and raise no Dependabot alerts. `${shlibs:Depends}` is resolved only at package build time and is not reported.
+
+When you add, remove or bump a directory under `AlpacaCore/external/`, edit `scripts/dependency_sdk_versions.json`: an SDK or library goes in `sdks` (path, name, version, where the version came from), a directory of documents or udev rules only goes in `doc_only`. The `docs-drift` CI job runs `python3 scripts/dependency_snapshot.py --check` and names the path to add or remove. Run `python3 scripts/dependency_snapshot.py` to print the snapshot; the VM never submits it.
 
 ## Packaging
 

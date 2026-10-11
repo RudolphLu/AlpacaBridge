@@ -136,6 +136,12 @@ add_library(alpacacore_builtins STATIC
     src/vendors/bisque/bisque_schema.cpp
     src/vendors/onstep/onstep_schema.cpp
     src/vendors/celestron/celestron_schema.cpp
+    src/vendors/synscan/synscan_schema.cpp
+    src/vendors/qhy/qhy_schema.cpp
+    src/vendors/touptek/touptek_schema.cpp
+    src/vendors/gemini/gemini_schema.cpp
+    src/vendors/wandererastro/wandererastro_schema.cpp
+    src/vendors/zwo/zwo_schema.cpp
 )
 target_link_libraries(alpacacore_builtins PUBLIC alpacacore)
 add_library(AlpacaCore::alpacacore_builtins ALIAS alpacacore_builtins)
@@ -147,6 +153,7 @@ if(ALPACACORE_ENABLE_ZWO)
     add_subdirectory(src/vendors/zwo)
     if(TARGET alpacacore_zwo)
         target_link_libraries(alpacacore_builtins PRIVATE alpacacore_zwo)
+        target_compile_definitions(alpacacore_builtins PRIVATE ALPACACORE_ENABLE_ZWO)
     endif()
 endif()
 
@@ -154,6 +161,8 @@ if(ALPACACORE_ENABLE_QHY)
     add_subdirectory(src/vendors/qhy)
     if(TARGET alpacacore_qhy)
         target_link_libraries(alpacacore_builtins PRIVATE alpacacore_qhy)
+        # register_builtin_factories() guards its QHY factory behind this macro.
+        target_compile_definitions(alpacacore_builtins PRIVATE ALPACACORE_ENABLE_QHY)
     endif()
 endif()
 
@@ -168,6 +177,8 @@ if(ALPACACORE_ENABLE_SYNSCAN)
     add_subdirectory(src/vendors/synscan)
     if(TARGET alpacacore_synscan)
         target_link_libraries(alpacacore_builtins PRIVATE alpacacore_synscan)
+        # register_builtin_factories() guards its SynScan factory behind this macro.
+        target_compile_definitions(alpacacore_builtins PRIVATE ALPACACORE_ENABLE_SYNSCAN)
     endif()
 endif()
 
@@ -205,6 +216,7 @@ if(ALPACACORE_ENABLE_GEMINI)
     add_subdirectory(src/vendors/gemini)
     if(TARGET alpacacore_gemini)
         target_link_libraries(alpacacore_builtins PRIVATE alpacacore_gemini)
+        target_compile_definitions(alpacacore_builtins PRIVATE ALPACACORE_ENABLE_GEMINI)
     endif()
 endif()
 
@@ -212,6 +224,7 @@ if(ALPACACORE_ENABLE_WANDERERASTRO)
     add_subdirectory(src/vendors/wandererastro)
     if(TARGET alpacacore_wandererastro)
         target_link_libraries(alpacacore_builtins PRIVATE alpacacore_wandererastro)
+        target_compile_definitions(alpacacore_builtins PRIVATE ALPACACORE_ENABLE_WANDERERASTRO)
     endif()
 endif()
 
@@ -255,6 +268,12 @@ if(ALPACACORE_ENABLE_TOUPTEK)
     add_subdirectory(src/vendors/touptek)
     if(TARGET alpacacore_touptek)
         target_link_libraries(alpacacore_builtins PRIVATE alpacacore_touptek)
+        # register_builtin_factories() guards its ToupTek factory behind this macro;
+        # the schema's gpioChip check and the StellaVita factory follow the second.
+        target_compile_definitions(alpacacore_builtins PRIVATE ALPACACORE_ENABLE_TOUPTEK)
+        if(ALPACACORE_TOUPTEK_STELLAVITA)
+            target_compile_definitions(alpacacore_builtins PRIVATE ALPACACORE_TOUPTEK_STELLAVITA)
+        endif()
     endif()
 endif()
 

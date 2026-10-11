@@ -468,3 +468,31 @@ TEST_CASE("ToupTek camera - malformed exposure failure clears on reconnect", "[t
     CHECK_FALSE(driver->get_image_ready());
     driver->set_connected(false);
 }
+
+// open-astro#294: a wheel's DeviceState is the single Position member, so it already costs one
+// device read and the static members cost none; this pins that so a cache is not needed.
+// Falsified by: touptek_filterwheel_driver.cpp get_names() calling
+// sdk_.get_filter_wheel_position() (position reads 4 after the loop, not 1).
+TEST_CASE("ToupTek AFW - DeviceState is one device read and static members cost none",
+          "[touptek][filterwheel][unit][fakesdk]") {
+    FakeToupTekSDK fake;
+    FakeToupTekSDK::ToupFilterWheelInfo wheel;
+    wheel.id = "fake-afw-0";
+    wheel.name = "FakeAFW";
+    wheel.model_name = "AFW-M";
+    fake.wheels.push_back(wheel);
+    fake.wheel_position_script = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    auto driver = alpacacore::vendor::touptek::create_touptek_filterwheel_by_id(0, "fake-afw-0", fake);
+    driver->set_connected(true);
+    const int base = fake.call_count("get_filter_wheel_position");
+
+    CHECK(driver->get_device_state().size() == 2);  // Position, TimeStamp
+    CHECK(fake.call_count("get_filter_wheel_position") - base == 1);
+    for (int i = 0; i < 3; ++i) {
+        (void)driver->get_names();
+        (void)driver->get_focus_offsets();
+    }
+    CHECK(fake.call_count("get_filter_wheel_position") - base == 1);
+    driver->set_connected(false);
+}
