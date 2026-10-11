@@ -937,7 +937,11 @@ to `vX.Y.Z`, and every beta tag and the promotion are merged back into `main` wi
 (never squash). A merge down keeps the receiving branch's `VERSION` and README badge, so `main` never
 carries a beta `VERSION`; only a stable release newer than `main`'s comes across. The stable branch
 takes bug and stability fixes only, landed on the branch (PR with `--base stable/X.Y`), never
-cherry-picked; `stable/X.Y` retires when the next release is promoted, not when its branch is cut.
+cherry-picked; a fix is admitted only when it repairs a regression from the previous stable, closes
+a promotion-milestone issue, or leaves the driver's recorded ConformU result standing (a seam, a
+capability-flag change, a state-machine rewrite or an unvalidated driver rework targets `main`
+even when it fixes a real bug); `stable/X.Y` retires when the next release is promoted, not when
+its branch is cut.
 Cutting, tagging, promoting and the merge-down PR stay with the upstream maintainer and
 diegopereiran. Branch model, promotion criteria, opt-in steps and the three version spellings:
 [docs/beta-channel.md](docs/beta-channel.md).

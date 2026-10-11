@@ -1,0 +1,2 @@
+### Changed
+- **Stable branch admission rule** (docs): `docs/beta-channel.md` and `AGENTS.md` now state when a fix PR may target `stable/X.Y` (a regression from the previous stable, a promotion-milestone issue, or a change that leaves the driver's recorded ConformU result standing) and that a driver rework, a new SDK seam, a client-visible capability-flag change or an unvalidated change targets `main` even when it fixes a real bug.

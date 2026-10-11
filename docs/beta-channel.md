@@ -110,6 +110,19 @@ version, so apt offers a tester on a nightly no later beta; install the next one
 - Bug and stability fixes only: crashes, hangs, races, wrong ASCOM behaviour, packaging and
   install failures, regressions from the previous stable, and docs fixes for the release itself.
   No features, no refactors, no new drivers.
+- A fix is admitted to the stable branch only when at least one of these holds: it repairs a
+  regression from the previous stable release, it closes an open issue on the `X.Y.0 promotion`
+  milestone, or it is small enough that the ConformU result already recorded for that driver on
+  this branch still stands. "Fixes a real bug" is not sufficient on its own: a long-standing
+  defect that the previous stable also had is a `main` fix that ships in the next minor. A PR that
+  adds an SDK seam or a fake, changes a capability flag a client can read (`CanStopExposure`,
+  `CanPulseGuide`, ...), rewrites an exposure or slew state machine, or lands without a hardware
+  run goes to `main`, even when it fixes a real bug, because it invalidates the hardware
+  validation the beta exists to accumulate and pushes promotion out instead of bringing it in. The
+  question to ask of every stable fix PR is whether the driver it touches would need a fresh
+  ConformU run afterwards; if yes, it targets `main`. The maintainer retargets a PR that misses
+  the bar with `gh pr edit --base main` rather than reviewing it on the branch (PR #1038 was the
+  first).
 - Fixes land on the stable branch and reach `main` through the merge down. No cherry-picks.
 - GitHub closes `Closes #N` issues only for a PR merged into `main`, so a merged PR into `stable/**`
   closes its issues through `.github/workflows/close-linked-issues.yml` (`scripts/close_linked_issues.py`):
