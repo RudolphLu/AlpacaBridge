@@ -938,10 +938,11 @@ to `vX.Y.Z`, and every beta tag and the promotion are merged back into `main` wi
 carries a beta `VERSION`; only a stable release newer than `main`'s comes across. The stable branch
 takes bug and stability fixes only, landed on the branch (PR with `--base stable/X.Y`), never
 cherry-picked; a fix is admitted only when it repairs a regression from the previous stable, closes
-a promotion-milestone issue, or leaves the driver's recorded ConformU result standing (a seam, a
-capability-flag change, a state-machine rewrite or an unvalidated driver rework targets `main`
-even when it fixes a real bug); `stable/X.Y` retires when the next release is promoted, not when
-its branch is cut.
+a promotion-milestone issue, or leaves the driver's recorded ConformU result standing, and a new SDK
+seam or fake, a client-visible capability-flag change, an exposure or slew state-machine rewrite, or
+a driver change that needs a fresh ConformU run and lands without one targets `main` unless the
+maintainer admits it by name on the promotion milestone or it finishes a series already partly on
+the branch; `stable/X.Y` retires when the next release is promoted, not when its branch is cut.
 Cutting, tagging, promoting and the merge-down PR stay with the upstream maintainer and
 diegopereiran. Branch model, promotion criteria, opt-in steps and the three version spellings:
 [docs/beta-channel.md](docs/beta-channel.md).

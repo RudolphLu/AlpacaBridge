@@ -109,20 +109,29 @@ version, so apt offers a tester on a nightly no later beta; install the next one
 
 - Bug and stability fixes only: crashes, hangs, races, wrong ASCOM behaviour, packaging and
   install failures, regressions from the previous stable, and docs fixes for the release itself.
-  No features, no refactors, no new drivers.
+  No features, no refactors, no new drivers. Every fix is also subject to the admission test in
+  the next two bullets.
 - A fix is admitted to the stable branch only when at least one of these holds: it repairs a
   regression from the previous stable release, it closes an open issue on the `X.Y.0 promotion`
   milestone, or it is small enough that the ConformU result already recorded for that driver on
   this branch still stands. "Fixes a real bug" is not sufficient on its own: a long-standing
-  defect that the previous stable also had is a `main` fix that ships in the next minor. A PR that
-  adds an SDK seam or a fake, changes a capability flag a client can read (`CanStopExposure`,
-  `CanPulseGuide`, ...), rewrites an exposure or slew state machine, or lands without a hardware
-  run goes to `main`, even when it fixes a real bug, because it invalidates the hardware
-  validation the beta exists to accumulate and pushes promotion out instead of bringing it in. The
-  question to ask of every stable fix PR is whether the driver it touches would need a fresh
-  ConformU run afterwards; if yes, it targets `main`. The maintainer retargets a PR that misses
-  the bar with `gh pr edit --base main` rather than reviewing it on the branch (PR #1038 was the
-  first).
+  defect that the previous stable also had is a `main` fix that ships in the next minor.
+  Packaging, install and release-docs fixes from the bullet above need no hardware run.
+- Some driver changes go to `main` whichever criterion they meet, because each one invalidates
+  the hardware validation the beta exists to accumulate and pushes promotion out instead of
+  bringing it in: a new SDK seam or a new fake, a change to a capability flag a client can read
+  (`CanStopExposure`, `CanPulseGuide`, ...), a rewrite of an exposure or slew state machine, and a
+  driver change that would need a fresh ConformU run but lands without one. New test cases over an existing fake are not a
+  new fake: a stable fix carries them as usual, including the fake-SDK test `AGENTS.md` asks for
+  with a connect-path fix. Two cases override this list. A maintainer may admit such a change by
+  name in an issue on the `X.Y.0 promotion` milestone, which is a deliberate decision, not a
+  criterion a contributor can meet by filing an issue. And a series of PRs fixing one issue
+  across several drivers finishes on the stable branch once part of it has landed there, so the
+  release does not ship two behaviours for one contract; each driver the series touches then gets
+  a ConformU issue on the milestone. The question to ask of every stable fix PR is whether the
+  driver it touches would need a fresh ConformU run afterwards; if yes, it targets `main` unless
+  one of those two cases applies. A PR that misses the bar is retargeted with
+  `gh pr edit --base main` before review, not reviewed on the branch.
 - Fixes land on the stable branch and reach `main` through the merge down. No cherry-picks.
 - GitHub closes `Closes #N` issues only for a PR merged into `main`, so a merged PR into `stable/**`
   closes its issues through `.github/workflows/close-linked-issues.yml` (`scripts/close_linked_issues.py`):
