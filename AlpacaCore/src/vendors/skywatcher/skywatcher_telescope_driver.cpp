@@ -17,8 +17,10 @@
 #include <alpacacore/util/connection_resolver.h>
 #include <alpacacore/util/error_handling.h>
 #include <alpacacore/util/host_clock.h>
+#include <alpacacore/util/link_health.h>
 #include <alpacacore/util/logging.h>
 #include <alpacacore/util/motion_policy.h>
+#include <alpacacore/util/state_snapshot.h>
 #include <alpacacore/vendor/skywatcher/skywatcher_protocol_wrapper.h>
 #include <alpacacore/vendor/skywatcher/skywatcher_telescope_driver.h>
 #include <alpacacore/version.h>
@@ -123,6 +125,24 @@ constexpr auto kPositionCacheTtl = std::chrono::seconds(2);
 // Longest a comms fault may serve last-known position/slewing state.
 constexpr auto kStaleCacheLimit = std::chrono::seconds(10);
 constexpr auto kOffsetModelHold = std::chrono::minutes(30);  // offset sessions serve the model this long
+// Decision 0010, Sky-Watcher adoption. The poller samples both axes every
+// kStatusPollPeriod (start to start; ticks missed behind a slow link are
+// skipped, never made up). kSnapshotMaxAge is the FRESHNESS bound, two poll
+// periods and under the limit guard's 250 ms MoveAxis poll: a frame older than
+// it reads `stale`, and the guard then keeps its direct read. It is not the
+// bound at which a getter refuses: that is the link-loss policy of decision
+// 0009 (util::kLinkStalenessBound of latched fault), because a 200 ms refusal
+// would drop Connected on any Wi-Fi hiccup. A link whose transaction takes
+// longer than half a period reads stale on every frame and keeps the guard
+// on its direct read; the getters still serve the frame.
+constexpr auto kStatusPollPeriod = std::chrono::milliseconds(100);
+constexpr auto kSnapshotMaxAge = std::chrono::milliseconds(200);
+// The live limit guard (open-astro#436) polls a MoveAxis motion every 250 ms;
+// a frame must go stale before the guard's next poll or the guard would read
+// a frame it never refreshed. run_limit_guard()'s kManualPoll is that period.
+constexpr auto kGuardManualPoll = std::chrono::milliseconds(250);
+static_assert(kSnapshotMaxAge < kGuardManualPoll, "the snapshot freshness bound must undercut the guard's poll");
+static_assert(kSnapshotMaxAge >= 2 * kStatusPollPeriod, "two poll periods, or a healthy link reads stale");
 constexpr auto kPulseGuideCompletionDelay = std::chrono::milliseconds(1000);
 constexpr auto kAxisStopTimeout = std::chrono::seconds(5);
 
@@ -261,6 +281,29 @@ std::atomic<int> g_limit_guard_running{0};
 }  // namespace
 }  // namespace detail
 
+// What one poll measured (decision 0010): the raw axis angles and the
+// controller's per-axis status, nothing derived. The dead-reckoned position,
+// the commanded rates and every client-set value stay in the driver under
+// mutex_, where a setter changes them and the next getter sees them.
+struct PolledFrame {
+    double ra_axis_deg = 0.0;
+    double dec_axis_deg = 0.0;
+    bool ra_running = false;
+    bool ra_speed_mode = false;
+    bool dec_running = false;
+    bool dec_speed_mode = false;
+
+    // The controller reports a GOTO in progress while either axis runs in
+    // GOTO mode; a tracking axis (speed mode) is not slewing.
+    bool goto_running() const { return (ra_running && !ra_speed_mode) || (dec_running && !dec_speed_mode); }
+
+    // False once the driver itself changed what the flags describe (a slew,
+    // park or home ended, a sync re-framed the axes) after the poll that
+    // measured them: the flags then say nothing until the next poll, and the
+    // driver's own operation flags are the answer for Slewing meanwhile.
+    bool status_current = true;
+};
+
 class SkyWatcherTelescopeDriver : public TelescopeDriver, protected alpacacore::AsyncConnectable {
 public:
     // Issue #358: hand the connect-failure reason to the router.
@@ -383,7 +426,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         // open-astro#445: connected_ records that a connect succeeded; the
         // link is asked too, so a pulled adapter reads false at once.
-        return connected_ && protocol_->link_alive();
+        return connected_ && protocol_->link_alive() && !frame_lost_locked();
     }
 
     // Takes no mutex_, so the management listing never waits on a connect.
@@ -419,7 +462,7 @@ public:
         bool relink = false;
         if (connected) {
             std::lock_guard<std::mutex> lock(mutex_);
-            relink = connected_ && !protocol.link_alive();
+            relink = connected_ && link_lost_locked();
         }
         if (!connected || relink) {
             // Join background task threads BEFORE taking mutex_ (they take it).
@@ -428,16 +471,20 @@ public:
             cancel_async_tasks();
         }
         std::unique_lock<std::mutex> lock(mutex_);
-        if (connected && !relink && connected_ && !protocol.link_alive()) {
+        if (connected && !relink && connected_ && link_lost_locked()) {
             // The loss became visible after the probe above, so the tasks were
             // not cancelled. A slew task blocked on mutex_ would wake to the
             // reconnected session and resume against the new link: drop the
             // lock and join it first, as the probe path does.
+            relink = true;
             lock.unlock();
             cancel_async_tasks();
             lock.lock();
         }
-        if (connected && connected_ && !protocol.link_alive()) {
+        // A probe's verdict stands once the tasks are cancelled: the poll can
+        // publish a fresh frame while cancel_async_tasks() joins it, and the
+        // idempotency return would then leave the session with no poll.
+        if (connected && connected_ && (relink || link_lost_locked())) {
             // open-astro#445: a connect against a dead link used to hit the
             // idempotency return below and report success with no reconnect.
             // Settle the dead session first, then run the gates as for any
@@ -445,6 +492,7 @@ public:
             ALPACA_LOG_WARN("SkyWatcher", "Connect requested on a lost link; reconnecting");
             session_open_.store(false);
             protocol.disconnect();
+            snapshot_.reset();
             connected_ = false;
             reset_runtime_state_locked();
         }
@@ -588,9 +636,9 @@ public:
             // Warm the position cache so first property reads stay inside
             // ConformU fast-response targets.
             try {
-                refresh_position_cache_locked(true);
+                seed_snapshot_locked();
             } catch (...) {  // NOLINT(bugprone-empty-catch)
-                // Cache warm-up only; reads will retry on demand.
+                // Warm-up only; the first poll retries.
             }
         } else {
             // Best effort: never leave an axis moving on disconnect.
@@ -613,6 +661,12 @@ public:
             // a failed re-identify, so a genuinely different or unreachable
             // board on reconnect is never shown under a stale name.
             reset_runtime_state_locked();
+        }
+        if (connected) {
+            // One poll body for the life of the connection (decision 0010),
+            // started with no mutex held (AsyncOperation rule 10).
+            lock.unlock();
+            start_status_poller();
         }
     }
 
@@ -660,7 +714,7 @@ public:
     double get_altitude() const override {
         std::lock_guard<std::mutex> lock(mutex_);
         check_connected();
-        refresh_position_cache_locked(false);
+        serve_position_locked();
         auto [alt, az] = compute_alt_az_locked();
         (void)az;
         return alt;
@@ -698,7 +752,7 @@ public:
     double get_azimuth() const override {
         std::lock_guard<std::mutex> lock(mutex_);
         check_connected();
-        refresh_position_cache_locked(false);
+        serve_position_locked();
         auto [alt, az] = compute_alt_az_locked();
         (void)alt;
         return az;
@@ -742,7 +796,7 @@ public:
     double get_declination() const override {
         std::lock_guard<std::mutex> lock(mutex_);
         check_connected();
-        refresh_position_cache_locked(false);
+        serve_position_locked();
         auto [ra, dec] = compute_ra_dec_locked();
         (void)ra;
         return std::clamp(dec, -90.0, 90.0);
@@ -896,7 +950,7 @@ public:
     double get_right_ascension() const override {
         std::lock_guard<std::mutex> lock(mutex_);
         check_connected();
-        refresh_position_cache_locked(false);
+        serve_position_locked();
         auto [ra, dec] = compute_ra_dec_locked();
         (void)dec;
         return ra;
@@ -961,7 +1015,7 @@ public:
     int get_side_of_pier() const override {
         std::lock_guard<std::mutex> lock(mutex_);
         check_connected();
-        refresh_position_cache_locked(false);
+        serve_position_locked();
         // ASCOM convention derived from the dec-axis branch: the side the goto
         // picks for HA >= 0 targets is pierEast (0), the mirror side
         // pierWest (1). The goto picks the branch with `k * branch` equal to
@@ -1283,7 +1337,7 @@ public:
                 return;  // already at home
             }
             displaced = claim_slew_slot_locked();
-            invalidate_position_cache_locked();
+            invalidate_position_cache_locked(false);
             slewing_cached_ = true;
             restore_tracking_after_slew_ = false;
             manual_axis_slewing_[0] = false;
@@ -1330,6 +1384,12 @@ public:
                     }
                     if (owns_slew_state_locked(ctx)) {
                         homing_ = false;
+                        // The goto branch ended the slewing flag in
+                        // wait_for_slew_complete(); AutoHome waits on its own
+                        // loop. No getter re-reads the board to clear it
+                        // (decision 0010), and a flag left set keeps the axes
+                        // busy: rate offsets deferred, the limit guard exempt.
+                        set_slewing_cached_false_locked();
                     }
                 } catch (const std::exception& ex) {
                     abandon_slew_body_locked(ctx, homing_);
@@ -1342,7 +1402,7 @@ public:
             displaced,
             [this] {
                 homing_ = false;
-                slewing_cached_ = false;
+                set_slewing_cached_false_locked();
             });
     }
 
@@ -1385,7 +1445,7 @@ public:
             target_ra_axis = park_ra_axis_deg_;
             target_dec_axis = park_dec_axis_deg_;
             displaced = claim_slew_slot_locked();
-            invalidate_position_cache_locked();
+            invalidate_position_cache_locked(false);
             slewing_cached_ = true;
             restore_tracking_after_slew_ = false;
             manual_axis_slewing_[0] = false;
@@ -1434,7 +1494,7 @@ public:
             displaced,
             [this] {
                 parking_ = false;
-                slewing_cached_ = false;
+                set_slewing_cached_false_locked();
             });
     }
 
@@ -1518,7 +1578,7 @@ public:
             pulse_axis_in_motion_[ai] = true;
             my_seq = ++pulse_seq_[ai];
             pulse_guide_end_time_[ai] = now + std::chrono::milliseconds(duration) + kPulseGuideCompletionDelay;
-            invalidate_position_cache_locked();
+            invalidate_position_cache_locked(false);
         }
 
         const int ai = axis - 1;  // 0=RA, 1=Dec (open-astro#620)
@@ -1695,7 +1755,7 @@ public:
                     try {
                         protocol_->stop_motion(kAxisRa);
                         cmd_axis_rate_deg_s_[0] = 0.0;
-                        invalidate_position_cache_locked();
+                        invalidate_position_cache_locked(false);
                         return;
                     } catch (const std::exception& e) {
                         last_error = e.what();
@@ -1828,7 +1888,7 @@ public:
                     // displacement tests read phantom motion).
                     std::unique_lock<std::mutex> lock(mutex_);
                     cmd_axis_rate_deg_s_[axis - 1] = 0.0;
-                    invalidate_position_cache_locked();
+                    invalidate_position_cache_locked(false);
                     // A Dec pulse pre-empted any DeclinationRate offset
                     // motion: re-apply it so guiding corrections don't
                     // silently cancel comet/satellite tracking.
@@ -1954,6 +2014,9 @@ public:
         std::unique_lock<std::mutex> ilock(initiator_mutex_);
         std::unique_lock<std::mutex> lock = start_goto("SlewToCoordinates", ra, dec, nullptr);
         uint64_t owner_generation = motion_generation_;
+        // A slew with no slot bumps the slot generation itself: its flags are
+        // its own until a newer goto, Park or FindHome claims the slot.
+        const uint64_t slew_owner = slew_generation_.bump();
         goto_in_progress_ = false;
         restoring_tracking_ = false;
         try {
@@ -1971,8 +2034,12 @@ public:
                 throw AlpacaException("Slew superseded by a concurrent motion command", AlpacaError::InvalidOperation);
             }
         } catch (...) {
-            if (motion_generation_ == owner_generation) {
+            // Failed, or superseded by a non-slew command (MoveAxis, Tracking,
+            // Sync): no getter clears these flags (decision 0010), and one left
+            // set keeps the axes busy and the limit guard exempt.
+            if (slew_generation_.current() == slew_owner) {
                 goto_in_progress_ = false;
+                set_slewing_cached_false_locked();
                 // An abandoned goto never reaches the landing that consumes this
                 // stamp, and a Park/FindHome landing within the next 30 s would
                 // otherwise fold the abandoned interval into goto_overhead_seconds_.
@@ -2181,7 +2248,7 @@ public:
             } catch (...) {  // NOLINT(bugprone-empty-catch)
                 // Best effort; status polling still reports the true state.
             }
-            slewing_cached_ = false;
+            set_slewing_cached_false_locked();
             slew_force_until_ = std::chrono::steady_clock::time_point::min();
         }
         parking_ = false;
@@ -2209,7 +2276,7 @@ public:
             check_not_parked_locked("MoveAxis");
             validate_move_axis(axis, rate);
             if (std::abs(rate) <= kStopEpsilon && !manual_axis_slewing_[axis]) {
-                invalidate_position_cache_locked();
+                invalidate_position_cache_locked(false);
                 clear_last_slew_error_locked();
                 return;  // the no-op described under the lock below
             }
@@ -2251,7 +2318,7 @@ public:
                 if (from_rest) {
                     seed_limit_guard_baseline_locked();
                 }
-                start_speed_motion_locked(lock, channel, rate);
+                start_speed_motion_locked(lock, channel, rate, /*anchor_model=*/true);
                 manual_axis_slewing_[axis] = true;
                 started = true;
             } else if (manual_axis_slewing_[axis]) {
@@ -2262,6 +2329,7 @@ public:
                 // exceed 1 s), then restores the previous tracking state per
                 // ASCOM.
                 protocol_->stop_motion(channel);
+                advance_model_anchor_locked();  // keep the motion up to the stop
                 cmd_axis_rate_deg_s_[axis] = 0.0;
                 // The stop is a motion command: bump and capture the
                 // generation so the background restore-tracking task can tell
@@ -2276,8 +2344,9 @@ public:
             // the RA axis) continues untouched per the ASCOM restore-tracking
             // semantics. Raising the flag here and clearing it via the status
             // poll failed ConformU over Wi-Fi, where the poll round-trip
-            // outlasted the checker's window.
-            invalidate_position_cache_locked();
+            // outlasted the checker's window. No board read either: the model
+            // was anchored where the rate changed, and the next poll re-measures.
+            invalidate_position_cache_locked(false);
             // open-astro#575: a fresh initiator is a clean start -- a client
             // that jogs an axis after a failed GOTO must not be told the OLD
             // goto failed.
@@ -2320,7 +2389,7 @@ public:
                 // ramped down; the mount coasted on after it. The next motion from
                 // rest seeds its limit-guard baseline from the cache, and a stale
                 // inside position would read a reverse MoveAxis as a crossing.
-                invalidate_position_cache_locked();
+                invalidate_position_cache_locked(false);  // lazy: the seed must read the board after the coast
                 if (!stopped) {
                     ALPACA_LOG_WARN("SkyWatcher", "MoveAxis stop: axis " + std::to_string(channel) +
                                                       " still reported running at timeout");
@@ -2434,7 +2503,7 @@ public:
         cmd_axis_rate_deg_s_[1] = 0.0;
         goto_in_progress_ = false;
         restoring_tracking_ = false;
-        slewing_cached_ = false;
+        set_slewing_cached_false_locked();
         // open-astro#575: AbortSlew is a valid clearing command for a stored
         // slew failure -- the client acted on the error, so the next Slewing
         // read must answer normally again.
@@ -2469,7 +2538,7 @@ private:
     void check_connected() const {
         // open-astro#445: also refuse on a lost link, so cached position reads
         // cannot keep answering from a mount that is no longer there.
-        if (!connected_ || !protocol_->link_alive()) {
+        if (!connected_ || !protocol_->link_alive() || frame_lost_locked()) {
             throw AlpacaException("Not connected to Sky-Watcher mount", AlpacaError::NotConnected);
         }
     }
@@ -2614,9 +2683,9 @@ private:
                 // kPositionCacheTtl, so the position stays honest; only the
                 // between-poll interpolation is flat.
                 //
-                // GOTO-mode motion needs no flag either:
-                // get_hardware_slewing_locked() re-derives it from the board
-                // on every read.
+                // GOTO-mode motion needs no flag either: the status poll
+                // publishes the board's running/goto flags and the Slewing
+                // getter serves them (served_hardware_slewing_locked()).
                 std::string message = "Link restored after ";
                 message += gap;
                 message += " with ";
@@ -2702,7 +2771,7 @@ private:
         pulse_axis_active_[1] = false;
         pulse_axis_in_motion_[0] = false;
         pulse_axis_in_motion_[1] = false;
-        slewing_cached_ = false;
+        set_slewing_cached_false_locked();
         clear_last_slew_error_locked();  // open-astro#575: a reconnect starts clean
         slew_force_until_ = std::chrono::steady_clock::time_point::min();
         manual_axis_slewing_[0] = false;
@@ -2720,6 +2789,7 @@ private:
         cmd_axis_rate_deg_s_[0] = 0.0;
         cmd_axis_rate_deg_s_[1] = 0.0;
         position_cache_valid_ = false;
+        snapshot_.reset();
         // open-astro#505: a reconnect re-runs the ":F" init, which is exactly
         // what clears the board-reset condition, so the fault must not survive
         // into the new session. Re-seed the epoch so the connect's own reads
@@ -3108,7 +3178,36 @@ private:
 
     // ── Position cache ──────────────────────────────────────────────────────
 
-    void invalidate_position_cache_locked() const { position_cache_valid_ = false; }
+    // Best-effort forced read of the position after an operation that moved,
+    // re-framed or re-ratioed the axes, so the first getter after it sees the
+    // result: getters no longer read the board themselves (decision 0010), and
+    // the read they used to make lazily after an invalidation happens here
+    // instead. A failure is left to the poll and the link latch.
+    void read_back_position_locked() const {
+        if (!connected_) {
+            return;
+        }
+        try {
+            refresh_position_cache_locked(true);
+        } catch (const std::exception& e) {
+            ALPACA_LOG_DEBUG("SkyWatcher", std::string("Position read-back failed: ") + e.what());
+        }
+    }
+
+    // `read_back` is false where the caller must not wait on the board: the
+    // asynchronous initiators (Park, FindHome, SlewToCoordinatesAsync, MoveAxis)
+    // and what they reach (FindHome's status check, the stop after a refused
+    // start), which return inside ConformU's STANDARD target and whose read a
+    // quiet link would stretch to seconds, and the pulse-guide dispatch and
+    // restore paths, whose timing is the guide pulse itself. The next poll
+    // re-anchors there.
+    void invalidate_position_cache_locked(bool read_back = true) const {
+        position_cache_valid_ = false;
+        note_model_write_locked();
+        if (read_back) {
+            read_back_position_locked();
+        }
+    }
 
     // Re-anchor the dead-reckoning model at "now" WITHOUT a hardware read.
     // Rate setters need a fresh anchor time for the new rate, but a hardware
@@ -3132,6 +3231,19 @@ private:
         cached_ra_axis_deg_ += cmd_axis_rate_deg_s_[0] * dt;
         cached_dec_axis_deg_ += cmd_axis_rate_deg_s_[1] * dt;
         last_position_update_ = now;
+        drop_poll_in_flight_locked();  // a poll that sampled before the new anchor must not undo it
+    }
+
+    // Moves the model anchor to now with no board read: the angles advance by
+    // the commanded rates (what the getters were serving), so a rate change
+    // made next applies from now, not from the last poll. For MoveAxis, an
+    // asynchronous initiator; its caller invalidates, so the next poll
+    // re-measures.
+    void advance_model_anchor_locked() const {
+        const auto [a1, a2] = dead_reckoned_axes_locked();
+        cached_ra_axis_deg_ = a1;
+        cached_dec_axis_deg_ = a2;
+        last_position_update_ = std::chrono::steady_clock::now();
     }
 
     // True while a goto/park/home/pulse/manual motion owns THIS axis.
@@ -3223,6 +3335,260 @@ private:
         }
     }
 
+    // ── Snapshot-served state (decision 0010, Sky-Watcher adoption) ─────────
+
+    // The frame a getter serves, or the refusal that applies. Order: a board
+    // that restarted under a recovered link; a latched fault (DriverException
+    // with the fault text, Connected stays true, decision 0009 point 1); no
+    // frame yet; a frame older than the link-loss bound with no latch (a poll
+    // that stopped answering the clock), which is a lost link. A merely stale
+    // frame (past kSnapshotMaxAge) is served: stale is not lost.
+    util::StateSnapshot<PolledFrame>::Reading served_frame_locked() const {
+        throw_if_board_reset_locked();
+        const std::string fault = protocol_->link_fault();
+        if (!fault.empty()) {
+            throw_comms_compromised_locked(fault);
+        }
+        auto reading = snapshot_.read();
+        if (!reading) {
+            throw AlpacaException(
+                "Sky-Watcher mount position is not available yet: the first status poll has not been answered",
+                AlpacaError::DriverException);
+        }
+        if (clock_.now() - reading->measured_at >= util::kLinkStalenessBound) {
+            throw AlpacaException("Not connected to Sky-Watcher mount", AlpacaError::NotConnected);
+        }
+        return *reading;
+    }
+
+    // The link is lost: the transport is gone, or the frame aged out with no
+    // latch. Either takes the same cancel, teardown and reconnect on Connected=true.
+    // A stale-frame loss stamps link_lost_at at the moment the frame crossed
+    // the bound, so the relink's outage-length decision (#521) sees it.
+    bool link_lost_locked() const {
+        if (!protocol_->link_alive()) {
+            return true;
+        }
+        if (!frame_lost_locked()) {
+            return false;
+        }
+        if (const auto reading = snapshot_.read()) {
+            protocol_->note_link_lost_at(reading->measured_at + util::kLinkStalenessBound);
+        }
+        return true;
+    }
+
+    // A frame older than the link-loss bound with no latch: the poll stopped
+    // answering the clock. Lost like a pulled adapter: Connected false, every
+    // getter and setter NotConnected, DeviceState empty (decision 0010).
+    // Any publish moves measured_at, a control-path read's too: a stopped poll
+    // shows once those reads stop. Writes dropping every poll age the frame out.
+    bool frame_lost_locked() const {
+        // A latched fault is decision 0009's own clock (the poll cannot publish
+        // while it lasts), so only an unlatched link ages the frame out.
+        if (!protocol_->link_fault().empty()) {
+            return false;
+        }
+        const auto reading = snapshot_.read();
+        return reading && clock_.now() - reading->measured_at >= util::kLinkStalenessBound;
+    }
+
+    // What the position getters call instead of refresh_position_cache_locked():
+    // the dead-reckoned model is already anchored on the last poll, so serving
+    // it needs only the refusals above.
+    void serve_position_locked() const { (void)served_frame_locked(); }
+
+    // The age of the state DeviceState serves: how long ago the poll measured
+    // it, on the task clock. Takes only the snapshot's own mutex.
+    std::optional<std::chrono::nanoseconds> device_state_age() const override {
+        const auto reading = snapshot_.read();
+        if (!reading) {
+            return std::nullopt;
+        }
+        return clock_.now() - reading->measured_at;
+    }
+
+    // A model re-anchor (a rate setter's, PR #221) the poll in flight must not
+    // undo: drops that poll's frame; the next one publishes. The board did not
+    // change, so the last frame's status flags stay current.
+    void drop_poll_in_flight_locked() const {
+        snapshot_.write([](PolledFrame&) {});
+    }
+
+    // A write that changed what the board's registers or motion mean (an
+    // invalidation, a sync included, or the end of a slew): drops the poll in
+    // flight and marks the last frame's status flags not current.
+    void note_model_write_locked() const {
+        snapshot_.write([](PolledFrame& frame) { frame.status_current = false; });
+    }
+
+    // Where the driver ends an operation that owned the axes: Slewing must not
+    // keep reading true from a poll that sampled before the end.
+    void set_slewing_cached_false_locked() const {
+        slewing_cached_ = false;
+        note_model_write_locked();
+    }
+
+    // Both axes' positions and status, from the board, with the counts per
+    // revolution the caller read under mutex_. `sampled_at` is taken before
+    // the reads, as refresh_position_cache_locked() takes its anchor, so a
+    // sample never claims to be newer than a direct read made after it began.
+    // Throws what the protocol throws; the wrapper has counted a failure
+    // toward the link latch.
+    PolledFrame sample_frame(uint32_t ra_cpr, uint32_t dec_cpr, std::chrono::steady_clock::time_point& sampled_at) {
+        auto& protocol = *protocol_;
+        sampled_at = std::chrono::steady_clock::now();
+        const uint32_t ra_counts = protocol.inquire_position(kAxisRa);
+        const uint32_t dec_counts = protocol.inquire_position(kAxisDec);
+        const AxisStatus ra_status = protocol.inquire_status(kAxisRa);
+        const AxisStatus dec_status = protocol.inquire_status(kAxisDec);
+        PolledFrame frame;
+        frame.ra_axis_deg = counts_to_degrees(ra_counts, ra_cpr);
+        frame.dec_axis_deg = counts_to_degrees(dec_counts, dec_cpr);
+        frame.ra_running = ra_status.running;
+        frame.ra_speed_mode = ra_status.speed_mode;
+        frame.dec_running = dec_status.running;
+        frame.dec_speed_mode = dec_status.speed_mode;
+        return frame;
+    }
+
+    // After a frame was published: re-anchor the dead-reckoning model on it,
+    // under the regime the direct read used. While rate offsets run the model
+    // holds (raw counts jitter around the commanded average, PR #221); while
+    // an axis runs at a commanded speed the TTL decides, since the model is
+    // the steadier answer; at rest or in a goto the commanded rates are zero
+    // and the raw angle is the truth. `force` is the connect: take the sample.
+    // Also finds out whether a link that just recovered still reaches the board
+    // we set up. Caller holds mutex_.
+    void adopt_frame_locked(const PolledFrame& frame, std::chrono::steady_clock::time_point sampled_at, bool force) {
+        // These reads just cleared a latched fault if anything did.
+        check_board_survived_recovery_locked();
+        if (!board_reset_fault_.empty()) {
+            return;
+        }
+        // A direct read or a model anchor made after this poll began sampling
+        // is the newer measurement: the older sample must not replace it.
+        if (!force && sampled_at < last_position_update_) {
+            return;
+        }
+        const bool offset_hold = position_cache_valid_ && rate_offsets_active_locked() && tracking_ &&
+                                 (sampled_at - last_position_update_) < kOffsetModelHold;
+        const bool follows_raw = cmd_axis_rate_deg_s_[0] == 0.0 && cmd_axis_rate_deg_s_[1] == 0.0;
+        const bool ttl_lapsed = !position_cache_valid_ || (sampled_at - last_position_update_) >= kPositionCacheTtl;
+        if (force || (!offset_hold && (follows_raw || ttl_lapsed))) {
+            cached_ra_axis_deg_ = frame.ra_axis_deg;
+            cached_dec_axis_deg_ = frame.dec_axis_deg;
+            position_cache_valid_ = true;
+            last_position_update_ = sampled_at;
+        }
+    }
+
+    // The first frame, at the end of a connect with mutex_ held, so the
+    // getters have an answer, status flags included, the moment Connect
+    // returns (ConformU's first reads are held to its fast-response target).
+    void seed_snapshot_locked() {
+        const auto token = snapshot_.begin_poll();
+        std::chrono::steady_clock::time_point sampled_at;
+        const PolledFrame frame =
+            sample_frame(axis_params_[0].counts_per_revolution, axis_params_[1].counts_per_revolution, sampled_at);
+        if (snapshot_.publish(token, frame)) {
+            adopt_frame_locked(frame, sampled_at, /*force=*/true);
+        }
+    }
+
+    // Test seam: called between a poll's sample and its publish, with no lock
+    // held, so a case can land a client write in that window.
+    void run_status_poll_after_sample_hook() {
+        std::function<void()> hook;
+        {
+            std::lock_guard<std::mutex> lock(status_poll_hook_mutex_);
+            hook = status_poll_after_sample_hook_;
+        }
+        if (hook) {
+            hook();
+        }
+    }
+
+    // One poll: sample both axes, then publish and adopt under mutex_. The
+    // exchanges run WITHOUT mutex_ (the protocol wrapper serialises them), so
+    // a getter never waits behind a slow link and the snapshot mutex is never
+    // held across I/O. Returns false when the connection is gone or a newer
+    // body replaced this one, and the poll body should end.
+    bool poll_status_once(util::OperationContext& ctx) {
+        if (status_poll_paused_for_testing_.load()) {
+            return true;
+        }
+        uint32_t ra_cpr = 0;
+        uint32_t dec_cpr = 0;
+        {
+            // A body started after a connect released mutex_ can outlive a
+            // disconnect landing in that gap and run on into the next session,
+            // which no cancel reaches until that session starts its own body.
+            // It reads the axis parameters here, under mutex_, so never while
+            // a connect writes them.
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!connected_ || ctx.stop_reason() != util::StopReason::None) {
+                return false;
+            }
+            ra_cpr = axis_params_[0].counts_per_revolution;
+            dec_cpr = axis_params_[1].counts_per_revolution;
+        }
+        if (!protocol_->link_alive()) {
+            // Lost (decision 0009): the wrapper has closed the transport and
+            // stamped link_lost_at. Drop the frame; only a Connect relinks.
+            snapshot_.reset();
+            // The loss may have been seen while an exchange held the I/O lock,
+            // which left the close pending; this body holds no I/O lock.
+            protocol_->finish_lost_close();
+            return false;
+        }
+        const auto token = snapshot_.begin_poll();
+        std::chrono::steady_clock::time_point sampled_at;
+        PolledFrame frame;
+        try {
+            frame = sample_frame(ra_cpr, dec_cpr, sampled_at);
+        } catch (const std::exception& e) {
+            // The wrapper counts the failure toward the link latch; the frame
+            // simply ages. This is the only silence detector while idle.
+            ALPACA_LOG_TRACE("SkyWatcher", std::string("Status poll failed: ") + e.what());
+            return true;
+        }
+        run_status_poll_after_sample_hook();
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!connected_ || ctx.stop_reason() != util::StopReason::None) {
+            return false;
+        }
+        if (snapshot_.publish(token, frame)) {  // false: a write landed since the sample
+            adopt_frame_locked(frame, sampled_at, /*force=*/false);
+        }
+        return true;
+    }
+
+    void run_status_poller(util::OperationContext& ctx) {
+        for (;;) {
+            const auto started = clock_.now();
+            if (!poll_status_once(ctx)) {
+                return;
+            }
+            // Start to start: wait for the next tick, skipping any a slow
+            // poll ran over (no catch-up).
+            const auto spent = clock_.now() - started;
+            const auto ticks = spent / kStatusPollPeriod + 1;
+            if (!ctx.wait_for(ticks * kStatusPollPeriod - spent)) {
+                return;
+            }
+        }
+    }
+
+    // Call without mutex_ held (AsyncOperation rule 10), after a connect.
+    void start_status_poller() {
+        try {
+            status_poll_.start([this](util::OperationContext& ctx) { run_status_poller(ctx); });
+        } catch (const std::exception& e) {
+            ALPACA_LOG_ERROR("SkyWatcher", std::string("Status poll did not start: ") + e.what());
+        }
+    }
+
     void refresh_position_cache_locked(bool force) const {
         auto now = std::chrono::steady_clock::now();
         throw_if_board_reset_locked();
@@ -3251,6 +3617,7 @@ private:
         }
         auto& protocol = *protocol_;
         bool succeeded = false;
+        const auto snapshot_token = snapshot_.begin_poll();
         try {
             uint32_t ra_counts = protocol.inquire_position(kAxisRa);
             uint32_t dec_counts = protocol.inquire_position(kAxisDec);
@@ -3259,6 +3626,13 @@ private:
             position_cache_valid_ = true;
             last_position_update_ = now;
             succeeded = true;
+            // A control-path read measures position only; the status flags
+            // stay those of the last poll (decision 0010).
+            auto previous = snapshot_.read();
+            PolledFrame frame = previous ? previous->value : PolledFrame{};
+            frame.ra_axis_deg = cached_ra_axis_deg_;
+            frame.dec_axis_deg = cached_dec_axis_deg_;
+            snapshot_.publish(snapshot_token, frame);
         } catch (...) {
             // Once latched, the cache is not an answer at any age: the values
             // are as unreachable as the board. This supersedes the ad-hoc
@@ -3559,10 +3933,17 @@ private:
     }
 
     // Start speed-mode motion at a signed rate on one axis (assumes the caller
-    // wants the axis re-commanded from stopped).
-    void start_speed_motion_locked(std::unique_lock<std::mutex>& lock, int channel, double signed_rate_deg_per_sec) {
+    // wants the axis re-commanded from stopped). `anchor_model` (MoveAxis,
+    // which reads no position back) anchors the model before the stop drops
+    // the old rate and again once the new one starts, so neither rate is
+    // applied over the other's time.
+    void start_speed_motion_locked(std::unique_lock<std::mutex>& lock, int channel, double signed_rate_deg_per_sec,
+                                   bool anchor_model = false) {
         auto& protocol = *protocol_;
         const uint64_t gen = ++motion_generation_;
+        if (anchor_model) {
+            advance_model_anchor_locked();
+        }
         if (!stop_axis_and_wait_locked(lock, channel, gen)) {
             throw AlpacaException("Motion superseded before dispatch");
         }
@@ -3580,6 +3961,9 @@ private:
         protocol.set_motion_mode(channel, fast ? '3' : '1', direction_char(rate));
         protocol.set_step_period(channel, step_period_for_locked(channel, rate, fast));
         protocol.start_motion(channel);
+        if (anchor_model) {
+            advance_model_anchor_locked();
+        }
         cmd_axis_rate_deg_s_[channel - 1] = rate;
     }
 
@@ -4099,7 +4483,7 @@ private:
         if (body_stopped()) {
             return false;  // cancelled or replaced: the canceller/new slew owns Slewing
         }
-        slewing_cached_ = false;
+        set_slewing_cached_false_locked();
         return true;
     }
 
@@ -4154,7 +4538,7 @@ private:
         } catch (...) {
             // Dispatch failed before the mount started moving: clear the
             // pre-published slew state so Slewing cannot wedge true.
-            slewing_cached_ = false;
+            set_slewing_cached_false_locked();
             restore_tracking_after_slew_ = false;
             last_goto_dispatch_time_ = std::chrono::steady_clock::time_point{};
             throw;
@@ -4400,7 +4784,22 @@ private:
         if (parking_ || homing_ || goto_in_progress_ || restoring_tracking_) {
             return true;
         }
-        return get_hardware_slewing_locked(true);
+        return served_hardware_slewing_locked();
+    }
+
+    // The client-facing form of get_hardware_slewing_locked(true): answered
+    // from the polled frame, never from the board (decision 0010). Motion the
+    // driver itself started (a manual axis, the force window of an async slew
+    // initiator) answers first, as in the direct form.
+    bool served_hardware_slewing_locked() const {
+        if (manual_axis_slewing_[0] || manual_axis_slewing_[1]) {
+            return true;
+        }
+        if (clock_.now() < slew_force_until_) {
+            return true;
+        }
+        const auto frame = served_frame_locked().value;
+        return frame.status_current && frame.goto_running();
     }
 
     // Hardware/manual slewing state WITHOUT the parking_ override. The park
@@ -4439,7 +4838,7 @@ private:
             }
         }
         if (was_slewing && !slewing_cached_) {
-            invalidate_position_cache_locked();
+            invalidate_position_cache_locked(false);
         }
         return slewing_cached_;
     }
@@ -4716,7 +5115,7 @@ private:
             }
             last_goto_dispatch_time_ = std::chrono::steady_clock::time_point{};
         }
-        slewing_cached_ = false;
+        set_slewing_cached_false_locked();
         // Landed: end the async initiator's window too, or Slewing would stay
         // true for the rest of its 8 s after a short goto and its restore.
         slew_force_until_ = std::chrono::steady_clock::time_point::min();
@@ -4769,6 +5168,20 @@ private:
         }
     }
 
+    // The guard's position source (open-astro#436, decision 0010): the polled
+    // frame while it is fresh (kSnapshotMaxAge, under the guard's 250 ms
+    // MoveAxis poll), so a moving axis is watched without extra board traffic;
+    // the direct read of old while it is stale, so a slow link or a stalled
+    // poll never leaves the guard blind. Caller holds mutex_.
+    void refresh_for_guard_locked() const {
+        const auto reading = snapshot_.read();
+        if (reading && !reading->stale) {
+            (void)served_frame_locked();  // the refusals still apply
+            return;
+        }
+        refresh_position_cache_locked(false);
+    }
+
     // Caller holds mutex_ and has refreshed the position cache.
     util::MotionSample limit_sample_locked() const {
         const double a1 = dead_reckoned_axes_locked().first;
@@ -4811,7 +5224,7 @@ private:
         } running;
 
         // 250 ms while MoveAxis drives an axis, 2 s while only tracking.
-        constexpr auto kManualPoll = std::chrono::milliseconds(250);
+        constexpr auto kManualPoll = kGuardManualPoll;
         constexpr auto kTrackingPoll = std::chrono::milliseconds(2000);
         for (;;) {
             std::chrono::milliseconds poll = kTrackingPoll;
@@ -4839,7 +5252,7 @@ private:
                     limit_guard_baseline_.reset();
                 } else {
                     try {
-                        refresh_position_cache_locked(false);
+                        refresh_for_guard_locked();
                         sample = limit_sample_locked();
                         if (limit_guard_baseline_) {
                             crossing = util::crossed(motion_limits_, *limit_guard_baseline_, sample);
@@ -4932,6 +5345,9 @@ private:
         // First: the limit guard stops motion through move_axis(), which
         // spawns a stop task, so it must be gone before those are joined.
         limit_guard_.cancel_all_and_join();
+        // The status poll (decision 0010) only reads, but its exchanges must
+        // be done before a disconnect closes the transport.
+        status_poll_.cancel_all_and_join();
         // Cancel every slot body before joining any, so they unwind in
         // parallel; the slots join below with no driver mutex held.
         slew_.cancel();
@@ -5048,7 +5464,7 @@ private:
             protocol_->instant_stop(kAxisDec);
             cmd_axis_rate_deg_s_[0] = 0.0;
             cmd_axis_rate_deg_s_[1] = 0.0;
-            invalidate_position_cache_locked();
+            invalidate_position_cache_locked(false);
         } catch (...) {  // NOLINT(bugprone-empty-catch)
             // Best effort; a dead link is reported by the link-health path.
         }
@@ -5067,7 +5483,7 @@ private:
             return;
         }
         phase_flag = false;
-        slewing_cached_ = false;
+        set_slewing_cached_false_locked();
         stop_axes_if_cancelled_locked();
     }
 
@@ -5088,7 +5504,7 @@ private:
         // A cancelled goto (AbortSlew throws "Slew wait cancelled") must not
         // leave its dispatch stamp for the next landing's overhead EMA.
         last_goto_dispatch_time_ = std::chrono::steady_clock::time_point{};
-        slewing_cached_ = false;
+        set_slewing_cached_false_locked();
         slew_force_until_ = std::chrono::steady_clock::time_point::min();
         if (ctx.stop_reason() == util::StopReason::None && slew_error_epoch_ == slew_epoch) {
             last_slew_error_ = message;
@@ -5130,7 +5546,7 @@ private:
             return lock;
         }
         const bool displaced = claim_slew_slot_locked();
-        invalidate_position_cache_locked();
+        invalidate_position_cache_locked(false);
         slewing_cached_ = true;
         // open-astro#575: a fresh initiator is a clean start -- a client
         // that retries a rejected goto must not be told the OLD goto failed.
@@ -5155,7 +5571,7 @@ private:
         std::function<void(util::OperationContext&)> run =
             [body = std::move(body), slew_epoch](util::OperationContext& ctx) { body(ctx, slew_epoch); };
         start_slew_body(std::move(run), displaced, [this] {
-            slewing_cached_ = false;
+            set_slewing_cached_false_locked();
             slew_force_until_ = std::chrono::steady_clock::time_point::min();
         });
         return lock;
@@ -5166,6 +5582,13 @@ private:
 public:
     void set_slew_spawn_for_testing(std::function<std::thread(std::function<void()>)> spawn) {
         slew_.set_spawn_for_testing(std::move(spawn));
+    }
+
+    void set_status_poll_paused_for_testing(bool paused) { status_poll_paused_for_testing_.store(paused); }
+
+    void set_status_poll_after_sample_hook_for_testing(std::function<void()> hook) {
+        std::lock_guard<std::mutex> lock(status_poll_hook_mutex_);
+        status_poll_after_sample_hook_ = std::move(hook);
     }
 
 private:
@@ -5417,6 +5840,15 @@ private:
     util::OperationGeneration limit_guard_generation_;
     util::AsyncOperation limit_guard_{"SkyWatcher limit guard", limit_guard_generation_, clock_};
 
+    // Decision 0010: the polled frame the getters and DeviceState are served
+    // from, and the one poll body that fills it for the life of a connection.
+    mutable util::StateSnapshot<PolledFrame> snapshot_{clock_, kSnapshotMaxAge};
+    std::atomic<bool> status_poll_paused_for_testing_{false};
+    std::mutex status_poll_hook_mutex_;
+    std::function<void()> status_poll_after_sample_hook_;
+    util::OperationGeneration status_poll_generation_;
+    util::AsyncOperation status_poll_{"SkyWatcher status poll", status_poll_generation_, clock_};
+
     // Slew, goto, Park and FindHome share one slot and one generation; each
     // axis's MoveAxis stop-completion body has its own of both (see "Slew and
     // stop slots"). The same-axis refinement near the stop body's tail stays on
@@ -5561,6 +5993,18 @@ std::unique_ptr<TelescopeDriver> create_skywatcher_telescope(int device_number, 
 void set_slew_spawn_for_testing(TelescopeDriver& driver, std::function<std::thread(std::function<void()>)> spawn) {
     if (auto* sw = dynamic_cast<SkyWatcherTelescopeDriver*>(&driver)) {
         sw->set_slew_spawn_for_testing(std::move(spawn));
+    }
+}
+
+void set_status_poll_paused_for_testing(TelescopeDriver& driver, bool paused) {
+    if (auto* sw = dynamic_cast<SkyWatcherTelescopeDriver*>(&driver)) {
+        sw->set_status_poll_paused_for_testing(paused);
+    }
+}
+
+void set_status_poll_after_sample_hook_for_testing(TelescopeDriver& driver, std::function<void()> hook) {
+    if (auto* sw = dynamic_cast<SkyWatcherTelescopeDriver*>(&driver)) {
+        sw->set_status_poll_after_sample_hook_for_testing(std::move(hook));
     }
 }
 
