@@ -109,7 +109,7 @@ jobs:
           github_token: ${{ github.token }}
           # The action also requires the TRIGGERING ACTOR to have write access,
           # so a fork contributor's own push needs their login here (never '*').
-          allowed_non_write_users: "htly9981,Knetus56,zeroastroboy,diegopereiran,kern2011"
+          allowed_non_write_users: "htly9981,Knetus56,zeroastroboy,diegopereiran,kern2011,pauleyj"
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
