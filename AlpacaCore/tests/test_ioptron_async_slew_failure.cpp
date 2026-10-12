@@ -25,8 +25,11 @@
 #include <alpacacore/vendor/ioptron/ioptron_telescope_driver.h>
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -68,6 +71,56 @@ bool wait_until(const std::function<bool()>& pred, int timeout_ms) {
     }
     return pred();
 }
+
+class WorkerGate {
+public:
+    void arm(bool reject_after_release = false, bool accept_second = false) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pause_next_ = true;
+        entered_ = false;
+        released_ = false;
+        reject_after_release_ = reject_after_release;
+        accept_second_ = accept_second;
+    }
+
+    void before_worker_lock(alpacacore::test::FakeIoptronMount& mount) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ++calls_;
+        const bool pause = pause_next_;
+        pause_next_ = false;
+        if (pause) {
+            entered_ = true;
+            cv_.notify_all();
+            cv_.wait(lock, [&] { return released_; });
+        }
+        const bool reject = pause && reject_after_release_;
+        const bool accept = calls_ == 2 && accept_second_;
+        lock.unlock();
+        if (reject) mount.set_reject_goto(true);
+        if (accept) mount.set_reject_goto(false);
+    }
+
+    bool wait_until_entered() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(5), [&] { return entered_; });
+    }
+
+    void release() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    int calls_ = 0;
+    bool pause_next_ = false;
+    bool reject_after_release_ = false;
+    bool accept_second_ = false;
+    bool entered_ = false;
+    bool released_ = false;
+};
 
 // Threw only for the driver-specific DriverException (0x500) the #575 contract
 // requires; any other code is ThrewOther, so a changed code fails the tests.
@@ -126,6 +179,69 @@ TEST_CASE("iOptron async - AbortSlew clears a stored slew failure (#575)", "[iop
 
     REQUIRE_NOTHROW(driver->abort_slew());
     CHECK(read_slewing(*driver) == SlewingRead::False);
+    driver->set_connected(false);
+}
+
+TEST_CASE("iOptron async AltAz retry clears its prior error before worker preparation",
+          "[ioptron][telescope][async][slewfailure]") {
+    alpacacore::test::FakeIoptronMount mount("0012", 0.0);
+    REQUIRE(mount.ok());
+    WorkerGate gate;
+    auto driver = alpacacore::vendor::ioptron::create_ioptron_telescope_with_slew_worker_hook(
+        0, endpoint(mount.port()), [&] { gate.before_worker_lock(mount); }, 45.0, -122.0);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    mount.set_reject_goto(true);
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(5.5, 20.0));
+    REQUIRE(wait_until([&] { return read_slewing(*driver) == SlewingRead::Threw; }, 10000));
+
+    require_alpaca_error([&] { driver->slew_to_alt_az_async(91.0, 90.0); }, alpacacore::AlpacaError::InvalidValue);
+    CHECK(read_slewing(*driver) == SlewingRead::Threw);
+
+    mount.set_reject_goto(false);
+    gate.arm();
+    REQUIRE_NOTHROW(driver->slew_to_alt_az_async(30.0, 90.0));
+    const bool worker_paused = gate.wait_until_entered();
+    if (!worker_paused) gate.release();
+    REQUIRE(worker_paused);
+    CHECK(read_slewing(*driver) == SlewingRead::True);
+    gate.release();
+    REQUIRE(wait_until([&] { return mount.count(":MS1#") >= 2; }, 5000));
+    REQUIRE(wait_until([&] { return read_slewing(*driver) == SlewingRead::False; }, 15000));
+    driver->set_connected(false);
+}
+
+TEST_CASE("iOptron async - a stale worker cannot publish over a newer accepted slew",
+          "[ioptron][telescope][async][slewfailure]") {
+    alpacacore::test::FakeIoptronMount mount("0012", 0.0);
+    REQUIRE(mount.ok());
+    WorkerGate gate;
+    gate.arm(/*reject_after_release=*/true, /*accept_second=*/true);
+    auto driver = alpacacore::vendor::ioptron::create_ioptron_telescope_with_slew_worker_hook(
+        0, endpoint(mount.port()), [&] { gate.before_worker_lock(mount); });
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(5.5, 20.0));
+    const bool worker_paused = gate.wait_until_entered();
+    if (!worker_paused) gate.release();
+    REQUIRE(worker_paused);
+    std::exception_ptr retry_error;
+    std::thread retry([&] {
+        try {
+            driver->slew_to_coordinates_async(6.5, 25.0);
+        } catch (...) {
+            retry_error = std::current_exception();
+        }
+    });
+    const bool newer_target_published = wait_until([&] { return driver->get_target_right_ascension() == 6.5; }, 5000);
+    gate.release();
+    retry.join();
+    REQUIRE(newer_target_published);
+    if (retry_error) std::rethrow_exception(retry_error);
+
+    REQUIRE(wait_until([&] { return mount.count(":MS1#") >= 1; }, 5000));
+    CHECK(mount.count(":MS1#") == 1);
+    REQUIRE(wait_until([&] { return read_slewing(*driver) == SlewingRead::False; }, 15000));
     driver->set_connected(false);
 }
 
