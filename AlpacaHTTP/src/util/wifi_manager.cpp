@@ -1060,7 +1060,9 @@ nlohmann::json WifiManager::scan() {
             // the shared sd_bus* (not thread-safe), so concurrent status
             // calls block ~1.5 s behind a scan rather than racing the bus
             // (PR #198 review round 3).
-            struct timespec ts{1, 500000000};  // 1.5 s
+            struct timespec ts {
+                1, 500000000
+            };  // 1.5 s
             nanosleep(&ts, nullptr);
         }
         sd_bus_error_free(&err);
