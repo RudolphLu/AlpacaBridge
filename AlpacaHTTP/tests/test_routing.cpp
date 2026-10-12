@@ -356,11 +356,13 @@ public:
     std::string get_driver_version() const override { return "0.0.1"; }
     int get_interface_version() const override { return 1; }
     bool get_connected() const override {
+        get_connected_calls.fetch_add(1);
         if (connected_throws) {
             throw alpacacore::AlpacaException("link probe failed", alpacacore::AlpacaError::DriverException);
         }
         return connected;
     }
+    bool get_connecting() const override { return connecting; }
     void set_connected(bool) override {}
     std::vector<std::string> get_supported_actions() const override { return {}; }
     std::string action(std::string_view, std::string_view) override { return ""; }
@@ -370,6 +372,8 @@ public:
     std::string command_string(std::string_view, bool) override { return ""; }
 
     bool connected = true;
+    bool connecting = false;
+    mutable std::atomic<int> get_connected_calls{0};
     bool connected_throws = false;
     std::string link_fault;
     bool link_fault_throws = false;
@@ -5169,6 +5173,28 @@ int main() {
             }
         }
         EXPECT(seen == 5);
+    }
+
+    // A device mid-connect is listed Connected=false without get_connected()
+    // being called: real drivers hold their coarse mutex across the connect and
+    // that call would stall the whole listing (issue #910).
+    {
+        // case: configureddevices skips get_connected while connecting
+        auto& registry = alpacacore::management::DeviceRegistry::instance();
+        auto mid = std::make_shared<FirmwareStubDriver>(9516, std::nullopt);
+        mid->connecting = true;
+        EXPECT(registry.register_device(mid));
+        const auto json =
+            nlohmann::json::parse(route_request(router, "GET", "/management/v1/configureddevices").body());
+        int seen = 0;
+        for (const auto& entry : json["Value"]) {
+            if (entry.value("DeviceType", "") == "CoverCalibrator" && entry.value("DeviceNumber", -1) == 9516) {
+                EXPECT(entry.contains("Connected") && entry["Connected"].get<bool>() == false);
+                ++seen;
+            }
+        }
+        EXPECT(seen == 1);
+        EXPECT(mid->get_connected_calls.load() == 0);
     }
 
     // configureddevices surfaces Firmware and SdkVersion independently, each only
