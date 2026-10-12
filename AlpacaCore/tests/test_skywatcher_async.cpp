@@ -460,10 +460,10 @@ TEST_CASE("SkyWatcher async - a pulse keeps its axis while virtual time has not 
     driver->set_tracking(true);
     mount.jump_axis_degrees(2, 45.0);
 
-    driver->pulse_guide(0, 10);                       // North, host backstop about 1.01 s
-    REQUIRE(clock.wait_for_waiters(1, kRendezvous));  // its hold is parked on the clock
+    driver->pulse_guide(0, 10);                                    // North, host backstop about 1.01 s
+    REQUIRE(clock.wait_for_waiters(1, kRendezvous));               // its hold is parked on the clock
     std::this_thread::sleep_for(std::chrono::milliseconds(1300));  // real time only
-    CHECK(driver->get_is_pulse_guiding());           // must not release the Dec axis
+    CHECK(driver->get_is_pulse_guiding());                         // must not release the Dec axis
     const uint32_t period_before = mount.step_period(2);
     driver->set_declination_rate(10.0);  // busy axis: stored, not applied to the running pulse
     CHECK(mount.step_period(2) == period_before);
