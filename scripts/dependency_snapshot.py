@@ -120,22 +120,57 @@ def build_snapshot(root: Path, sha: str, ref: str, job_id: str, scanned: str) ->
             "manifests": manifests}
 
 
+def parse_deb_fields(text: str) -> dict[str, str]:
+    """Fields of `dpkg-deb -f`, with continuation lines (leading space) folded into their field."""
+    out: dict[str, str] = {}
+    cur = None
+    for line in text.splitlines():
+        if line[:1] in " \t" and cur:
+            out[cur] += " " + line.strip()
+        elif ":" in line:
+            cur, _, val = line.partition(":")
+            out[cur] = val.strip()
+    return out
+
+
+def parse_installed(text: str) -> dict[str, str]:
+    """{package: version} from `dpkg-query -W -f='${db:Status-Abbrev}\\t${Package}\\t${Version}\\n'`, installed rows only."""
+    out = {}
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[0].strip() == "ii":
+            out[parts[1]] = parts[2]
+    return out
+
+
 def file_digests(data: bytes) -> dict[str, str]:
     return {"sha1": hashlib.sha1(data).hexdigest(), "sha256": hashlib.sha256(data).hexdigest()}
 
 
-def tree_digest(root: Path, rel: str) -> str:
-    """SHA-256 over the git-tracked files under rel: path, then file bytes (or symlink target)."""
+def tracked_files(root: Path, rel: str) -> list[tuple[str, bool]]:
+    """(path, is_symlink) for every git-tracked file under rel, sorted. The pins and the
+    --spdx match both use this set, so an untracked file can satisfy neither."""
     out = subprocess.run(["git", "-C", str(root), "ls-files", "-s", "-z", "--", rel],
                          check=True, capture_output=True, text=True).stdout
-    h = hashlib.sha256()
+    entries = []
     for entry in sorted(e for e in out.split("\0") if e):
         meta, path = entry.split("\t", 1)
+        entries.append((path, meta.split()[0] == "120000"))
+    return entries
+
+
+def tree_digest(root: Path, rel: str) -> str:
+    """SHA-256 over the git-tracked files under rel: path, then file bytes (or symlink target).
+    A tracked file missing from the working tree hashes as missing, so it reads as drift."""
+    h = hashlib.sha256()
+    for path, is_link in tracked_files(root, rel):
         p = root / path
-        if meta.split()[0] == "120000":
+        if is_link and p.is_symlink():
             data = b"L" + os.readlink(p).encode()
-        else:
+        elif not is_link and p.is_file():
             data = b"F" + hashlib.sha256(p.read_bytes()).digest()
+        else:
+            data = b"M"
         h.update(path.encode() + b"\0" + data + b"\n")
     return h.hexdigest()
 
@@ -203,11 +238,10 @@ def build_spdx(root: Path, deb: dict[str, str], file_name: str, sha256: str,
         ver = e.get("version")
         sdk_id = add(f"pkg:generic/{e['name']}{'@' + ver if ver else ''}", e["name"], ver)
         rels.append((root_id, "CONTAINS", sdk_id))
-        for dirpath, _, names in os.walk(root / e["path"]):
-            for n in names:
-                p = Path(dirpath) / n
-                if p.is_file() and not p.is_symlink():
-                    vendored.setdefault(hashlib.sha256(p.read_bytes()).hexdigest(), sdk_id)
+        for path, is_link in tracked_files(root, e["path"]):
+            p = root / path
+            if not is_link and p.is_file():
+                vendored.setdefault(hashlib.sha256(p.read_bytes()).hexdigest(), sdk_id)
     files = []
     unmatched = []
     for path in sorted(payload):
@@ -301,6 +335,7 @@ def self_test() -> int:
         (r / "scripts").mkdir()
         for p in ("A/sdk-1", "B", "Q/deep"):
             (r / EXTERNAL / p).mkdir(parents=True)
+        subprocess.run(["git", "-C", d, "init", "-q"], check=True)  # vendored files are git-tracked files
         (r / TABLE).write_text(json.dumps({"sdks": [
             {"path": f"{EXTERNAL}/A/sdk-1", "name": "a-sdk", "version": "1"},
             {"path": f"{EXTERNAL}/Q/deep", "name": "q-sdk", "version": None}],
@@ -391,6 +426,30 @@ def self_test() -> int:
         assert (purl[deb_purl("cmake", "3.31.6-2")], "BUILD_DEPENDENCY_OF", purl[
             "pkg:deb/debian/alpacabridge@5.0.0~beta2?arch=arm64&distro=trixie"]) in rels
         assert deb_purl("g++", None) in purl, "a build dep not installed keeps no version"
+        # dpkg-deb -f output: a folded field keeps its continuation lines.
+        fields = parse_deb_fields("Package: alpacabridge\nVersion: 5.0.0\n"
+                                  "Depends: libc6 (>= 2.38),\n libgpiod3 (>= 2.1),\n adduser\nArchitecture: arm64\n")
+        assert fields["Depends"] == "libc6 (>= 2.38), libgpiod3 (>= 2.1), adduser", fields
+        assert fields["Package"] == "alpacabridge" and fields["Architecture"] == "arm64", fields
+        # dpkg-query: only installed ("ii") rows give a version.
+        inst = parse_installed("ii \tcmake\t3.31.6-2\nrc \tlibold\t1.0\nii \tg++\t4:14.2.0-1\n")
+        assert inst == {"cmake": "3.31.6-2", "g++": "4:14.2.0-1"}, inst
+        # An untracked file under an SDK path is not vendored: it must not satisfy the gate.
+        (r / EXTERNAL / "A/sdk-1/lib/untracked.so").write_bytes(b"untracked-bytes")
+        try:
+            build_spdx(r, deb, "x.deb", "f" * 64, "t", "n",
+                       payload={"usr/lib/alpacabridge/untracked.so": file_digests(b"untracked-bytes")}, installed={})
+        except ValueError as e:
+            assert "usr/lib/alpacabridge/untracked.so" in str(e), e
+        else:
+            raise AssertionError("an untracked file must not match")
+        (r / EXTERNAL / "A/sdk-1/lib/untracked.so").unlink()
+        # A tracked file deleted from the working tree is drift, not a traceback.
+        (r / EXTERNAL / "Q/deep/qhy.hex").unlink()
+        errs = check_drift(r)
+        assert len(errs) == 1 and f"{EXTERNAL}/Q/deep" in errs[0] and "--pin" in errs[0], errs
+        (r / EXTERNAL / "Q/deep/qhy.hex").write_bytes(fw)
+        assert check_drift(r) == [], check_drift(r)
         # A shipped vendor file that matches no vendored file fails the SBOM.
         try:
             build_spdx(r, deb, "x.deb", "f" * 64, "t", "n",
@@ -435,7 +494,7 @@ def main() -> int:
         fields = ("Package", "Version", "Architecture", "Depends")
         out = subprocess.run(["dpkg-deb", "-f", str(deb_path), *fields],
                              check=True, capture_output=True, text=True).stdout
-        deb = {k: v.strip() for k, _, v in (line.partition(":") for line in out.splitlines()) if k in fields}
+        deb = parse_deb_fields(out)
         sha256 = hashlib.sha256(deb_path.read_bytes()).hexdigest()
         payload = {}
         with tempfile.TemporaryDirectory() as tmp:
@@ -446,9 +505,9 @@ def main() -> int:
                         p = Path(dirpath) / n
                         if p.is_file() and not p.is_symlink():
                             payload[p.relative_to(tmp).as_posix()] = file_digests(p.read_bytes())
-        query = subprocess.run(["dpkg-query", "-W", "-f=${Package}\\t${Version}\\n"],
+        query = subprocess.run(["dpkg-query", "-W", "-f=${db:Status-Abbrev}\\t${Package}\\t${Version}\\n"],
                                check=True, capture_output=True, text=True).stdout
-        installed = dict(line.split("\t", 1) for line in query.splitlines() if "\t" in line)
+        installed = parse_installed(query)
         repo = os.environ.get("GITHUB_REPOSITORY", "open-astro/AlpacaBridge")
         created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         try:

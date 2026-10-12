@@ -805,7 +805,7 @@ The `.deb` ships `/etc/ld.so.conf.d/alpacabridge.conf` which adds `/usr/lib/alpa
 
 ### SDK Version Bumps
 
-When a vendor releases a new SDK version, update the `.so` files in `external/` and bump symlink targets (e.g. `libASICamera2.so.1.41` → `libASICamera2.so.1.42`). If the vendor's SDK path is versioned (e.g. ToupTek's `toupcamsdk.20260128/`), update the path reference in `debian/rules`, `build_and_run.sh`, `install_alpaca_service.sh`, AND `AlpacaCore/src/vendors/<vendor>/CMakeLists.txt` in the same commit. Then run `python3 scripts/dependency_snapshot.py --pin` and check the entry's `version` in `scripts/dependency_sdk_versions.json`: `--check` (the `docs-drift` CI job) fails while the vendored files differ from their `sha256` pin, and the release SBOM refuses a shipped vendor file that matches no vendored one.
+When a vendor releases a new SDK version, update the `.so` files in `external/` and bump symlink targets (e.g. `libASICamera2.so.1.41` → `libASICamera2.so.1.42`). If the vendor's SDK path is versioned (e.g. ToupTek's `toupcamsdk.20260128/`), update the path reference in `debian/rules`, `build_and_run.sh`, `install_alpaca_service.sh`, AND `AlpacaCore/src/vendors/<vendor>/CMakeLists.txt` in the same commit. Then run `python3 scripts/dependency_snapshot.py --pin` and check the entry's `version` in `scripts/dependency_sdk_versions.json`: `--check` (the `docs-drift` CI job) fails while the vendored files differ from their `sha256` pin, and the release SBOM refuses any file under `/usr/lib/alpacabridge/` or `/usr/lib/firmware/` in the `.deb` that matches no git-tracked vendored file (`/usr/sbin/fxload` and the udev rules are outside that check).
 
 ### Driver version (DriverVersion)
 
