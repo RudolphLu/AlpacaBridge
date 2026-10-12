@@ -587,7 +587,7 @@ TEST_CASE(
     // whole second off without the other side; the shift is well outside the anchor's own 25 ms uncertainty.
     // Once the side is right the residual is the shift itself (150 ms = 2.25") plus the anchor's and the phase
     // wait's own margins; the wrong side is 12-14" off.
-    for (const auto [shift_ms, phase] : {std::pair{150, 0.96}, std::pair{-150, 0.04}}) {
+    for (const auto& [shift_ms, phase] : {std::pair{150, 0.96}, std::pair{-150, 0.04}}) {
         st->sawtooth_epoch.store(epoch + Clock::duration(std::chrono::milliseconds(shift_ms)).count());
         std::this_thread::sleep_for(std::chrono::milliseconds(2100));
         wait_for_sawtooth_phase(*st, phase);
