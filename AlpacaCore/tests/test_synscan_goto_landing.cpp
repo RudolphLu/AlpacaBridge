@@ -15,6 +15,10 @@
 // fails ConformU's +/-10" SlewToCoordinates check. The driver re-issues the
 // GOTO from the handset's own readback until the landing is inside tolerance.
 // The fake lands every GOTO a fixed RA offset away from what it was told.
+//
+// open-astro#1030: the handset advances its local sidereal time once a second, so its RA readback after a GOTO is
+// a sawtooth, exact right after the tick and one second of RA (15") low just before the next. With `sawtooth` set
+// the fake reports RA that way, from its own epoch, so a test can sample the driver at a chosen phase.
 
 #ifndef _WIN32
 
@@ -45,6 +49,8 @@ using Clock = std::chrono::steady_clock;
 constexpr uint32_t kCountsMask = 0xFFFFFF;
 // 1.96 s of RA (the offset measured on the EQM-35 Pro) in 24-bit counts: 1.96 / 86400 * 2^24.
 constexpr uint32_t kRaOffsetCounts = 381;
+// One second of RA in 24-bit counts: 2^24 / 86400.
+constexpr double kCountsPerSecondOfRa = 194.18;
 
 struct LandingOffsetHandset {
     std::atomic<uint32_t> ra_raw{0x400000};
@@ -62,6 +68,15 @@ struct LandingOffsetHandset {
     // the random per-GOTO Dec scatter a SynScan handset shows on a real mount (#1027).
     std::atomic<bool> dec_scripted{false};
     std::array<std::atomic<int32_t>, 4> dec_offset_script{};
+    // The once-a-second RA readback sawtooth (#1030), phased from `sawtooth_epoch`.
+    std::atomic<bool> sawtooth{false};
+    std::atomic<Clock::rep> sawtooth_epoch{0};
+
+    double sawtooth_phase() const {
+        const auto epoch = Clock::time_point(Clock::duration(sawtooth_epoch.load()));
+        const double since = std::chrono::duration<double>(Clock::now() - epoch).count();
+        return since - std::floor(since);
+    }
 
     bool goto_in_progress() const {
         if (goto_count.load() == 0) return false;
@@ -82,8 +97,14 @@ alpacacore::test::FakeMountServer::Responder responder(const std::shared_ptr<Lan
         switch (chunk[0]) {
             case 'K':
                 return std::string(1, chunk.size() > 1 ? chunk[1] : 'K') + "#";
-            case 'e':
-                return hex24(st->ra_raw.load()) + "," + hex24(st->dec_raw.load()) + "#";
+            case 'e': {
+                uint32_t ra = st->ra_raw.load();
+                if (st->sawtooth.load()) {
+                    const auto low = static_cast<uint32_t>(std::lround(st->sawtooth_phase() * kCountsPerSecondOfRa));
+                    ra = (ra + kCountsMask + 1 - low) & kCountsMask;
+                }
+                return hex24(ra) + "," + hex24(st->dec_raw.load()) + "#";
+            }
             case 'r': {
                 // "r" + 6 hex + "00" + "," + 6 hex + "00"
                 if (chunk.size() < 18) return "";
@@ -161,6 +182,14 @@ void script_rig_dec_scatter(LandingOffsetHandset& st) {
         st.dec_offset_script[i].store(dec_counts[i]);
     }
     st.dec_scripted.store(true);
+}
+
+// Blocks until the fake's sawtooth is at `phase` (0..1) of its second, within 20 ms.
+void wait_for_sawtooth_phase(const LandingOffsetHandset& st, double phase) {
+    const auto deadline = Clock::now() + std::chrono::seconds(3);
+    while (std::abs(st.sawtooth_phase() - phase) > 0.02 && Clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
 }
 
 // Counts the SynScan WARN that reports a landing still off after the last refinement pass. The sink may be
@@ -362,6 +391,34 @@ TEST_CASE("SynScan GOTO landing - async Dec scatter left after the last pass com
     CHECK(st->goto_count.load() == 4);
     CHECK(dec_error_arcsec(*driver, kTargetDec) > kConformUToleranceArcsec);
     CHECK(counter.warns.load() == 1);
+    driver->set_connected(false);
+}
+
+TEST_CASE("SynScan GOTO landing - RightAscension is corrected for the handset's one-second readback sawtooth (#1030)",
+          "[synscan][telescope][goto-landing]") {
+    auto st = std::make_shared<LandingOffsetHandset>();
+    st->ra_offset_counts.store(165);  // 12.7": the EQM-35 Pro's per-GOTO east landing offset, read at the tick
+    st->sawtooth_epoch.store(Clock::now().time_since_epoch().count());
+    st->sawtooth.store(true);
+    alpacacore::test::FakeMountServer server(responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
+        0, endpoint(server.port()), alpacacore::vendor::synscan::SynScanVersion::V4);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    REQUIRE_NOTHROW(driver->slew_to_coordinates(kTargetRa, kTargetDec));
+    // The landing offset is constant, so one refinement pass lands it once the residual is read at the tick.
+    CHECK(st->goto_count.load() <= 3);
+
+    // Each sample is a fresh handset read (the position cache lasts 2 s) at a chosen phase of the handset's second;
+    // uncorrected, the phase-0.9 read is 13.5" low and the three spread by 11".
+    for (const double phase : {0.15, 0.5, 0.9}) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+        wait_for_sawtooth_phase(*st, phase);
+        INFO("phase " << phase);
+        CHECK(ra_error_arcsec(*driver, kTargetRa) < 3.0);
+    }
+    CHECK(dec_error_arcsec(*driver, kTargetDec) < kConformUToleranceArcsec);
     driver->set_connected(false);
 }
 
