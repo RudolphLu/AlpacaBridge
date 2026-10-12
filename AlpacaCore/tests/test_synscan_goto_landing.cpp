@@ -225,15 +225,17 @@ alpacacore::test::FakeMountServer::Responder responder(const std::shared_ptr<Lan
                             const double elapsed = std::chrono::duration<double>(Clock::now() - started).count();
                             const auto moved = static_cast<int32_t>(std::lround(counts_per_s * elapsed));
                             if (!st->ignore_nudges.load()) {
-                                st->dec_raw.store(static_cast<uint32_t>(static_cast<int32_t>(st->dec_raw.load()) + moved) &
-                                                  kCountsMask);
+                                st->dec_raw.store(
+                                    static_cast<uint32_t>(static_cast<int32_t>(st->dec_raw.load()) + moved) &
+                                    kCountsMask);
                             }
                             st->nudge_count.fetch_add(1);
                             st->last_nudge_stop_at.store(Clock::now().time_since_epoch().count());
                         }
                     } else {
                         // Dec: code 6 raises Dec (no tracking on this axis, so the rate is the move).
-                        st->axis_counts_per_s[axis].store((chunk[3] == 6 ? 1.0 : -1.0) * rate_arcsec * kCountsPerArcsec);
+                        st->axis_counts_per_s[axis].store((chunk[3] == 6 ? 1.0 : -1.0) * rate_arcsec *
+                                                          kCountsPerArcsec);
                         st->axis_move_started[axis].store(Clock::now().time_since_epoch().count());
                         st->nudge_starts.fetch_add(1);
                     }

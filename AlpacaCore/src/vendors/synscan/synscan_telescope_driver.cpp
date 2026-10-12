@@ -1330,8 +1330,8 @@ public:
             auto& protocol = SynScanProtocolWrapper::instance();
             const double guide_rate = axis == 1 ? guide_rate_.dec : guide_rate_.ra;
             // RA: West (direction_sign +1) lowers RA, East raises it.
-            double slew_rate_deg_per_sec = axis == 0 ? ra_motor_rate_locked(-direction_sign * guide_rate * 3600.0)
-                                                     : direction_sign * guide_rate;
+            double slew_rate_deg_per_sec =
+                axis == 0 ? ra_motor_rate_locked(-direction_sign * guide_rate * 3600.0) : direction_sign * guide_rate;
             if (axis == 1) {
                 char pier = protocol.get_pointing_state();
                 if (pier == 'W') {
@@ -2141,9 +2141,9 @@ private:
         const double seconds = std::clamp(std::abs(move_arcsec) / rate_arcsec_per_sec, 0.05, kNudgeMaxSeconds);
         // RA goes through the absolute motor rate (ra_motor_rate_locked); Dec north is positive unless the mount
         // is on the west side of the pier, where the Dec motor runs the other way.
-        double signed_rate = axis == 0 ? ra_motor_rate_locked(move_arcsec > 0.0 ? rate_arcsec_per_sec
-                                                                                  : -rate_arcsec_per_sec)
-                                       : (move_arcsec > 0.0 ? rate_deg_per_sec : -rate_deg_per_sec);
+        double signed_rate = axis == 0
+                                 ? ra_motor_rate_locked(move_arcsec > 0.0 ? rate_arcsec_per_sec : -rate_arcsec_per_sec)
+                                 : (move_arcsec > 0.0 ? rate_deg_per_sec : -rate_deg_per_sec);
         if (axis == 1 && protocol.get_pointing_state() == 'W') {
             signed_rate = -signed_rate;
         }
