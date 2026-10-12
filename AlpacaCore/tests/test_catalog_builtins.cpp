@@ -480,9 +480,9 @@ TEST_CASE("Builtin catalog - Player One index range refuses values the int cast 
           "[catalog][playerone][unit]") {
     DeviceCatalog catalog;
     register_builtin_schemas(catalog);
-    const std::pair<DeviceKey, const char*> targets[]{
-        {kPlayerOneCameraKey, "cameraIndex"}, {kPlayerOneSwitchKey, "cameraIndex"},
-        {kPlayerOneWheelKey, "filterwheelIndex"}};
+    const std::pair<DeviceKey, const char*> targets[]{{kPlayerOneCameraKey, "cameraIndex"},
+                                                      {kPlayerOneSwitchKey, "cameraIndex"},
+                                                      {kPlayerOneWheelKey, "filterwheelIndex"}};
     for (const auto& [key, field] : targets) {
         for (const std::int64_t bad : {std::int64_t{1} << 31, std::int64_t{-1}}) {
             INFO(std::string(field) + " = " + std::to_string(bad));
