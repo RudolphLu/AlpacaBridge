@@ -1406,17 +1406,24 @@ public:
             auto& proto = SynScanProtocolWrapper::instance();
             // An RA pulse ran the motor at an absolute rate in place of tracking; while tracking, the tracking
             // command alone ends it (see ra_motor_rate_locked). Read now: tracking may have changed mid-pulse.
+            // Without the equatorial model the pulse ran the guide rate alone, so it stops and then restores
+            // tracking as before.
             int end_tracking_mode = 0;
+            bool end_with_tracking = false;
             if (axis == 0) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 end_tracking_mode = connected_ ? tracking_mode_cached_ : 0;
+                end_with_tracking = end_tracking_mode > 0 && equatorial_geometry_locked();
             }
             for (int attempt = 0; attempt < kStopAttempts && !stopped; ++attempt) {
                 try {
-                    if (end_tracking_mode > 0) {
+                    if (end_with_tracking) {
                         proto.set_tracking_mode(end_tracking_mode);
                     } else {
                         proto.move_axis_variable_rate(axis, 0.0);
+                        if (end_tracking_mode > 0) {
+                            proto.set_tracking_mode(end_tracking_mode);
+                        }
                     }
                     stopped = true;
                 } catch (const std::exception& e) {
@@ -1752,6 +1759,9 @@ public:
         // goto failed.
         last_slew_error_.clear();
 
+        if (axis == 0) {
+            invalidate_readback_top_locked();  // the jog moves RA by an unknown amount
+        }
         auto& protocol = SynScanProtocolWrapper::instance();
         protocol.move_axis_variable_rate(axis, moving ? rate : 0.0);
         if (!moving && axis == 0 && tracking_mode_cached_ > 0) {
@@ -2119,10 +2129,25 @@ private:
     // southern site; INDI's SynScan driver sends 6 for west at sidereal + guide rate, so 6 is taken as westward
     // north of the equator (not measured on a northern mount).
     double ra_motor_rate_locked(double east_arcsec_per_s) const {
+        if (!equatorial_geometry_locked()) {
+            // Axis 0 is azimuth on an Alt-Az mount: no sidereal base, and the move is the guide rate as before.
+            return -east_arcsec_per_s / 3600.0;
+        }
         const double base_arcsec_per_s = tracking_mode_cached_ > 0 ? kSiderealDegPerSec * 3600.0 : 0.0;
         const double westward_arcsec_per_s = base_arcsec_per_s - east_arcsec_per_s;
         const double westward_sign = site_latitude_cached_ < 0.0 ? -1.0 : 1.0;
         return westward_sign * westward_arcsec_per_s / 3600.0;
+    }
+
+    // True only when the mount is known to be equatorial. The absolute RA motor model and the timed landing moves
+    // assume the motor axes are RA and Dec; an Alt-Az mount, or an AZ-EQ mount whose geometry is not configured,
+    // keeps the relative pulse rate and the residual-aimed re-GOTO.
+    bool equatorial_geometry_locked() const {
+        try {
+            return alignment_mode_locked() != AlignmentMode::AltAz;
+        } catch (const AlpacaException&) {
+            return false;
+        }
     }
 
     // Moves one axis by `delta_arcsec` (RA: east positive; Dec: north positive) at the guide rate and stops,
@@ -2156,6 +2181,12 @@ private:
             std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
         }
         lock.lock();
+        if (motion_generation_ != owner_generation) {
+            // A newer initiator (AbortSlew, MoveAxis, a slew, park, disconnect) has commanded the axes itself and
+            // owns them now; ending this move would end its motion.
+            check_connected();
+            return false;
+        }
         std::string stop_error;
         bool stopped = false;
         for (int attempt = 0; attempt < 3 && !stopped; ++attempt) {
@@ -2570,6 +2601,7 @@ private:
         auto& protocol = SynScanProtocolWrapper::instance();
         std::atomic<bool>* cancel = async_task ? &slew_task_cancel_ : nullptr;
         const double nudge_reach_arcsec = kNudgeMaxSeconds * std::min(guide_rate_.ra, guide_rate_.dec) * 3600.0;
+        const bool timed_finish = equatorial_geometry_locked();
         bool regoto_done = false;
         for (int round = 0;; ++round) {
             if (motion_generation_ != owner_generation || (cancel != nullptr && cancel->load())) {
@@ -2611,8 +2643,10 @@ private:
             equatorial_cache_valid_ = false;
             altaz_cache_valid_ = false;
             guide_position_valid_ = false;
-            if (!regoto_done && (ra_error_arcsec > nudge_reach_arcsec || dec_error_arcsec > nudge_reach_arcsec)) {
-                // Too far for a timed move: one re-GOTO, aimed by the residual, brings it within reach.
+            if (!timed_finish ||
+                (!regoto_done && (ra_error_arcsec > nudge_reach_arcsec || dec_error_arcsec > nudge_reach_arcsec))) {
+                // Too far for a timed move: one re-GOTO, aimed by the residual, brings it within reach. Without the
+                // timed finish (not known equatorial) every round is a re-GOTO.
                 regoto_done = true;
                 const double aim_ra = std::fmod(ra + ra_error_hours + 24.0, 24.0);
                 const double aim_dec = std::clamp(dec + dec_error_degrees, -90.0, 90.0);

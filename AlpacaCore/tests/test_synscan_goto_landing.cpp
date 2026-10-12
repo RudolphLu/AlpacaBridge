@@ -89,6 +89,8 @@ struct LandingOffsetHandset {
     std::atomic<int> nudge_count{0};  // moves ended, by a stop or (RA) a tracking command
     // The site's hemisphere as the `w` reply reports it; it decides which RA code runs westward.
     std::atomic<bool> southern{false};
+    // The `m` reply: 50 is an EQ mount (GermanPolar); 128..159 and 160 are Alt-Az.
+    std::atomic<int> model_id{50};
     // RA motor: westward speed in arcsec/s (sidereal while tracking, 0 stopped), integrated into ra_raw.
     std::mutex ra_motor_mutex;
     double ra_westward_arcsec_per_s = kSiderealArcsecPerSec;
@@ -132,6 +134,11 @@ struct LandingOffsetHandset {
             nudge_count.fetch_add(1);
             last_nudge_stop_at.store(Clock::now().time_since_epoch().count());
         }
+    }
+
+    double ra_motor_speed() {
+        std::lock_guard<std::mutex> lock(ra_motor_mutex);
+        return ra_westward_arcsec_per_s;
     }
 
     uint32_t ra_now() {
@@ -246,7 +253,7 @@ alpacacore::test::FakeMountServer::Responder responder(const std::shared_ptr<Lan
                 st->set_ra_motor(chunk.size() > 1 && chunk[1] != 0 ? kSiderealArcsecPerSec : 0.0, false);
                 return "#";
             case 'm':
-                return std::string(1, static_cast<char>(50)) + "#";
+                return std::string(1, static_cast<char>(st->model_id.load())) + "#";
             case 't':  // tracking mode read: sidereal tracking on
                 return std::string(1, '\x01') + "#";
             case 'w': {
@@ -840,6 +847,97 @@ TEST_CASE("SynScan MoveAxis - stopping the RA axis while tracking resumes tracki
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     CHECK(std::abs(ra_counts_since(*st, stopped_at)) < 0.5 * kCountsPerArcsec);  // not 15" a second
     CHECK(driver->get_tracking());
+    driver->set_connected(false);
+}
+
+TEST_CASE("SynScan MoveAxis - an RA jog after a landing drops the last known RA (#1030)",
+          "[synscan][telescope][goto-landing]") {
+    // The last known RA picks the side of the handset's tick for a read inside its uncertainty. A jog of 7.5" to
+    // 22.5" leaves the true RA nearer the stale landing's one-second neighbour than the landing itself, so a stale
+    // value turns every read for the rest of the anchor window one second of RA (15") wrong.
+    auto st = std::make_shared<LandingOffsetHandset>();
+    st->sawtooth.store(true);
+    st->sawtooth_epoch.store(Clock::now().time_since_epoch().count());
+    alpacacore::test::FakeMountServer server(responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
+        0, endpoint(server.port()), alpacacore::vendor::synscan::SynScanVersion::V4);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    use_fast_guide_rate(*driver);
+    REQUIRE_NOTHROW(driver->slew_to_coordinates(kTargetRa, kTargetDec));
+    REQUIRE(true_ra_error_arcsec(*st, kTargetRa) < 3.0);
+
+    // About 15" east: on the fake's motor model a westward speed of -14.4"/s raises RA at 29.4"/s.
+    const double westward_code_rate = -14.4 / 3600.0;
+    driver->move_axis(0, westward_code_rate);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    driver->move_axis(0, 0.0);
+    const double jog_arcsec = true_ra_error_arcsec(*st, kTargetRa);
+    REQUIRE(jog_arcsec > 8.0);
+    REQUIRE(jog_arcsec < 22.0);
+
+    const auto ra_counts = st->ra_now();
+    const double true_ra_hours = ra_counts / (kCountsMask + 1.0) * 24.0;
+    for (const double phase : {0.15, 0.5, 0.9}) {
+        wait_for_sawtooth_phase(*st, phase);
+        CAPTURE(phase);
+        CHECK(ra_error_arcsec(*driver, true_ra_hours) < 3.0);
+    }
+    driver->set_connected(false);
+}
+
+TEST_CASE("SynScan GOTO landing - a superseded synchronous landing move leaves the newer MoveAxis running (#1030)",
+          "[synscan][telescope][goto-landing]") {
+    // A synchronous slew's landing move sleeps with no cancel; a client that aborts and jogs meanwhile owns the
+    // axis, so the move must not end it when it wakes.
+    auto st = std::make_shared<LandingOffsetHandset>();
+    alpacacore::test::FakeMountServer server(responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
+        0, endpoint(server.port()), alpacacore::vendor::synscan::SynScanVersion::V4);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    driver->set_guide_rate(alpacacore::GuideRate{7.5 / 3600.0, 7.5 / 3600.0});  // the 29" RA residual: ~3.9 s
+
+    std::thread slew([&] {
+        try {
+            driver->slew_to_coordinates(kTargetRa, kTargetDec);
+        } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch)
+            // superseded by the abort
+        }
+    });
+    const auto deadline = Clock::now() + std::chrono::seconds(10);
+    while (st->nudge_starts.load() < 1 && Clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    REQUIRE(st->nudge_starts.load() >= 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    driver->abort_slew();
+    driver->move_axis(0, 0.5);
+    slew.join();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(std::abs(st->ra_motor_speed() - 0.5 * 3600.0) < 1.0);  // the jog still runs
+    driver->move_axis(0, 0.0);
+    driver->set_connected(false);
+}
+
+TEST_CASE("SynScan GOTO landing - an Alt-Az mount finishes its landing with re-GOTOs, not axis moves (#1030)",
+          "[synscan][telescope][goto-landing]") {
+    // The landing residual is in RA/Dec; on an Alt-Az mount the motor axes are azimuth and altitude, so the timed
+    // moves (and the sidereal base rate of the RA motor model) do not apply. The residual-aimed re-GOTO does.
+    auto st = std::make_shared<LandingOffsetHandset>();
+    st->model_id.store(128);
+    alpacacore::test::FakeMountServer server(responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
+        0, endpoint(server.port()), alpacacore::vendor::synscan::SynScanVersion::V4);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    REQUIRE(driver->get_alignment_mode() == alpacacore::AlignmentMode::AltAz);
+    use_fast_guide_rate(*driver);
+
+    REQUIRE_NOTHROW(driver->slew_to_coordinates(kTargetRa, kTargetDec));
+
+    CHECK(st->nudge_starts.load() == 0);
+    CHECK(st->goto_count.load() >= 2);
     driver->set_connected(false);
 }
 
