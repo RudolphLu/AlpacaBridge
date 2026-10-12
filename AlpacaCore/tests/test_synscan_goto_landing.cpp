@@ -16,8 +16,10 @@
 // GOTO from the handset's own readback until the landing is inside tolerance.
 // The fake lands every GOTO a fixed RA offset away from what it was told, re-rolls that by one second of RA on
 // every other GOTO when `reroll` is set (as the handset does: two GOTOs with an identical aim landed 194 counts
-// apart), and executes the driver's timed guide-rate moves (`P` variable rate, then stop) exactly, adding the
-// tracking gap an RA stop/restart costs on the handset (open-astro#1030).
+// apart), and executes the driver's timed guide-rate moves exactly. A variable-rate `P` slew REPLACES tracking on
+// the handset (measured on the EQM-35 Pro, open-astro#1030): the rate is the RA motor's own speed, westward in the
+// sidereal direction for code 6 north of the equator and code 7 south of it, so the fake integrates RA at
+// (sidereal - westward speed) and a `T` with a tracking mode resumes sidereal speed at once.
 //
 // open-astro#1030: the handset advances its local sidereal time once a second, so its RA readback after a GOTO is
 // a sawtooth, exact right after the tick and one second of RA (15") low just before the next. With `sawtooth` set
@@ -38,6 +40,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -55,8 +58,7 @@ constexpr uint32_t kRaOffsetCounts = 381;
 // One second of RA in 24-bit counts: 2^24 / 86400.
 constexpr double kCountsPerSecondOfRa = 194.18;
 constexpr double kCountsPerArcsec = 1.0 / 0.0772;
-// The tracking gap an RA stop/restart costs on the handset: measured 3.5" extra on a 15" east pulse.
-constexpr int32_t kRaStopGapCounts = 45;
+constexpr double kSiderealArcsecPerSec = 15.0411;
 
 struct LandingOffsetHandset {
     std::atomic<uint32_t> ra_raw{0x400000};
@@ -84,7 +86,15 @@ struct LandingOffsetHandset {
     // Timed moves: `P` variable-rate start records the axis velocity; the stop applies the displacement.
     std::atomic<bool> ignore_nudges{false};
     std::atomic<int> nudge_starts{0};
-    std::atomic<int> nudge_count{0};  // stops received
+    std::atomic<int> nudge_count{0};  // moves ended, by a stop or (RA) a tracking command
+    // The site's hemisphere as the `w` reply reports it; it decides which RA code runs westward.
+    std::atomic<bool> southern{false};
+    // RA motor: westward speed in arcsec/s (sidereal while tracking, 0 stopped), integrated into ra_raw.
+    std::mutex ra_motor_mutex;
+    double ra_westward_arcsec_per_s = kSiderealArcsecPerSec;
+    double ra_carry_counts = 0.0;
+    bool ra_moving = false;
+    Clock::time_point ra_motor_since = Clock::now();
     std::atomic<Clock::rep> last_nudge_stop_at{0};
     std::array<std::atomic<double>, 2> axis_counts_per_s{};
     std::array<std::atomic<Clock::rep>, 2> axis_move_started{};
@@ -93,6 +103,41 @@ struct LandingOffsetHandset {
         const auto epoch = Clock::time_point(Clock::duration(sawtooth_epoch.load()));
         const double since = std::chrono::duration<double>(Clock::now() - epoch).count();
         return since - std::floor(since);
+    }
+
+    // Brings ra_raw up to now under the current RA motor speed. Caller holds ra_motor_mutex.
+    void advance_ra_locked() {
+        const auto now = Clock::now();
+        const double elapsed = std::chrono::duration<double>(now - ra_motor_since).count();
+        ra_motor_since = now;
+        if (ignore_nudges.load()) {
+            return;
+        }
+        ra_carry_counts += (kSiderealArcsecPerSec - ra_westward_arcsec_per_s) * elapsed * kCountsPerArcsec;
+        const auto whole = static_cast<int32_t>(std::trunc(ra_carry_counts));
+        ra_carry_counts -= whole;
+        ra_raw.store(static_cast<uint32_t>(static_cast<int32_t>(ra_raw.load()) + whole) & kCountsMask);
+    }
+
+    // Sets the RA motor speed; ends a running timed move when the new speed is a stop or tracking.
+    void set_ra_motor(double westward_arcsec_per_s, bool starts_move) {
+        std::lock_guard<std::mutex> lock(ra_motor_mutex);
+        advance_ra_locked();
+        ra_westward_arcsec_per_s = westward_arcsec_per_s;
+        if (starts_move) {
+            ra_moving = true;
+            nudge_starts.fetch_add(1);
+        } else if (ra_moving) {
+            ra_moving = false;
+            nudge_count.fetch_add(1);
+            last_nudge_stop_at.store(Clock::now().time_since_epoch().count());
+        }
+    }
+
+    uint32_t ra_now() {
+        std::lock_guard<std::mutex> lock(ra_motor_mutex);
+        advance_ra_locked();
+        return ra_raw.load();
     }
 
     bool goto_in_progress() const {
@@ -115,7 +160,7 @@ alpacacore::test::FakeMountServer::Responder responder(const std::shared_ptr<Lan
             case 'K':
                 return std::string(1, chunk.size() > 1 ? chunk[1] : 'K') + "#";
             case 'e': {
-                uint32_t ra = st->ra_raw.load();
+                uint32_t ra = st->ra_now();
                 if (st->sawtooth.load()) {
                     const auto low = static_cast<uint32_t>(std::lround(st->sawtooth_phase() * kCountsPerSecondOfRa));
                     ra = (ra + kCountsMask + 1 - low) & kCountsMask;
@@ -128,6 +173,7 @@ alpacacore::test::FakeMountServer::Responder responder(const std::shared_ptr<Lan
                 const uint32_t ra = static_cast<uint32_t>(std::strtoul(chunk.substr(1, 6).c_str(), nullptr, 16));
                 const uint32_t dec = static_cast<uint32_t>(std::strtoul(chunk.substr(10, 6).c_str(), nullptr, 16));
                 const int ordinal = st->goto_count.fetch_add(1) + 1;
+                st->set_ra_motor(kSiderealArcsecPerSec, false);  // a GOTO lands tracking
                 uint32_t offset = st->ra_offset_counts.load() * (st->growing.load() ? ordinal : 1U);
                 if (st->reroll.load() && ordinal % 2 == 0) {
                     offset += static_cast<uint32_t>(std::lround(kCountsPerSecondOfRa));
@@ -158,8 +204,18 @@ alpacacore::test::FakeMountServer::Responder responder(const std::shared_ptr<Lan
                 if (chunk.size() >= 8 && chunk[1] == 3 && chunk[2] == 16 && chunk[4] == 0 && chunk[5] == 0) {
                     st->goto_stopped.store(true);
                 }
-                if (chunk.size() >= 8 && chunk[1] == 3 && (chunk[2] == 16 || chunk[2] == 17)) {
-                    const std::size_t axis = chunk[2] == 16 ? 0 : 1;
+                if (chunk.size() >= 8 && chunk[1] == 2 && chunk[2] == 16 && chunk[4] == 0) {
+                    st->set_ra_motor(0.0, false);  // fixed-rate RA stop
+                }
+                if (chunk.size() >= 8 && chunk[1] == 3 && chunk[2] == 16) {
+                    const double rate_arcsec =
+                        ((static_cast<unsigned char>(chunk[4]) << 8) | static_cast<unsigned char>(chunk[5])) / 4.0;
+                    const int westward_code = st->southern.load() ? 7 : 6;
+                    const double westward = chunk[3] == westward_code ? rate_arcsec : -rate_arcsec;
+                    st->set_ra_motor(westward, rate_arcsec != 0.0);
+                }
+                if (chunk.size() >= 8 && chunk[1] == 3 && chunk[2] == 17) {
+                    const std::size_t axis = 1;
                     const double rate_arcsec =
                         ((static_cast<unsigned char>(chunk[4]) << 8) | static_cast<unsigned char>(chunk[5])) / 4.0;
                     if (rate_arcsec == 0.0) {
@@ -167,20 +223,17 @@ alpacacore::test::FakeMountServer::Responder responder(const std::shared_ptr<Lan
                         if (counts_per_s != 0.0) {
                             const auto started = Clock::time_point(Clock::duration(st->axis_move_started[axis].load()));
                             const double elapsed = std::chrono::duration<double>(Clock::now() - started).count();
-                            int32_t moved = static_cast<int32_t>(std::lround(counts_per_s * elapsed));
-                            if (axis == 0) moved += kRaStopGapCounts;
+                            const auto moved = static_cast<int32_t>(std::lround(counts_per_s * elapsed));
                             if (!st->ignore_nudges.load()) {
-                                auto& raw = axis == 0 ? st->ra_raw : st->dec_raw;
-                                raw.store(static_cast<uint32_t>(static_cast<int32_t>(raw.load()) + moved) &
-                                          kCountsMask);
+                                st->dec_raw.store(static_cast<uint32_t>(static_cast<int32_t>(st->dec_raw.load()) + moved) &
+                                                  kCountsMask);
                             }
                             st->nudge_count.fetch_add(1);
                             st->last_nudge_stop_at.store(Clock::now().time_since_epoch().count());
                         }
                     } else {
-                        // RA: code 7 (the negative variable rate) moves east, raising RA; Dec: code 6 raises Dec.
-                        const bool positive = axis == 0 ? chunk[3] == 7 : chunk[3] == 6;
-                        st->axis_counts_per_s[axis].store((positive ? 1.0 : -1.0) * rate_arcsec * kCountsPerArcsec);
+                        // Dec: code 6 raises Dec (no tracking on this axis, so the rate is the move).
+                        st->axis_counts_per_s[axis].store((chunk[3] == 6 ? 1.0 : -1.0) * rate_arcsec * kCountsPerArcsec);
                         st->axis_move_started[axis].store(Clock::now().time_since_epoch().count());
                         st->nudge_starts.fetch_add(1);
                     }
@@ -188,13 +241,20 @@ alpacacore::test::FakeMountServer::Responder responder(const std::shared_ptr<Lan
                 return "#";
             }
             case 'T':
+                st->set_ra_motor(chunk.size() > 1 && chunk[1] != 0 ? kSiderealArcsecPerSec : 0.0, false);
                 return "#";
             case 'm':
                 return std::string(1, static_cast<char>(50)) + "#";
             case 't':  // tracking mode read: sidereal tracking on
                 return std::string(1, '\x01') + "#";
-            case 'w':
-                return std::string(8, '\0') + "#";
+            case 'w': {
+                std::string location(8, '\0');
+                if (st->southern.load()) {
+                    location[0] = '\x29';  // 41 degrees
+                    location[3] = '\x01';  // D: 1 = south
+                }
+                return location + "#";
+            }
             case 'W':
                 return "#";
             default:
@@ -701,6 +761,108 @@ TEST_CASE("SynScan GOTO landing - destroying the driver during an async GOTO ret
     const auto t0 = Clock::now();
     g.driver.reset();
     CHECK(Clock::now() - t0 < kStopBudget);
+}
+
+// The handset's own RA after its motor speed is brought up to now, as a signed count difference from `from`.
+int32_t ra_counts_since(LandingOffsetHandset& st, uint32_t from) {
+    int32_t delta = static_cast<int32_t>((st.ra_now() - from) & kCountsMask);
+    if (delta > static_cast<int32_t>(kCountsMask / 2)) delta -= static_cast<int32_t>(kCountsMask + 1);
+    return delta;
+}
+
+// The true pointing error after a landing, from the fake's RA rather than the driver's report of it.
+double true_ra_error_arcsec(LandingOffsetHandset& st, double target_hours) {
+    const auto target = static_cast<uint32_t>(std::lround(target_hours / 24.0 * (kCountsMask + 1.0))) & kCountsMask;
+    return std::abs(ra_counts_since(st, target)) / kCountsPerArcsec;
+}
+
+void wait_pulse_done(alpacacore::TelescopeDriver& driver) {
+    const auto deadline = Clock::now() + std::chrono::seconds(5);
+    while (driver.get_is_pulse_guiding() && Clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+TEST_CASE("SynScan PulseGuide - a west RA pulse lowers RA and an east one raises it, in either hemisphere (#1030)",
+          "[synscan][telescope][goto-landing]") {
+    // On the handset a variable-rate P slew is the RA motor's own speed, not an offset from tracking (rig,
+    // 2026-10-13: a 2 s west pulse at 7.5"/s moved RA 50.6" EAST, an east one 19.3" east). A pulse therefore runs
+    // the motor westward at sidereal + guide rate (west) or sidereal - guide rate (east) and hands back to tracking.
+    const bool southern = GENERATE(false, true);
+    CAPTURE(southern);
+    auto st = std::make_shared<LandingOffsetHandset>();
+    st->southern.store(southern);
+    alpacacore::test::FakeMountServer server(responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
+        0, endpoint(server.port()), alpacacore::vendor::synscan::SynScanVersion::V4);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    driver->set_tracking(true);
+    driver->set_guide_rate(alpacacore::GuideRate{7.5 / 3600.0, 7.5 / 3600.0});
+    const double expected_counts = 7.5 * kCountsPerArcsec;  // 1 s at 7.5"/s
+    const double tolerance_counts = 1.5 * kCountsPerArcsec;
+
+    uint32_t before = st->ra_now();
+    driver->pulse_guide(3, 1000);  // West
+    wait_pulse_done(*driver);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));  // tracking again: RA must stay put
+    const int32_t west = ra_counts_since(*st, before);
+    CHECK(std::abs(west + expected_counts) < tolerance_counts);
+
+    before = st->ra_now();
+    driver->pulse_guide(2, 1000);  // East
+    wait_pulse_done(*driver);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    const int32_t east = ra_counts_since(*st, before);
+    CHECK(std::abs(east - expected_counts) < tolerance_counts);
+    driver->set_connected(false);
+}
+
+TEST_CASE("SynScan MoveAxis - stopping the RA axis while tracking resumes tracking (#1030)",
+          "[synscan][telescope][goto-landing]") {
+    // A variable-rate P slew replaces tracking on the handset, so a plain stop leaves the RA motor stopped and RA
+    // running away at the sidereal rate while Tracking still reads true. ASCOM resumes the tracking rate when
+    // MoveAxis stops.
+    auto st = std::make_shared<LandingOffsetHandset>();
+    alpacacore::test::FakeMountServer server(responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
+        0, endpoint(server.port()), alpacacore::vendor::synscan::SynScanVersion::V4);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    driver->set_tracking(true);
+
+    driver->move_axis(0, 0.01);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    driver->move_axis(0, 0.0);
+    const uint32_t stopped_at = st->ra_now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    CHECK(std::abs(ra_counts_since(*st, stopped_at)) < 0.5 * kCountsPerArcsec);  // not 15" a second
+    CHECK(driver->get_tracking());
+    driver->set_connected(false);
+}
+
+TEST_CASE("SynScan GOTO landing - the RA landing move converges in either hemisphere (#1030)",
+          "[synscan][telescope][goto-landing]") {
+    // Rig, 2026-10-13: the RA landing moves ran the motor the wrong way and the landing ended 113" off after three
+    // passes. Checked against the fake's own RA, not the driver's report of it.
+    const bool southern = GENERATE(false, true);
+    CAPTURE(southern);
+    auto st = std::make_shared<LandingOffsetHandset>();
+    st->southern.store(southern);
+    alpacacore::test::FakeMountServer server(responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
+        0, endpoint(server.port()), alpacacore::vendor::synscan::SynScanVersion::V4);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    use_fast_guide_rate(*driver);
+    LandingWarnCounter warns;
+
+    REQUIRE_NOTHROW(driver->slew_to_coordinates(kTargetRa, kTargetDec));
+
+    CHECK(true_ra_error_arcsec(*st, kTargetRa) < 3.0);
+    CHECK(warns.warns.load() == 0);
+    CHECK(st->goto_count.load() == 1);
+    driver->set_connected(false);
 }
 
 #endif  // !_WIN32

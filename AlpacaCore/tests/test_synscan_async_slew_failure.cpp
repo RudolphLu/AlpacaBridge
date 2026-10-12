@@ -353,9 +353,12 @@ TEST_CASE("SynScan PulseGuide - cross-axis pulses keep the RA tracking restore",
     REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
     driver->set_tracking(true);
 
+    const auto started = std::chrono::steady_clock::now();
     driver->pulse_guide(2, 1500);  // East, RA
     driver->pulse_guide(0, 300);   // North, Dec; must not cancel the RA timer
     REQUIRE(wait_until([&] { return !driver->get_is_pulse_guiding(); }, 5000));
+    // The RA pulse ran its whole 1.5 s: a cancelled timer would also end it with T, but early.
+    CHECK(std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(1500));
 
     const auto commands = st->command_snapshot();
     int last_ra = -1;
@@ -369,7 +372,8 @@ TEST_CASE("SynScan PulseGuide - cross-axis pulses keep the RA tracking restore",
         }
     }
     REQUIRE(last_ra >= 0);
-    CHECK(is_zero_rate_command(commands[static_cast<std::size_t>(last_ra)]));
+    // An RA move replaces tracking on the handset and ends with the tracking command, not a stop (#1030).
+    CHECK_FALSE(is_zero_rate_command(commands[static_cast<std::size_t>(last_ra)]));
     CHECK(tracking_restored_after_ra_stop);
     CHECK(driver->get_tracking());
     driver->set_connected(false);

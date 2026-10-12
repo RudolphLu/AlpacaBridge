@@ -83,10 +83,8 @@ constexpr auto kReadbackTickValidity = std::chrono::seconds(120);
 constexpr double kReadbackDisambiguationHours = 0.5 / 3600.0;
 // The handset also re-rolls each GOTO landing by a whole second of RA (passes with an identical aim landed 194
 // counts apart), so the landing is finished with timed guide-rate moves, which it executes to a fraction of an
-// arcsecond in Dec and within a few arcseconds in RA, not with more GOTOs. An RA move also stops tracking for
-// the stop/restart round trips, which adds this much RA whichever way it moved (measured 18.5" for a 15" east
-// pulse). A residual beyond what a move of kNudgeMaxSeconds covers gets one re-GOTO first.
-constexpr double kRaNudgeStopGapArcsec = 3.5;
+// arcsecond in Dec and within the readback's resolution in RA, not with more GOTOs. A residual beyond what a move
+// of kNudgeMaxSeconds covers gets one re-GOTO first.
 constexpr double kNudgeMaxSeconds = 8.0;
 constexpr int kMaxLandingRounds = 3;
 constexpr auto kPulseGuideCompletionDelay = std::chrono::milliseconds(1000);
@@ -1331,7 +1329,9 @@ public:
             check_not_parked_locked("PulseGuide");
             auto& protocol = SynScanProtocolWrapper::instance();
             const double guide_rate = axis == 1 ? guide_rate_.dec : guide_rate_.ra;
-            double slew_rate_deg_per_sec = direction_sign * guide_rate;
+            // RA: West (direction_sign +1) lowers RA, East raises it.
+            double slew_rate_deg_per_sec = axis == 0 ? ra_motor_rate_locked(-direction_sign * guide_rate * 3600.0)
+                                                     : direction_sign * guide_rate;
             if (axis == 1) {
                 char pier = protocol.get_pointing_state();
                 if (pier == 'W') {
@@ -1387,6 +1387,7 @@ public:
                 // Cancelled by replacement, AbortSlew, disconnect or
                 // destruction. Still make a best-effort attempt to stop the
                 // axis before exiting — the mount would otherwise keep slewing.
+                // AbortSlew restores tracking itself; teardown must not.
                 try {
                     SynScanProtocolWrapper::instance().move_axis_variable_rate(axis, 0.0);
                 } catch (...) {  // NOLINT(bugprone-empty-catch)
@@ -1403,9 +1404,20 @@ public:
             bool stopped = false;
             std::string last_error;
             auto& proto = SynScanProtocolWrapper::instance();
+            // An RA pulse ran the motor at an absolute rate in place of tracking; while tracking, the tracking
+            // command alone ends it (see ra_motor_rate_locked). Read now: tracking may have changed mid-pulse.
+            int end_tracking_mode = 0;
+            if (axis == 0) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                end_tracking_mode = connected_ ? tracking_mode_cached_ : 0;
+            }
             for (int attempt = 0; attempt < kStopAttempts && !stopped; ++attempt) {
                 try {
-                    proto.move_axis_variable_rate(axis, 0.0);
+                    if (end_tracking_mode > 0) {
+                        proto.set_tracking_mode(end_tracking_mode);
+                    } else {
+                        proto.move_axis_variable_rate(axis, 0.0);
+                    }
                     stopped = true;
                 } catch (const std::exception& e) {
                     last_error = e.what();
@@ -1422,23 +1434,15 @@ public:
                     if (!connected_) {
                         return;
                     }
-                    const int tracking_mode = tracking_mode_cached_;
-                    if (tracking_mode <= 0) {
+                    if (end_tracking_mode <= 0) {
                         return;
                     }
-                    try {
-                        proto.set_tracking_mode(tracking_mode);
-                        // A same-mode T re-send leaves the handset's readback regime as it is (measured); the
-                        // pulse moved RA by the estimate the override already reports.
-                        if (guide_position_valid_) {
-                            readback_top_hours_ = guide_position_ra_hours_;
-                        } else {
-                            invalidate_readback_top_locked();
-                        }
-                    } catch (const std::exception& e) {
-                        ALPACA_LOG_WARN("SynScan", std::string("PulseGuide: failed to restore tracking: ") + e.what());
-                    } catch (...) {
-                        ALPACA_LOG_WARN("SynScan", "PulseGuide: failed to restore tracking");
+                    // A same-mode T leaves the handset's readback regime as it is (measured); the pulse moved RA
+                    // by the estimate the override already reports.
+                    if (guide_position_valid_) {
+                        readback_top_hours_ = guide_position_ra_hours_;
+                    } else {
+                        invalidate_readback_top_locked();
                     }
                 }
             } else {
@@ -1748,7 +1752,13 @@ public:
         // goto failed.
         last_slew_error_.clear();
 
-        SynScanProtocolWrapper::instance().move_axis_variable_rate(axis, moving ? rate : 0.0);
+        auto& protocol = SynScanProtocolWrapper::instance();
+        protocol.move_axis_variable_rate(axis, moving ? rate : 0.0);
+        if (!moving && axis == 0 && tracking_mode_cached_ > 0) {
+            // A variable-rate P slew replaces tracking on the handset, so the stop leaves the RA motor stopped;
+            // ASCOM resumes the tracking rate when MoveAxis stops (see ra_motor_rate_locked).
+            protocol.set_tracking_mode(tracking_mode_cached_);
+        }
         slewing_cached_ = false;
         slew_force_until_ = std::chrono::steady_clock::time_point::min();
         position_override_until_ = std::chrono::steady_clock::time_point::min();
@@ -2100,6 +2110,21 @@ private:
         return hunt;
     }
 
+    // The signed variable rate (deg/s, positive = code 6) that moves RA east at `east_arcsec_per_s`. On the handset
+    // a variable-rate P slew is the RA motor's own speed and replaces tracking (EQM-35 Pro on HC 06.03.00,
+    // 2026-10-13: a 2 s "west" pulse sent as code 6 at 7.5"/s moved RA 50.6" east, the "east" one as code 7 19.3"
+    // east). So the motor runs westward at the base rate (sidereal while tracking, else 0) less the eastward rate,
+    // and the tracking command alone ends the move: sent mid-slew it resumes sidereal at once, with no stop
+    // between (measured: a 15" move landed within the readback's resolution). The westward code is 7 at that
+    // southern site; INDI's SynScan driver sends 6 for west at sidereal + guide rate, so 6 is taken as westward
+    // north of the equator (not measured on a northern mount).
+    double ra_motor_rate_locked(double east_arcsec_per_s) const {
+        const double base_arcsec_per_s = tracking_mode_cached_ > 0 ? kSiderealDegPerSec * 3600.0 : 0.0;
+        const double westward_arcsec_per_s = base_arcsec_per_s - east_arcsec_per_s;
+        const double westward_sign = site_latitude_cached_ < 0.0 ? -1.0 : 1.0;
+        return westward_sign * westward_arcsec_per_s / 3600.0;
+    }
+
     // Moves one axis by `delta_arcsec` (RA: east positive; Dec: north positive) at the guide rate and stops,
     // restoring tracking after an RA move as a pulse does. Returns false when superseded or cancelled.
     bool nudge_axis_locked(std::unique_lock<std::mutex>& lock, int axis, double delta_arcsec, uint64_t owner_generation,
@@ -2110,16 +2135,14 @@ private:
         if (rate_arcsec_per_sec <= 0.0) {
             return true;
         }
-        double move_arcsec = delta_arcsec;
-        if (axis == 0) {
-            move_arcsec -= kRaNudgeStopGapArcsec;  // the stop/restart gap adds RA whichever way the move goes
-        }
-        // A residual just over the tolerance can call for a move shorter than the handset resolves once the RA
-        // gap is allowed for; a 50 ms minimum keeps it from being skipped round after round.
+        const double move_arcsec = delta_arcsec;
+        // A residual just over the tolerance can call for a move shorter than the handset resolves; a 50 ms
+        // minimum keeps it from being skipped round after round.
         const double seconds = std::clamp(std::abs(move_arcsec) / rate_arcsec_per_sec, 0.05, kNudgeMaxSeconds);
-        // RA east is the negative variable rate, as pulse_guide sends it; Dec north is positive unless the mount
+        // RA goes through the absolute motor rate (ra_motor_rate_locked); Dec north is positive unless the mount
         // is on the west side of the pier, where the Dec motor runs the other way.
-        double signed_rate = axis == 0 ? (move_arcsec > 0.0 ? -rate_deg_per_sec : rate_deg_per_sec)
+        double signed_rate = axis == 0 ? ra_motor_rate_locked(move_arcsec > 0.0 ? rate_arcsec_per_sec
+                                                                                  : -rate_arcsec_per_sec)
                                        : (move_arcsec > 0.0 ? rate_deg_per_sec : -rate_deg_per_sec);
         if (axis == 1 && protocol.get_pointing_state() == 'W') {
             signed_rate = -signed_rate;
@@ -2137,7 +2160,11 @@ private:
         bool stopped = false;
         for (int attempt = 0; attempt < 3 && !stopped; ++attempt) {
             try {
-                protocol.move_axis_variable_rate(axis, 0.0);
+                if (axis == 0 && tracking_mode_cached_ > 0) {
+                    protocol.set_tracking_mode(tracking_mode_cached_);  // ends the RA move, see ra_motor_rate_locked
+                } else {
+                    protocol.move_axis_variable_rate(axis, 0.0);
+                }
                 stopped = true;
             } catch (const std::exception& e) {
                 stop_error = e.what();
@@ -2145,9 +2172,6 @@ private:
         }
         if (!stopped) {
             throw AlpacaException("Landing move stop failed on axis " + std::to_string(axis) + ": " + stop_error);
-        }
-        if (axis == 0 && tracking_mode_cached_ > 0) {
-            protocol.set_tracking_mode(tracking_mode_cached_);
         }
         check_connected();
         return keep && motion_generation_ == owner_generation;
