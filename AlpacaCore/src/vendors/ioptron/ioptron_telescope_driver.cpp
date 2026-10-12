@@ -59,7 +59,8 @@ public:
                            std::optional<double> site_latitude_deg, std::optional<double> site_longitude_deg,
                            std::optional<double> site_elevation_m, std::optional<bool> sync_time_on_connect,
                            util::ConnectionResolver<ConnectionInfo> connection_resolver = {},
-                           std::function<void()> before_slew_worker_lock = {})
+                           std::function<void()> before_slew_worker_lock = {},
+                           std::function<void()> before_slew_reap = {}, std::function<void()> before_handoff_lock = {})
         : AsyncConnectable("iOptron"),
           device_number_(device_number),
           connection_info_(connection_info),
@@ -106,7 +107,9 @@ public:
           pending_site_longitude_(site_longitude_deg),
           pending_site_elevation_(site_elevation_m),
           sync_time_on_connect_(sync_time_on_connect.value_or(true)),
-          before_slew_worker_lock_(std::move(before_slew_worker_lock)) {
+          before_slew_worker_lock_(std::move(before_slew_worker_lock)),
+          before_slew_reap_(std::move(before_slew_reap)),
+          before_handoff_lock_(std::move(before_handoff_lock)) {
         // Initialize mount info (will be populated on connect)
     }
 
@@ -408,7 +411,10 @@ public:
             // Join the async slew dispatch thread before tearing down the
             // protocol connection (runs after lock.unlock() — the thread
             // takes mutex_, so joining under the lock would deadlock).
-            reap_slew_dispatch();
+            {
+                std::lock_guard<std::mutex> handoff_lock(slew_handoff_mutex_);
+                reap_slew_dispatch();
+            }
             auto& protocol = iOptronProtocolWrapper::instance();
             protocol.disconnect();
             ALPACA_LOG_INFO("iOptron", "Disconnected from mount");
@@ -1324,6 +1330,7 @@ public:
     }
 
     void abort_slew() override {
+        std::lock_guard<std::mutex> handoff_lock(slew_handoff_mutex_);
         // open-astro#768: fence the async slew dispatch first, so no :MS1#/:MS2#
         // can reach the mount after the stop below. Runs without mutex_ held
         // (the dispatch thread takes it), like every other reap site.
@@ -1498,6 +1505,8 @@ public:
 
     void slew_to_coordinates_async(double ra, double dec) override {
         validate_ra_dec(ra, dec, "SlewToCoordinatesAsync");
+        if (before_handoff_lock_) before_handoff_lock_();
+        std::lock_guard<std::mutex> handoff_lock(slew_handoff_mutex_);
         double phys_ra = 0.0;
         double phys_dec = 0.0;
         std::uint64_t generation = 0;
@@ -1512,6 +1521,7 @@ public:
             generation = slew_operation_generation_;
         }
         try {
+            if (before_slew_reap_) before_slew_reap_();
             // Joinable member thread (never detached), joined in the
             // destructor and on disconnect. Join any previous dispatch first
             // (must run without mutex_ held — the thread takes mutex_).
@@ -1631,6 +1641,8 @@ public:
 
     void slew_to_alt_az_async(double altitude, double azimuth) override {
         validate_alt_az(altitude, azimuth, "SlewToAltAzAsync");
+        if (before_handoff_lock_) before_handoff_lock_();
+        std::lock_guard<std::mutex> handoff_lock(slew_handoff_mutex_);
         std::uint64_t generation = 0;
         std::string previous_slew_error;
         {
@@ -1658,6 +1670,7 @@ public:
         }
 
         try {
+            if (before_slew_reap_) before_slew_reap_();
             // Joinable member thread (never detached), joined in the
             // destructor and on disconnect. Join any previous dispatch first
             // (must run without mutex_ held — the thread takes mutex_).
@@ -2873,6 +2886,9 @@ private:
     std::optional<double> pending_site_elevation_;
     bool sync_time_on_connect_;
     const std::function<void()> before_slew_worker_lock_;
+    const std::function<void()> before_slew_reap_;
+    const std::function<void()> before_handoff_lock_;
+    std::mutex slew_handoff_mutex_;
 };
 
 // Factory function implementation
@@ -2886,10 +2902,12 @@ std::unique_ptr<TelescopeDriver> create_ioptron_telescope(
 
 std::unique_ptr<TelescopeDriver> create_ioptron_telescope_with_slew_worker_hook(
     int device_number, const ConnectionInfo& connection_info, std::function<void()> before_worker_lock,
-    std::optional<double> site_latitude_deg, std::optional<double> site_longitude_deg) {
+    std::optional<double> site_latitude_deg, std::optional<double> site_longitude_deg,
+    std::function<void()> before_slew_reap, std::function<void()> before_handoff_lock) {
     return std::make_unique<iOptronTelescopeDriver>(
         device_number, connection_info, site_latitude_deg, site_longitude_deg, std::nullopt, std::nullopt,
-        util::ConnectionResolver<ConnectionInfo>{}, std::move(before_worker_lock));
+        util::ConnectionResolver<ConnectionInfo>{}, std::move(before_worker_lock), std::move(before_slew_reap),
+        std::move(before_handoff_lock));
 }
 
 std::unique_ptr<TelescopeDriver> create_ioptron_telescope_with_site(

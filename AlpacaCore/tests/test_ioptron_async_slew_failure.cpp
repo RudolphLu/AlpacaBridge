@@ -24,6 +24,7 @@
 #include <alpacacore/util/error_handling.h>
 #include <alpacacore/vendor/ioptron/ioptron_telescope_driver.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -70,6 +71,15 @@ bool wait_until(const std::function<bool()>& pred, int timeout_ms) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     return pred();
+}
+
+void require_alpaca_error(const std::function<void()>& fn, int expected_code) {
+    try {
+        fn();
+        FAIL("Expected AlpacaException");
+    } catch (const alpacacore::AlpacaException& ex) {
+        REQUIRE(ex.error_code() == expected_code);
+    }
 }
 
 class WorkerGate {
@@ -120,6 +130,55 @@ private:
     bool accept_second_ = false;
     bool entered_ = false;
     bool released_ = false;
+};
+
+class SlewHandoffGate {
+public:
+    void before_lock() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++attempts_;
+        cv_.notify_all();
+    }
+
+    void before_reap() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ++reaps_;
+        cv_.notify_all();
+        if (reaps_ == 1) {
+            first_reap_entered_ = true;
+            cv_.notify_all();
+            cv_.wait(lock, [&] { return release_first_; });
+        }
+    }
+
+    bool wait_for_attempts(int count, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, timeout, [&] { return attempts_ >= count; });
+    }
+
+    bool wait_for_first_reap(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, timeout, [&] { return first_reap_entered_; });
+    }
+
+    bool wait_for_reaps(int count, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, timeout, [&] { return reaps_ >= count; });
+    }
+
+    void release_first() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        release_first_ = true;
+        cv_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    int attempts_ = 0;
+    int reaps_ = 0;
+    bool first_reap_entered_ = false;
+    bool release_first_ = false;
 };
 
 // Threw only for the driver-specific DriverException (0x500) the #575 contract
@@ -241,6 +300,70 @@ TEST_CASE("iOptron async - a stale worker cannot publish over a newer accepted s
 
     REQUIRE(wait_until([&] { return mount.count(":MS1#") >= 1; }, 5000));
     CHECK(mount.count(":MS1#") == 1);
+    REQUIRE(wait_until([&] { return read_slewing(*driver) == SlewingRead::False; }, 15000));
+    driver->set_connected(false);
+}
+
+TEST_CASE("iOptron async - a newer initiator cannot be reaped by an older handoff",
+          "[ioptron][telescope][async][slewfailure]") {
+    alpacacore::test::FakeIoptronMount mount("0012", 0.0);
+    REQUIRE(mount.ok());
+    WorkerGate worker_gate;
+    worker_gate.arm();
+    SlewHandoffGate handoff;
+    auto driver = alpacacore::vendor::ioptron::create_ioptron_telescope_with_slew_worker_hook(
+        0, endpoint(mount.port()), [&] { worker_gate.before_worker_lock(mount); }, 45.0, -122.0,
+        [&] { handoff.before_reap(); }, [&] { handoff.before_lock(); });
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    std::exception_ptr older_error;
+    std::exception_ptr newer_error;
+    std::jthread older;
+    std::jthread newer;
+    struct ReleaseGate {
+        SlewHandoffGate& handoff;
+        WorkerGate& worker;
+        ~ReleaseGate() {
+            handoff.release_first();
+            worker.release();
+        }
+    } release_gate{handoff, worker_gate};
+
+    older = std::jthread([&] {
+        try {
+            driver->slew_to_coordinates_async(5.5, 20.0);
+        } catch (...) {
+            older_error = std::current_exception();
+        }
+    });
+    REQUIRE(handoff.wait_for_attempts(1, std::chrono::seconds(5)));
+    REQUIRE(handoff.wait_for_first_reap(std::chrono::seconds(5)));
+
+    std::atomic<bool> newer_call_started{false};
+    newer = std::jthread([&] {
+        newer_call_started.store(true, std::memory_order_release);
+        try {
+            driver->slew_to_coordinates_async(6.5, 25.0);
+        } catch (...) {
+            newer_error = std::current_exception();
+        }
+    });
+    REQUIRE(wait_until([&] { return newer_call_started.load(std::memory_order_acquire); }, 5000));
+    REQUIRE(handoff.wait_for_attempts(2, std::chrono::seconds(5)));
+    CHECK_FALSE(handoff.wait_for_reaps(2, std::chrono::milliseconds(100)));
+    CHECK(driver->get_target_right_ascension() == 5.5);
+
+    handoff.release_first();
+    REQUIRE(handoff.wait_for_reaps(2, std::chrono::seconds(5)));
+    REQUIRE(worker_gate.wait_until_entered());
+    worker_gate.release();
+    older.join();
+    newer.join();
+    if (older_error) std::rethrow_exception(older_error);
+    if (newer_error) std::rethrow_exception(newer_error);
+
+    CHECK(driver->get_target_right_ascension() == 6.5);
+    REQUIRE(wait_until([&] { return mount.count(":MS1#") >= 1; }, 5000));
     REQUIRE(wait_until([&] { return read_slewing(*driver) == SlewingRead::False; }, 15000));
     driver->set_connected(false);
 }
