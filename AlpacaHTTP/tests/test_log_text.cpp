@@ -51,7 +51,7 @@ int main() {
     // Ordinary non-ASCII text is unchanged.
     EXPECT(escape_for_log("\xC3\xA9\xE4\xB8\xAD\xE6\x96\x87") == "\xC3\xA9\xE4\xB8\xAD\xE6\x96\x87");
     // A cut never splits an escaped sequence: the 3-byte control would end at 257.
-    {
+    {  // case: cut does not split an escaped bidi control
         const std::string in = std::string(255, 'a') + "\xE2\x80\xAE";
         EXPECT(escape_for_log(in) == std::string(255, 'a') + "... (258 bytes)");
     }
