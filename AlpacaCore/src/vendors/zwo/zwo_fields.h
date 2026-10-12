@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <set>
 #include <string>
@@ -70,16 +71,33 @@ inline const Field<double> kZwoFocalLength{.key = "focalLength", .default_value 
 
 // SDK-bound devices: an id (>= 0) wins over an index (>= 0), and one of the two is
 // required. -1 means "not set", as the arm read it.
-inline const Field<std::int64_t> kZwoFilterwheelIndex{
-    .key = "filterwheelIndex", .default_value = -1, .role = Role::EnumerationIndex};
-inline const Field<std::int64_t> kZwoFilterwheelId{.key = "filterwheelId", .default_value = -1, .role = Role::DeviceId};
+inline constexpr std::int64_t kZwoSelectorMin = -1;
+inline constexpr std::int64_t kZwoSelectorMax = std::numeric_limits<int>::max();
+inline const Field<std::int64_t> kZwoFilterwheelIndex{.key = "filterwheelIndex",
+                                                      .default_value = -1,
+                                                      .role = Role::EnumerationIndex,
+                                                      .min = kZwoSelectorMin,
+                                                      .max = kZwoSelectorMax};
+inline const Field<std::int64_t> kZwoFilterwheelId{.key = "filterwheelId",
+                                                   .default_value = -1,
+                                                   .role = Role::DeviceId,
+                                                   .min = kZwoSelectorMin,
+                                                   .max = kZwoSelectorMax};
 inline const Field<std::vector<std::string>> kZwoFilterNames{.key = "filterNames", .default_value = {}};
-inline const Field<std::int64_t> kZwoFocuserIndex{
-    .key = "focuserIndex", .default_value = -1, .role = Role::EnumerationIndex};
-inline const Field<std::int64_t> kZwoFocuserId{.key = "focuserId", .default_value = -1, .role = Role::DeviceId};
-inline const Field<std::int64_t> kZwoRotatorIndex{
-    .key = "rotatorIndex", .default_value = -1, .role = Role::EnumerationIndex};
-inline const Field<std::int64_t> kZwoRotatorId{.key = "rotatorId", .default_value = -1, .role = Role::DeviceId};
+inline const Field<std::int64_t> kZwoFocuserIndex{.key = "focuserIndex",
+                                                  .default_value = -1,
+                                                  .role = Role::EnumerationIndex,
+                                                  .min = kZwoSelectorMin,
+                                                  .max = kZwoSelectorMax};
+inline const Field<std::int64_t> kZwoFocuserId{
+    .key = "focuserId", .default_value = -1, .role = Role::DeviceId, .min = kZwoSelectorMin, .max = kZwoSelectorMax};
+inline const Field<std::int64_t> kZwoRotatorIndex{.key = "rotatorIndex",
+                                                  .default_value = -1,
+                                                  .role = Role::EnumerationIndex,
+                                                  .min = kZwoSelectorMin,
+                                                  .max = kZwoSelectorMax};
+inline const Field<std::int64_t> kZwoRotatorId{
+    .key = "rotatorId", .default_value = -1, .role = Role::DeviceId, .min = kZwoSelectorMin, .max = kZwoSelectorMax};
 
 // Switch. "dewheater" (a camera's heater through the camera SDK, the default),
 // "asiair" (Pro, Pi 4), "asiair-plus-picm4" (Plus, Pi CM4; same wiring) and
@@ -90,11 +108,15 @@ inline const Field<std::string> kZwoSwitchType{
 inline const Field<std::int64_t> kZwoCameraIndex{.key = "cameraIndex",
                                                  .default_value = -1,
                                                  .role = Role::EnumerationIndex,
-                                                 .applies_when = AppliesWhen{"switchType", "dewheater"}};
+                                                 .applies_when = AppliesWhen{"switchType", "dewheater"},
+                                                 .min = kZwoSelectorMin,
+                                                 .max = kZwoSelectorMax};
 inline const Field<std::int64_t> kZwoCameraId{.key = "cameraId",
                                               .default_value = -1,
                                               .role = Role::DeviceId,
-                                              .applies_when = AppliesWhen{"switchType", "dewheater"}};
+                                              .applies_when = AppliesWhen{"switchType", "dewheater"},
+                                              .min = kZwoSelectorMin,
+                                              .max = kZwoSelectorMax};
 inline const Field<std::string> kZwoGpioChip{
     .key = "gpioChip", .default_value = "/dev/gpiochip0", .applies_when = AppliesWhen{"switchType", "asiair"}};
 inline const Field<std::string> kZwoDevicePath{.key = "devicePath",
@@ -196,8 +218,7 @@ inline std::optional<std::string> zwo_switch_refusal(const DeviceConfig& config)
         }
         return std::nullopt;
     }
-    return zwo_bound_refusal(config, kZwoCameraId, kZwoCameraIndex,
-                             "ZWO dew heater switch requires cameraIndex or cameraId");
+    return std::nullopt;
 }
 
 }  // namespace alpacacore::catalog
