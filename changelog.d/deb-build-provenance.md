@@ -1,0 +1,2 @@
+### Changed (tooling)
+- **Beta and nightly `.deb`s carry build provenance and an SBOM** (CI, `.github/workflows/release.yml`, `.github/workflows/nightly-build.yml`): each published `.deb` now gets a Sigstore-signed SLSA build provenance attestation and an SPDX SBOM attestation, so `gh attestation verify <file> --repo open-astro/AlpacaBridge` proves which workflow and commit built it. A release dry run builds the SBOM but attests nothing. Stable `.deb`s ship through apt.openastro.net and are not covered.

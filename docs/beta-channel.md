@@ -32,6 +32,12 @@ file with `sha256sum -c alpacabridge_X.Y.Z-beta.N_arm64.deb.sha256`, then run
 `sudo apt install ./alpacabridge_X.Y.Z-beta.N_arm64.deb`. apt does not offer the next beta to a
 build installed this way; repeat the download for each beta, or opt in as above.
 
+To check the file was built by this repository's release workflow from the beta's tag, and not
+just that it matches its `.sha256`, run on any machine with the GitHub CLI signed in:
+`gh attestation verify alpacabridge_X.Y.Z-beta.N_arm64.deb --repo open-astro/AlpacaBridge`.
+The same works for a nightly `.deb`. Each attestation, and the SBOM attached to it, is also
+listed under the repository's Actions > Attestations.
+
 **Opt out** by removing `beta` from the apt line and restoring the default
 `update_packages_url`. apt does not downgrade on its own, so a user who leaves mid-beta stays
 on the beta build until the stable release overtakes it.
