@@ -148,6 +148,9 @@ int main() {
             const auto& id = setting(backend.added_settings, "connection", "id");
             EXPECT(id.type == 's');
             EXPECT(id.string_value == expected_id);
+            const auto& connection_type = setting(backend.added_settings, "connection", "type");
+            EXPECT(connection_type.type == 's');
+            EXPECT(connection_type.string_value == "802-11-wireless");
             const auto& wire_ssid = setting(backend.added_settings, "802-11-wireless", "ssid");
             EXPECT(wire_ssid.type == 'y');
             EXPECT(wire_ssid.bytes == std::vector<std::uint8_t>(ssid.begin(), ssid.end()));
@@ -185,10 +188,22 @@ int main() {
         const auto& updated_id = setting(backend.updated_settings, "connection", "id");
         EXPECT(updated_id.type == 's');
         EXPECT(updated_id.string_value == "Custom ID");
+        const auto& connection_type = setting(backend.updated_settings, "connection", "type");
+        EXPECT(connection_type.type == 's');
+        EXPECT(connection_type.string_value == "802-11-wireless");
+        const auto& autoconnect = setting(backend.updated_settings, "connection", "autoconnect");
+        EXPECT(autoconnect.type == 'b');
+        EXPECT(autoconnect.boolean_value);
+        const auto& priority = setting(backend.updated_settings, "connection", "autoconnect-priority");
+        EXPECT(priority.type == 'i');
+        EXPECT(priority.integer_value == 4);
         EXPECT(setting(backend.updated_settings, "connection", "uuid").string_value == "uuid-custom");
         EXPECT(setting(backend.updated_settings, "802-11-wireless", "ssid").bytes == std::vector<std::uint8_t>{0xff});
-        EXPECT(result["Id"] == "Custom ID");
-        EXPECT(result["SsidHex"] == "ff");
+        EXPECT((result == nlohmann::json{{"Id", "Custom ID"},
+                                         {"Ssid", std::string("\xff", 1)},
+                                         {"SsidHex", "ff"},
+                                         {"Autoconnect", true},
+                                         {"Priority", 4}}));
     }
 
     // case: WifiManager supplies a safe ID when an existing profile has none
@@ -227,10 +242,36 @@ int main() {
         FakeWifiProfileBackend password_backend;
         WifiManager password_manager("unused", password_backend);
         const auto password_result = password_manager.save_profile("SecureNet", "password1", true, 0);
+        const auto& connection_type = setting(password_backend.added_settings, "connection", "type");
+        EXPECT(connection_type.type == 's');
+        EXPECT(connection_type.string_value == "802-11-wireless");
+        const auto& key_mgmt_new = setting(password_backend.added_settings, "802-11-wireless-security", "key-mgmt");
+        EXPECT(key_mgmt_new.type == 's');
+        EXPECT(key_mgmt_new.string_value == "wpa-psk");
         const auto& psk = setting(password_backend.added_settings, "802-11-wireless-security", "psk");
         EXPECT(psk.type == 's');
         EXPECT(psk.string_value == "password1");
         EXPECT(!password_result.contains("Passphrase"));
+
+        FakeWifiProfileBackend replacement_backend;
+        auto replacement = saved_profile("SecureNet", "infrastructure", "Saved SecureNet", "uuid-secure");
+        replacement["802-11-wireless-security"] = {{"key-mgmt", "wpa-psk"}};
+        replacement_backend.connections.emplace_back("/saved/secure", std::move(replacement));
+        WifiManager replacement_manager("unused", replacement_backend);
+        const auto replacement_result = replacement_manager.save_profile("SecureNet", "newpassword1", true, 3);
+        EXPECT(replacement_backend.add_calls == 0);
+        EXPECT(replacement_backend.update_calls == 1);
+        EXPECT(replacement_backend.updated_path == "/saved/secure");
+        EXPECT(connection_id(replacement_backend.updated_settings) == "Saved SecureNet");
+        EXPECT(setting(replacement_backend.updated_settings, "connection", "uuid").string_value == "uuid-secure");
+        const auto& replacement_key_mgmt =
+            setting(replacement_backend.updated_settings, "802-11-wireless-security", "key-mgmt");
+        EXPECT(replacement_key_mgmt.type == 's');
+        EXPECT(replacement_key_mgmt.string_value == "wpa-psk");
+        const auto& replacement_psk = setting(replacement_backend.updated_settings, "802-11-wireless-security", "psk");
+        EXPECT(replacement_psk.type == 's');
+        EXPECT(replacement_psk.string_value == "newpassword1");
+        EXPECT(!replacement_result.contains("Passphrase"));
     }
 
     // case: WifiManager pins dual-interface profiles to the client interface
