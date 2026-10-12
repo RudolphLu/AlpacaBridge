@@ -35,6 +35,27 @@ int main() {
     EXPECT(escape_for_log("\x80") == "\\x80");
     EXPECT(escape_for_log("\xED\xA0\x80") == "\\xed\\xa0\\x80");  // surrogate
 
+    // C1 controls and bidi controls are escaped byte by byte; range edges too.
+    EXPECT(escape_for_log("a\xC2\x9B"
+                          "b") == "a\\xc2\\x9bb");
+    EXPECT(escape_for_log("\xE2\x80\xAE") == "\\xe2\\x80\\xae");
+    EXPECT(escape_for_log("\xC2\x80\xC2\x9F") == "\\xc2\\x80\\xc2\\x9f");
+    EXPECT(escape_for_log("\xE2\x80\xAA") == "\\xe2\\x80\\xaa");
+    EXPECT(escape_for_log("\xE2\x81\xA6\xE2\x81\xA9") == "\\xe2\\x81\\xa6\\xe2\\x81\\xa9");
+    // Neighbours pass through: U+00A0, U+2029, U+202F, U+2065, U+206A.
+    EXPECT(escape_for_log("\xC2\xA0") == "\xC2\xA0");
+    EXPECT(escape_for_log("\xE2\x80\xA9") == "\xE2\x80\xA9");
+    EXPECT(escape_for_log("\xE2\x80\xAF") == "\xE2\x80\xAF");
+    EXPECT(escape_for_log("\xE2\x81\xA5") == "\xE2\x81\xA5");
+    EXPECT(escape_for_log("\xE2\x81\xAA") == "\xE2\x81\xAA");
+    // Ordinary non-ASCII text is unchanged.
+    EXPECT(escape_for_log("\xC3\xA9\xE4\xB8\xAD\xE6\x96\x87") == "\xC3\xA9\xE4\xB8\xAD\xE6\x96\x87");
+    // A cut never splits an escaped sequence: the 3-byte control would end at 257.
+    {
+        const std::string in = std::string(255, 'a') + "\xE2\x80\xAE";
+        EXPECT(escape_for_log(in) == std::string(255, 'a') + "... (258 bytes)");
+    }
+
     // Cut on a code-point boundary: 255 ASCII bytes then a 2-byte character
     // that would end at byte 257.
     {
