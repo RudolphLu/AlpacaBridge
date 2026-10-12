@@ -15,7 +15,7 @@ and fixed what that surfaced: `gp_camera_autodetect()`'s return-value contract, 
 ASCOM contract, a `StartExposure` ROI bounds check, and the `PixelSizeX`/`PixelSizeY` lookup table
 described below; a third session validated the D3300 on the same slot with no code change.
 The Canon EOS 4000D report came from a user's Raspberry Pi 5, not that rig (issue #611), also with no
-code change; the Canon EOS 70D report (issue #637) and the Canon EOS 250D report came from a second
+code change, and the committed report is that user's re-run for the Canon bulb change on a 5.0.0 nightly built from main (issue #1063, ConformU 4.5.1, 2026-10-12); the Canon EOS 70D report (issue #637) and the Canon EOS 250D report came from a second
 Raspberry Pi 5, again with no code change; both were re-run on that Pi for the Canon bulb change (issue #640, ConformU 4.5.1, 2026-10-09), and the committed reports are those runs. The 70D works on mode dial B (its shutter-speed list holds only `bulb`; every exposure takes the Canon bulb path, issue #640), and a Raspberry Pi 3 is too
 slow for it under ConformU: libraw's `unpack()` of its 20 MP CR2 takes about 4 s there, the frame stays
 `Exposing` for about 8 s, and ConformU's `StartExposure` wait gives up. The Canon EOS 250D (the EOS 200D II in Asia) needs the
@@ -181,7 +181,8 @@ SDK cleanup checklist does not apply here).
   **B mode:** with the mode dial on B the shutter-speed list holds only `bulb`, so there is no
   native speed to use and every duration, short ones too, takes the bulb path instead of failing
   with "No shutter speed control exposed by this camera". The shutter-speed widget is not written there: the body owns the shutter and refuses the write ("I/O in progress", EOS 70D), so the press/release pair alone drives the exposure. Bench evidence is in #640 (EOS 250D on M
-  with shutter Bulb, EOS 70D on B: 5 s and 35 s frames by hand); the EOS 4000D is not verified and
+  with shutter Bulb, EOS 70D on B: 5 s and 35 s frames by hand); the EOS 4000D is user-verified with a 60 s
+  frame through NINA and a ConformU re-run (#1063; its camera-side settings are not recorded), and
   other Canon bodies need their own check. Written from libgphoto2's documented behaviour only
   (INDI is LGPL; copy nothing from it).
 - **RAW format selection**: at connect, the driver scans the `"imageformat"`/`"imagequality"`
