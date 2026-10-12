@@ -30,6 +30,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -67,6 +68,11 @@ struct FakeCelestronState {
     std::atomic<bool> goto_cancelled{false};  // set by the cancel-goto command, cleared by the next GOTO
     std::atomic<bool> hold_slew{false};
     std::atomic<bool> shifted_position{false};
+    std::atomic<bool> reject_next_position_reply{false};
+    std::atomic<bool> reject_position_after_slew{false};
+    std::atomic<bool> reject_next_tracking_write{false};
+    std::atomic<int> malformed_slew_status{0};
+    std::atomic<int> slew_status_polls{0};
     std::atomic<bool> mute{false};
     std::atomic<unsigned char> model_id{24};  // CGX-L
     std::atomic<unsigned char> firmware_major{5};
@@ -132,6 +138,7 @@ alpacacore::test::FakeMountServer::Responder celestron_responder(const std::shar
             case 'E':
             case 'z':
             case 'Z':
+                if (st->reject_next_position_reply.exchange(false)) return "";
                 return st->shifted_position.load() ? "13AB0500,21000500#" : "12AB0500,20000500#";
             case 'r':
             case 'R':
@@ -139,6 +146,14 @@ alpacacore::test::FakeMountServer::Responder celestron_responder(const std::shar
             case 'B':
                 return st->goto_reply();
             case 'L':
+                st->slew_status_polls.fetch_add(1);
+                if (const int malformed = st->malformed_slew_status.load(); malformed == 1) return "01#";
+                if (st->malformed_slew_status.load() == 2) return "0junk#";
+                if (st->goto_count.load() > 0 && !st->goto_in_progress() &&
+                    st->reject_position_after_slew.exchange(false)) {
+                    st->reject_next_position_reply.store(true);
+                    return "0#";
+                }
                 return st->goto_in_progress() ? "1#" : "0#";
             case 'M':  // cancel goto
                 st->goto_cancelled.store(true);
@@ -148,6 +163,7 @@ alpacacore::test::FakeMountServer::Responder celestron_responder(const std::shar
             case 'p':  // pier side used by the DEC guide command
                 return "W#";
             case 'T':
+                if (st->reject_next_tracking_write.exchange(false)) return "";
                 return "#";
             case 'P': {  // AUX passthrough: P len dev op ...
                 const unsigned char op = chunk.size() > 3 ? static_cast<unsigned char>(chunk[3]) : 0;
@@ -182,6 +198,12 @@ alpacacore::vendor::celestron::ConnectionInfo endpoint(int port, int timeout_ms 
     info.tcp_port = port;
     info.response_timeout_ms = timeout_ms;
     return info;
+}
+
+std::unique_ptr<alpacacore::TelescopeDriver> make_driver(int port, alpacacore::util::TaskClock& clock) {
+    return alpacacore::vendor::celestron::create_celestron_telescope_with_site(
+        0, endpoint(port), std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        alpacacore::vendor::celestron::CelestronAlignmentSetting::Auto, clock);
 }
 
 bool wait_until(const std::function<bool()>& pred, int timeout_ms) {
@@ -294,6 +316,26 @@ TEST_CASE("Celestron async - motor-controller completion-poll failure persists t
     driver->set_connected(false);
 }
 
+TEST_CASE("Celestron async - complete HC status replies are validated", "[celestron][telescope][async][slewfailure]") {
+    for (const int malformed : {1, 2}) {
+        auto st = std::make_shared<FakeCelestronState>();
+        st->hold_slew.store(true);
+        alpacacore::test::FakeMountServer server(celestron_responder(st));
+        REQUIRE(server.ok());
+        auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+        REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+        REQUIRE_NOTHROW(driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0));
+        REQUIRE(wait_until([&] { return st->goto_count.load() > 0; }, 5000));
+        st->malformed_slew_status.store(malformed);
+        std::string message;
+        REQUIRE(wait_until([&] { return read_slewing(*driver, &message) == SlewingRead::Threw; }, 10000));
+        CHECK(st->slew_status_polls.load() > 0);
+        CHECK(message.find("invalid response") != std::string::npos);
+        driver->set_connected(false);
+    }
+}
+
 TEST_CASE("Celestron async - slew timeout is a persistent failure", "[celestron][telescope][async][slewfailure]") {
     alpacacore::test::FakeTaskClock clock;
     auto st = std::make_shared<FakeCelestronState>();
@@ -310,6 +352,51 @@ TEST_CASE("Celestron async - slew timeout is a persistent failure", "[celestron]
     REQUIRE(advance_until(
         clock, [&] { return read_slewing(*driver, &message) == SlewingRead::Threw; }, std::chrono::seconds(1), 125));
     CHECK(message.find("timed out after 120s") != std::string::npos);
+    CHECK(read_slewing(*driver) == SlewingRead::Threw);
+    driver->set_connected(false);
+}
+
+TEST_CASE("Celestron async - tracking restoration failure is retained", "[celestron][telescope][async][slewfailure]") {
+    alpacacore::test::FakeTaskClock clock;
+    auto st = std::make_shared<FakeCelestronState>();
+    st->clock = &clock;
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = make_driver(server.port(), clock);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    driver->set_tracking(true);
+
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0));
+    REQUIRE(wait_until([&] { return st->goto_count.load() > 0; }, 5000));
+    st->reject_next_tracking_write.store(true);
+    std::string message;
+    REQUIRE(advance_until(
+        clock, [&] { return read_slewing(*driver, &message) == SlewingRead::Threw; }, std::chrono::milliseconds(250),
+        24));
+    CHECK(message.find("Slew completion handling failed") != std::string::npos);
+    CHECK(read_slewing(*driver) == SlewingRead::Threw);
+    driver->set_connected(false);
+}
+
+TEST_CASE("Celestron async - post-slew position-read failure is retained",
+          "[celestron][telescope][async][slewfailure]") {
+    alpacacore::test::FakeTaskClock clock;
+    auto st = std::make_shared<FakeCelestronState>();
+    st->clock = &clock;
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = make_driver(server.port(), clock);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    REQUIRE_NOTHROW(driver->set_tracking(true));
+
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0));
+    REQUIRE(wait_until([&] { return st->goto_count.load() > 0; }, 5000));
+    st->reject_position_after_slew.store(true);
+    std::string message;
+    REQUIRE(advance_until(
+        clock, [&] { return read_slewing(*driver, &message) == SlewingRead::Threw; }, std::chrono::milliseconds(250),
+        24));
+    CHECK(message.find("Slew completion handling failed") != std::string::npos);
     CHECK(read_slewing(*driver) == SlewingRead::Threw);
     driver->set_connected(false);
 }

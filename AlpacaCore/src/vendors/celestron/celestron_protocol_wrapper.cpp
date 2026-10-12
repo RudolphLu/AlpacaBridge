@@ -529,7 +529,7 @@ public:
         if (response.empty()) {
             throw AlpacaException("Slew completion query (L) returned no response", AlpacaError::DriverException);
         }
-        if (response[0] != '0' && response[0] != '1') {
+        if (response.size() != 1 || (response[0] != '0' && response[0] != '1')) {
             throw AlpacaException("Slew completion query (L) returned an invalid response",
                                   AlpacaError::DriverException);
         }
@@ -593,13 +593,9 @@ public:
         cmd.push_back(static_cast<char>(1));
         std::string response = send_command(cmd, true, 0, 1);
         if (response.empty()) {
-            throw AlpacaException("Home completion query returned no response", AlpacaError::DriverException);
+            return false;
         }
-        const auto status = static_cast<unsigned char>(response[0]);
-        if (status != 0x00 && status != 0xFF) {
-            throw AlpacaException("Home completion query returned an invalid response", AlpacaError::DriverException);
-        }
-        return status == 0xFF;
+        return static_cast<unsigned char>(response[0]) != 0;
     }
 
     void level_start(int axis) {
@@ -647,9 +643,13 @@ public:
         cmd.push_back(static_cast<char>(1));
         std::string response = send_command(cmd, true, 0, 1);
         if (response.empty()) {
-            return false;
+            throw AlpacaException("Home completion query returned no response", AlpacaError::DriverException);
         }
-        return static_cast<unsigned char>(response[0]) != 0;
+        const auto status = static_cast<unsigned char>(response[0]);
+        if (status != 0x00 && status != 0xFF) {
+            throw AlpacaException("Home completion query returned an invalid response", AlpacaError::DriverException);
+        }
+        return status == 0xFF;
     }
 
     std::string get_device_firmware(int device_address) {
