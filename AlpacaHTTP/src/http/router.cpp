@@ -2484,8 +2484,11 @@ Response Router::handle_configured_devices(const Request& request, std::uint32_t
             if (auto driver = registry.get_device(cap.type, cap.device_number)) {
                 // Connected feeds the web UI status dot (green/yellow). Omitted
                 // when the call throws, so the UI shows "unknown" (red).
+                // get_connecting() is lock-free; a driver mid-connect can hold its
+                // coarse mutex across get_connected() for the whole connect, so
+                // report false without asking (as the Connected endpoint does).
                 try {
-                    device["Connected"] = driver->get_connected();
+                    device["Connected"] = !driver->get_connecting() && driver->get_connected();
                 } catch (const std::exception& e) {
                     util::log_warning("Connected query failed for " + cap.name + ": " + e.what());
                 }
