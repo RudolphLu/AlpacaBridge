@@ -447,9 +447,11 @@ TEST_CASE("SkyWatcher async - a pulse that supersedes another still reports IsPu
 }
 
 // open-astro#994: the pulse's ownership deadline was stamped and compared on the
-// host steady clock while the hold waits on the task clock. Under a fake clock
-// the pulse must stay live until virtual time passes its end.
-TEST_CASE("SkyWatcher async - IsPulseGuiding follows the task clock, not the host clock (#994)",
+// host steady clock while the hold waits on the task clock. Once the host
+// backstop (duration + 1 s) passed in real time, any IsPulseGuiding read dropped
+// the Dec axis's ownership while the pulse was still running in virtual time,
+// so a DeclinationRate write rewrote the running axis instead of deferring.
+TEST_CASE("SkyWatcher async - a pulse keeps its axis while virtual time has not reached its end (#994)",
           "[skywatcher][async][pulseguide]") {
     FakeTaskClock clock;
     FakeSkyWatcherMount mount(FakeMountProfile::wave_100i(), clock);
@@ -458,12 +460,13 @@ TEST_CASE("SkyWatcher async - IsPulseGuiding follows the task clock, not the hos
     driver->set_tracking(true);
     mount.jump_axis_degrees(2, 45.0);
 
-    driver->pulse_guide(0, 500);                      // North
+    driver->pulse_guide(0, 10);                       // North, host backstop about 1.01 s
     REQUIRE(clock.wait_for_waiters(1, kRendezvous));  // its hold is parked on the clock
-    CHECK(driver->get_is_pulse_guiding());
-    // Past the commanded duration plus the 1 s completion delay, in virtual time.
-    REQUIRE(run_clock_until(clock, [&] { return !driver->get_is_pulse_guiding(); }, std::chrono::milliseconds(3000)));
-    CHECK_FALSE(driver->get_is_pulse_guiding());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1300));  // real time only
+    CHECK(driver->get_is_pulse_guiding());           // must not release the Dec axis
+    const uint32_t period_before = mount.step_period(2);
+    driver->set_declination_rate(10.0);  // busy axis: stored, not applied to the running pulse
+    CHECK(mount.step_period(2) == period_before);
     driver->set_connected(false);
 }
 
