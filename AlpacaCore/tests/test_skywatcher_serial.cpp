@@ -108,6 +108,28 @@ TEST_CASE("SkyWatcher serial - a malformed (byte-dropped) reply is resent and re
     REQUIRE(link.board.count_frames('j') == 2);  // rejected once, resent once
 }
 
+TEST_CASE("SkyWatcher serial - a started :J whose ack was garbled is not reported as rejected on resend",
+          "[skywatcher][serial]") {
+    // The board applies the first ":J1" (the axis starts) but its ack is garbled.
+    // The resend then draws "!2" (motor not stopped) because the axis is running.
+    // That refusal proves the first frame landed, so the start succeeded: the
+    // driver must not tell the client the move failed while the axis runs.
+    SerialLink link(300);
+    link.board.reject_j_on_running_axis();
+    link.board.malform_next();
+    REQUIRE_NOTHROW(link.proto.send_command('J', 1));
+    REQUIRE(link.board.count_frames('J') == 2);
+    REQUIRE(link.proto.inquire_status(1).running);
+}
+
+TEST_CASE("SkyWatcher serial - a genuine :J rejection on the first frame still throws", "[skywatcher][serial]") {
+    SerialLink link(300);
+    link.board.reject_j_on_running_axis();
+    REQUIRE_NOTHROW(link.proto.send_command('J', 1));
+    REQUIRE_THROWS_AS(link.proto.send_command('J', 1), alpacacore::AlpacaException);
+    REQUIRE(link.board.count_frames('J') == 2);  // no resend after a "!"
+}
+
 TEST_CASE("SkyWatcher serial - giving up on a second mis-pair still settles the line", "[skywatcher][serial]") {
     // send_command settles the link before its one resend. It must also
     // settle before it gives up on a second mis-pair: the stale frame behind
