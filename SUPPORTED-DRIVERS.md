@@ -2,7 +2,7 @@
 
 <img src="docs/image/ab.png" alt="AlpacaBridge logo" width="420">
 
-## Updated 2026-10-11
+## Updated 2026-10-13
 This document lists all hardware vendors and device types that are verified to work with AlpacaBridge.
 
 ## Contents
@@ -763,6 +763,7 @@ This document lists all hardware vendors and device types that are verified to w
 
 | Model Series | Connection | Linux<br>(arm64) | Status |
 |--------------|------------|------------------|--------|
+| Sky-Watcher EQM-35 Pro | USB/Serial (hand controller) | ✓ | [ConformU Validation](AlpacaCore/conformu/SynScan/Sky-Watcher%20EQM-35%20Pro/) |
 | Sky-Watcher HEQ5 PRO | USB/Serial (hand controller) | ✓ | [ConformU Validation](AlpacaCore/conformu/SynScan/Sky-Watcher%20HEQ5%20PRO/) |
 
 <details>
@@ -774,9 +775,10 @@ This document lists all hardware vendors and device types that are verified to w
 - **Hand controller setup**: the driver reads pointing and `SideOfPier` from the hand controller's own model, so set the handset's date, time, time zone and site correctly, and power the mount on at its home position (counterweight bar down, pointing at the pole). On an EQM-35 Pro at latitude -37 with a wrong handset date, time and site and a board powered on away from home, `SideOfPier` read `pierWest` on both sides of the meridian. With the handset set up correctly, the same driver passed ConformU's SideOfPier checks (issue #243).
 - **If the handset stops answering** (connect fails the echo test, or every query times out): the SBC powers the handset over its USB cable, so power-cycling the mount with the USB still plugged in does not restart it. Unplug the handset's USB from the SBC, power-cycle the mount, bring the handset to its main screen, wait 30 s, then plug the USB back in (issue #881).
 - **Sky-Watcher HEQ5 PRO Firmware**: Hand controller firmware 4.42.00, motor controller firmware 3.46
-- **Pulse guiding**: Software-timed variable-rate slew (SynScan has no hardware pulse guide command). Driver issues a variable-rate axis slew at the configured guide rate, times the pulse duration in a background thread, then stops the axis and restores sidereal tracking. GEM pier-side DEC direction flip applied automatically. Position reporting uses accumulated `rate × duration` deltas in the target coordinate frame for ConformU tolerance compliance.
-- **AZ-EQ mounts (model IDs 5/6, not hardware-validated)**: with the device's Alignment Mode setting at `altaz` or `equatorial`, `AlignmentMode`, the tracking mode (1 for Alt-Az; 2 north, 3 south for equatorial) and the park position follow the setting. This is covered by unit tests on the fake mount only; there is no ConformU run on an AZ-EQ mount yet. Unset (`auto`) keeps today's behaviour: `AlignmentMode` and `Tracking=true` throw `DriverException`, because the hand controller does not report the active geometry.
-- **ConformU**: Validated with ConformU 4.3.0 — 0 errors, 0 issues (pulse guide tested across N/S/E/W at declinations -9, +9, -3, +3).
+- **Pulse guiding**: Software-timed variable-rate slew (SynScan has no hardware pulse guide command). A variable-rate slew is the motor's own speed and replaces tracking on the handset, so an RA pulse runs the motor westward at the sidereal rate plus or minus the guide rate and, while tracking, ends with the tracking command, which resumes sidereal without a stop; a Dec pulse moves at the guide rate and stops. The westward direction code follows the site's hemisphere (measured south of the equator on the EQM-35 Pro; taken from INDI's SynScan driver for the north).
+- **AZ-EQ mounts (model IDs 5/6, not hardware-validated)**: with the device's Alignment Mode setting at `altaz` or `equatorial`, `AlignmentMode`, the tracking mode (1 for Alt-Az; 2 for equatorial in either hemisphere, since 3 is PEC mode in the SynScan protocol) and the park position follow the setting. This is covered by unit tests on the fake mount only; there is no ConformU run on an AZ-EQ mount yet. Unset (`auto`) keeps today's behaviour: `AlignmentMode` and `Tracking=true` throw `DriverException`, because the hand controller does not report the active geometry.
+- **ConformU**: HEQ5 PRO validated with ConformU 4.3.0 — 0 errors, 0 issues (pulse guide tested across N/S/E/W at declinations -9, +9, -3, +3).
+- **Sky-Watcher EQM-35 Pro**: hand controller firmware HC 06.03.00 (its database version, 04.28, is what older notes called firmware), bare mount on Linux arm64 (Raspberry Pi 5, ConformU run on the Pi against localhost). ConformU 4.5.1 (2026-10-13, the #1081 build): 0 errors, 0 issues, 0 timing violations; the RA landing was 0.45" and Dec 0.1" from target. Before #1081 the same handset failed the RA landings by 10-159" (#1030: the once-a-second RA readback sawtooth, and RA moves that ran the motor the wrong way). Site coordinates in the report are rounded to whole degrees.
 
 </details>
 
