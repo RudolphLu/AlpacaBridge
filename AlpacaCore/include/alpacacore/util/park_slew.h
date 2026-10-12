@@ -87,7 +87,21 @@ inline void run_park_slew(OperationContext& ctx, std::unique_lock<std::mutex>& l
             hooks.abandon();
             return;
         }
-        if (hooks.poll_slewing()) {
+        bool still_slewing = false;
+        try {
+            still_slewing = hooks.poll_slewing();
+        } catch (const std::exception& ex) {
+            hooks.fail(std::string("Park slew status polling failed: ") + ex.what());
+            return;
+        } catch (...) {
+            hooks.fail("Park slew status polling failed: unknown exception");
+            return;
+        }
+        if (ctx.stop_reason() != StopReason::None || !hooks.still_parking()) {
+            hooks.abandon();
+            return;
+        }
+        if (still_slewing) {
             saw_slewing = true;
         } else {
             if (!saw_slewing && (clock.now() - start) < start_grace) {
