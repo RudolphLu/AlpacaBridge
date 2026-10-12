@@ -54,11 +54,14 @@ constexpr double kMaxMoveAxisRateDegPerSec = 4.0;
 constexpr double kDefaultGuideRateDegPerSec = 7.5 / 3600.0;
 constexpr double kSiderealDegPerSec = 15.0411 / 3600.0;
 // open-astro#880: a GOTO can land tens of arcseconds off (EQM-35 Pro: 29.4" in RA) and the driver reports the
-// handset's own position afterwards. Refinement re-issues the GOTO until the readback is inside the tolerance,
-// well inside ConformU's +/-10", for at most this many extra passes. A residual still above the tolerance after
-// the last pass is logged and the slew completes: a handset's own GOTO scatter (EQM-35 Pro on HC 06.03.00: about
-// +/-10" in Dec per GOTO, up to 20", open-astro#1027) is not something another pass can remove, and failing the
-// slew there turned a plate-solvable 15" landing into an error.
+// handset's own position afterwards. Refinement re-issues the GOTO until the RA and Dec readbacks are inside this
+// tolerance, well inside ConformU's +/-10", for at most this many extra passes. A residual still above the
+// tolerance after the last pass is logged and the slew completes: a handset's own GOTO scatter (EQM-35 Pro on
+// HC 06.03.00: about +/-10" in Dec per GOTO, up to 20", open-astro#1027) is not something another pass can
+// remove, and failing the slew there turned a plate-solvable 15" landing into an error.
+// open-astro#1030: that handset's precise RA readback also ramps down 15.04" (one second of sidereal motion) and
+// jumps back once a second, so a single RA read can be off by up to one 15.04" step; a pass that has RA inside this
+// tolerance must not move the RA aim (see refine_goto_landing_locked), or the Dec-only passes drag RA along.
 constexpr double kLandingToleranceArcsec = 3.0;
 constexpr int kMaxLandingRefinePasses = 3;
 // A readback this far from the target is not a landing error a fine re-GOTO corrects (a refused or limit-stopped
@@ -2287,11 +2290,13 @@ private:
     };
 
     // After a GOTO completes, read the handset's own position and re-issue the GOTO while RA or Dec is off by
-    // more than kLandingToleranceArcsec, at most kMaxLandingRefinePasses times (open-astro#880). Each pass aims at
-    // the target corrected by the residual just read, so a systematic landing offset is cancelled rather than
-    // repeated. 16-bit handsets (V3) step ~19.8" in RA, so they are not refined. `lock` is held on entry and on
-    // return. Returns false when the slew was superseded, aborted or cancelled; throws when a pass fails. A
-    // residual left after the last pass is logged as a WARN, not thrown (open-astro#1027).
+    // more than kLandingToleranceArcsec on either axis, at most kMaxLandingRefinePasses times (open-astro#880).
+    // Each pass aims at the target corrected by the residual just read, so a systematic landing offset is
+    // cancelled rather than repeated; RA inside the tolerance keeps its aim, so a Dec-driven pass does
+    // not chase the handset's one-second RA readback steps (open-astro#1030). 16-bit handsets (V3) step ~19.8" in RA,
+    // so they are not refined. `lock` is held on entry and on return. Returns false when the slew was superseded,
+    // aborted or cancelled; throws when a pass fails. A residual left after the last pass is logged as a WARN, not
+    // thrown (open-astro#1027).
     bool refine_goto_landing_locked(std::unique_lock<std::mutex>& lock, double ra, double dec,
                                     uint64_t owner_generation, util::OperationContext* ctx) {
         if (!use_precise_commands_) {
@@ -2329,7 +2334,9 @@ private:
                                                std::to_string(kMaxLandingRefinePasses) + " refinement passes");
                 return true;
             }
-            aim_ra = std::fmod(aim_ra + ra_error_hours + 24.0, 24.0);
+            if (ra_error_arcsec > kLandingToleranceArcsec) {
+                aim_ra = std::fmod(aim_ra + ra_error_hours + 24.0, 24.0);
+            }
             aim_dec = std::clamp(aim_dec + dec_error_degrees, -90.0, 90.0);
             equatorial_cache_valid_ = false;
             altaz_cache_valid_ = false;

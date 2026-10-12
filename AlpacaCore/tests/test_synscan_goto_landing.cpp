@@ -62,6 +62,8 @@ struct LandingOffsetHandset {
     // the random per-GOTO Dec scatter a SynScan handset shows on a real mount (#1027).
     std::atomic<bool> dec_scripted{false};
     std::array<std::atomic<int32_t>, 4> dec_offset_script{};
+    // The RA counts each of the first four GOTOs was commanded to (#1030: a Dec-only pass must not move it).
+    std::array<std::atomic<uint32_t>, 4> goto_ra_commanded{};
 
     bool goto_in_progress() const {
         if (goto_count.load() == 0) return false;
@@ -90,6 +92,9 @@ alpacacore::test::FakeMountServer::Responder responder(const std::shared_ptr<Lan
                 const uint32_t ra = static_cast<uint32_t>(std::strtoul(chunk.substr(1, 6).c_str(), nullptr, 16));
                 const uint32_t dec = static_cast<uint32_t>(std::strtoul(chunk.substr(10, 6).c_str(), nullptr, 16));
                 const int ordinal = st->goto_count.fetch_add(1) + 1;
+                if (ordinal <= static_cast<int>(st->goto_ra_commanded.size())) {
+                    st->goto_ra_commanded[static_cast<std::size_t>(ordinal - 1)].store(ra);
+                }
                 const uint32_t offset = st->ra_offset_counts.load() * (st->growing.load() ? ordinal : 1U);
                 st->ra_raw.store((ra + offset) & kCountsMask);
                 int32_t dec_offset = 0;
@@ -198,6 +203,28 @@ TEST_CASE("SynScan GOTO landing - SlewToCoordinates refines a GOTO the handset l
     CHECK(ra_error_arcsec(*driver, kTargetRa) < kConformUToleranceArcsec);
     CHECK(dec_error_arcsec(*driver, kTargetDec) < kConformUToleranceArcsec);
     CHECK(st->goto_count.load() == 2);  // the GOTO plus one refinement
+    driver->set_connected(false);
+}
+
+TEST_CASE("SynScan GOTO landing - a Dec-only refinement pass leaves the RA aim alone (#1030)",
+          "[synscan][telescope][goto-landing]") {
+    auto st = std::make_shared<LandingOffsetHandset>();
+    st->ra_offset_counts.store(20);       // 1.5" RA, inside the 3" tolerance
+    st->dec_offset_script[0].store(124);  // a systematic 9.6" Dec offset, cancelled by the aim correction
+    st->dec_offset_script[1].store(124);
+    st->dec_scripted.store(true);
+    alpacacore::test::FakeMountServer server(responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
+        0, endpoint(server.port()), alpacacore::vendor::synscan::SynScanVersion::V4);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    REQUIRE_NOTHROW(driver->slew_to_coordinates(kTargetRa, kTargetDec));
+
+    CHECK(st->goto_count.load() == 2);
+    // RA was inside its tolerance, so the second GOTO aims at the same RA as the first.
+    CHECK(st->goto_ra_commanded[1].load() == st->goto_ra_commanded[0].load());
+    CHECK(dec_error_arcsec(*driver, kTargetDec) < 3.0);
     driver->set_connected(false);
 }
 
