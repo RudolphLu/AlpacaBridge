@@ -446,6 +446,27 @@ TEST_CASE("SkyWatcher async - a pulse that supersedes another still reports IsPu
     driver->set_connected(false);
 }
 
+// open-astro#994: the pulse's ownership deadline was stamped and compared on the
+// host steady clock while the hold waits on the task clock. Under a fake clock
+// the pulse must stay live until virtual time passes its end.
+TEST_CASE("SkyWatcher async - IsPulseGuiding follows the task clock, not the host clock (#994)",
+          "[skywatcher][async][pulseguide]") {
+    FakeTaskClock clock;
+    FakeSkyWatcherMount mount(FakeMountProfile::wave_100i(), clock);
+    REQUIRE(mount.ok());
+    auto driver = connected_driver(mount, clock);
+    driver->set_tracking(true);
+    mount.jump_axis_degrees(2, 45.0);
+
+    driver->pulse_guide(0, 500);                      // North
+    REQUIRE(clock.wait_for_waiters(1, kRendezvous));  // its hold is parked on the clock
+    CHECK(driver->get_is_pulse_guiding());
+    // Past the commanded duration plus the 1 s completion delay, in virtual time.
+    REQUIRE(run_clock_until(clock, [&] { return !driver->get_is_pulse_guiding(); }, std::chrono::milliseconds(3000)));
+    CHECK_FALSE(driver->get_is_pulse_guiding());
+    driver->set_connected(false);
+}
+
 // open-astro#559 (review): once IsPulseGuiding reads false the pulse must also
 // have released its axis. A client that waits for the property and then
 // writes DeclinationRate is following the ASCOM contract; if the pulse still
