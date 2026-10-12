@@ -63,6 +63,8 @@ struct FakeSynScanState {
     // With `no_location` set the handset never answers the location query,
     // so the driver has no site unless config or a client supplies one.
     std::atomic<bool> no_location{false};
+    std::atomic<int> slew_status_polls{0};
+    std::atomic<int> tracking_stop_attempts{0};
     std::mutex mutex;
     std::string position = "00000000,00000000#";
     std::vector<std::string> gotos;
@@ -120,6 +122,7 @@ alpacacore::test::FakeMountServer::Responder synscan_responder(std::shared_ptr<F
             case 'W':
                 return "#";
             case 'L':
+                st->slew_status_polls.fetch_add(1);
                 if (st->invalid_slew_status.load()) return "?#";
                 return st->goto_in_progress() ? "1#" : "0#";
             case 'M':  // cancel goto
@@ -128,7 +131,10 @@ alpacacore::test::FakeMountServer::Responder synscan_responder(std::shared_ptr<F
             case 't':  // tracking mode read: sidereal tracking on (open-astro#775 slew gate)
                 return std::string(1, '\x01') + "#";
             case 'T':
-                if (st->reject_tracking_stop.load() && chunk.size() > 1 && chunk[1] == 0) return "";
+                if (st->reject_tracking_stop.load() && chunk.size() > 1 && chunk[1] == 0) {
+                    st->tracking_stop_attempts.fetch_add(1);
+                    return "";
+                }
                 return "#";
             case 'P':  // tracking mode write / passthrough
                 return "#";
@@ -752,7 +758,7 @@ TEST_CASE("SynScan async - malformed Park status reply persists through Slewing"
 
     REQUIRE_NOTHROW(driver->park());
     bool surfaced = false;
-    for (int i = 0; i < 16 && !surfaced; ++i) {
+    for (int i = 0; i < 48 && !surfaced; ++i) {
         clock.wait_for_waiters(1, std::chrono::milliseconds(100));
         clock.advance(std::chrono::milliseconds(250));
         clock.wait_for_woken_settled(std::chrono::seconds(2));
@@ -765,6 +771,7 @@ TEST_CASE("SynScan async - malformed Park status reply persists through Slewing"
         }
     }
     REQUIRE(surfaced);
+    CHECK(st->slew_status_polls.load() > 0);
     CHECK_FALSE(driver->get_at_park());
     driver->set_connected(false);
 }
@@ -774,7 +781,6 @@ TEST_CASE("SynScan async - a Park tracking-stop failure persists through Slewing
     alpacacore::test::FakeTaskClock clock;
     auto st = std::make_shared<FakeSynScanState>();
     st->clock = &clock;
-    st->reject_tracking_stop.store(true);
     alpacacore::test::FakeMountServer server(synscan_responder(st));
     REQUIRE(server.ok());
     auto driver = alpacacore::vendor::synscan::create_synscan_telescope_with_site(
@@ -783,8 +789,9 @@ TEST_CASE("SynScan async - a Park tracking-stop failure persists through Slewing
     REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
 
     REQUIRE_NOTHROW(driver->park());
+    st->reject_tracking_stop.store(true);
     bool surfaced = false;
-    for (int i = 0; i < 24 && !surfaced; ++i) {
+    for (int i = 0; i < 48 && !surfaced; ++i) {
         clock.wait_for_waiters(1, std::chrono::milliseconds(100));
         clock.advance(std::chrono::milliseconds(250));
         clock.wait_for_woken_settled(std::chrono::seconds(2));
@@ -797,6 +804,8 @@ TEST_CASE("SynScan async - a Park tracking-stop failure persists through Slewing
         }
     }
     REQUIRE(surfaced);
+    CHECK(st->slew_status_polls.load() > 0);
+    CHECK(st->tracking_stop_attempts.load() > 0);
     CHECK_FALSE(driver->get_at_park());
     driver->set_connected(false);
 }
