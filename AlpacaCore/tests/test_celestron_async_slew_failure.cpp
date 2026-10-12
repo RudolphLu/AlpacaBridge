@@ -65,6 +65,7 @@ struct FakeCelestronState {
     alpacacore::util::TaskClock::clock::time_point now() const { return clock->now(); }
     std::atomic<bool> reject_goto{false};  // true: swallow the GOTO -> the wrapper times out and throws
     std::atomic<bool> goto_cancelled{false};  // set by the cancel-goto command, cleared by the next GOTO
+    std::atomic<bool> hold_slew{false};
     std::atomic<bool> shifted_position{false};
     std::atomic<bool> mute{false};
     std::atomic<unsigned char> model_id{24};  // CGX-L
@@ -95,6 +96,7 @@ struct FakeCelestronState {
     static constexpr auto kGotoDuration = std::chrono::milliseconds(1500);
     bool goto_in_progress() const {
         if (goto_count.load() == 0 || goto_cancelled.load()) return false;
+        if (hold_slew.load()) return true;
         const auto started = Clock::time_point(Clock::duration(goto_started.load()));
         return now() - started < kGotoDuration;
     }
@@ -249,6 +251,66 @@ TEST_CASE("Celestron async - a GOTO the hand controller never acknowledges surfa
     CHECK(read_slewing(*driver) == SlewingRead::True);
     REQUIRE(wait_until([&] { return st->goto_count.load() > 0; }, 5000));
     REQUIRE(wait_until([&] { return read_slewing(*driver) == SlewingRead::False; }, 15000));
+    driver->set_connected(false);
+}
+
+TEST_CASE("Celestron async - HC completion-poll failure persists through Slewing",
+          "[celestron][telescope][async][slewfailure]") {
+    auto st = std::make_shared<FakeCelestronState>();
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0));
+    REQUIRE(wait_until([&] { return st->goto_count.load() > 0; }, 5000));
+    st->mute.store(true);  // The hand controller stops answering its "L" status query.
+
+    std::string message;
+    REQUIRE(wait_until([&] { return read_slewing(*driver, &message) == SlewingRead::Threw; }, 10000));
+    CHECK(message.find("Slew completion polling failed") != std::string::npos);
+    CHECK(read_slewing(*driver) == SlewingRead::Threw);
+    driver->set_connected(false);
+}
+
+TEST_CASE("Celestron async - motor-controller completion-poll failure persists through Slewing",
+          "[celestron][telescope][async][slewfailure]") {
+    auto st = std::make_shared<FakeCelestronState>();
+    st->firmware_major.store(0);
+    st->firmware_minor.store(0);  // no usable HC: use MC_GOTO_FAST and MC_SLEW_DONE
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0));
+    REQUIRE(wait_until([&] { return st->goto_count.load() > 0; }, 5000));
+    st->mute.store(true);  // The motor controllers stop answering MC_SLEW_DONE.
+
+    std::string message;
+    REQUIRE(wait_until([&] { return read_slewing(*driver, &message) == SlewingRead::Threw; }, 10000));
+    CHECK(message.find("Slew completion polling failed") != std::string::npos);
+    CHECK(read_slewing(*driver) == SlewingRead::Threw);
+    driver->set_connected(false);
+}
+
+TEST_CASE("Celestron async - slew timeout is a persistent failure", "[celestron][telescope][async][slewfailure]") {
+    alpacacore::test::FakeTaskClock clock;
+    auto st = std::make_shared<FakeCelestronState>();
+    st->clock = &clock;
+    st->hold_slew.store(true);
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = make_driver(server.port(), clock);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0));
+    REQUIRE(wait_until([&] { return st->goto_count.load() > 0; }, 5000));
+    std::string message;
+    REQUIRE(advance_until(
+        clock, [&] { return read_slewing(*driver, &message) == SlewingRead::Threw; }, std::chrono::seconds(1), 125));
+    CHECK(message.find("timed out after 120s") != std::string::npos);
+    CHECK(read_slewing(*driver) == SlewingRead::Threw);
     driver->set_connected(false);
 }
 
