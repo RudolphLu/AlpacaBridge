@@ -58,6 +58,8 @@ struct FakeSynScanState {
     std::atomic<bool> hold_goto{false};
     std::atomic<bool> goto_held{false};
     std::atomic<unsigned char> model_id{50};
+    std::atomic<bool> invalid_slew_status{false};
+    std::atomic<bool> reject_tracking_stop{false};
     // With `no_location` set the handset never answers the location query,
     // so the driver has no site unless config or a client supplies one.
     std::atomic<bool> no_location{false};
@@ -118,6 +120,7 @@ alpacacore::test::FakeMountServer::Responder synscan_responder(std::shared_ptr<F
             case 'W':
                 return "#";
             case 'L':
+                if (st->invalid_slew_status.load()) return "?#";
                 return st->goto_in_progress() ? "1#" : "0#";
             case 'M':  // cancel goto
                 st->goto_seen.store(false);
@@ -125,6 +128,8 @@ alpacacore::test::FakeMountServer::Responder synscan_responder(std::shared_ptr<F
             case 't':  // tracking mode read: sidereal tracking on (open-astro#775 slew gate)
                 return std::string(1, '\x01') + "#";
             case 'T':
+                if (st->reject_tracking_stop.load() && chunk.size() > 1 && chunk[1] == 0) return "";
+                return "#";
             case 'P':  // tracking mode write / passthrough
                 return "#";
             case 'm':  // model id: chr(model) + "#"; 50 = EQM-35 Pro
@@ -666,7 +671,13 @@ TEST_CASE("SynScan async - Unpark reports stops it could not send", "[synscan][t
         CHECK(std::string(ex.what()).rfind("Unpark could not stop the park slew: ", 0) == 0);
     }
     CHECK_FALSE(driver->get_at_park());
-    CHECK(driver->get_slewing());  // the hardware poll fails too, so the cached state stands
+    try {
+        static_cast<void>(driver->get_slewing());
+        FAIL("Slewing must surface the failed Unpark stop");
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+        CHECK(std::string(ex.what()).find("Unpark could not stop") != std::string::npos);
+    }
 
     driver->set_connected(false);
 }
@@ -715,8 +726,78 @@ TEST_CASE("SynScan async - a failed park logs the stops it could not send", "[sy
     REQUIRE(wait_until([&] { return stop_errors.load() > 0; }, 10000));
     CHECK(stop_errors.load() == 1);
     CHECK_FALSE(driver->get_at_park());
-    CHECK(driver->get_slewing());
+    try {
+        static_cast<void>(driver->get_slewing());
+        FAIL("Slewing must surface the failed Park");
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+        CHECK(std::string(ex.what()).find("stopping after failure failed") != std::string::npos);
+    }
 
+    driver->set_connected(false);
+}
+
+TEST_CASE("SynScan async - malformed Park status reply persists through Slewing",
+          "[synscan][telescope][async][parkfailure]") {
+    alpacacore::test::FakeTaskClock clock;
+    auto st = std::make_shared<FakeSynScanState>();
+    st->clock = &clock;
+    st->invalid_slew_status.store(true);
+    alpacacore::test::FakeMountServer server(synscan_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::synscan::create_synscan_telescope_with_site(
+        0, endpoint(server.port()), alpacacore::vendor::synscan::SynScanVersion::V4, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, alpacacore::vendor::synscan::SynScanAlignmentSetting::Auto, clock);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    REQUIRE_NOTHROW(driver->park());
+    bool surfaced = false;
+    for (int i = 0; i < 16 && !surfaced; ++i) {
+        clock.wait_for_waiters(1, std::chrono::milliseconds(100));
+        clock.advance(std::chrono::milliseconds(250));
+        clock.wait_for_woken_settled(std::chrono::seconds(2));
+        try {
+            (void)driver->get_slewing();
+        } catch (const alpacacore::AlpacaException& ex) {
+            CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+            CHECK(std::string(ex.what()).find("Invalid response to SynScan slew-status query") != std::string::npos);
+            surfaced = true;
+        }
+    }
+    REQUIRE(surfaced);
+    CHECK_FALSE(driver->get_at_park());
+    driver->set_connected(false);
+}
+
+TEST_CASE("SynScan async - a Park tracking-stop failure persists through Slewing",
+          "[synscan][telescope][async][parkfailure]") {
+    alpacacore::test::FakeTaskClock clock;
+    auto st = std::make_shared<FakeSynScanState>();
+    st->clock = &clock;
+    st->reject_tracking_stop.store(true);
+    alpacacore::test::FakeMountServer server(synscan_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::synscan::create_synscan_telescope_with_site(
+        0, endpoint(server.port()), alpacacore::vendor::synscan::SynScanVersion::V4, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, alpacacore::vendor::synscan::SynScanAlignmentSetting::Auto, clock);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    REQUIRE_NOTHROW(driver->park());
+    bool surfaced = false;
+    for (int i = 0; i < 24 && !surfaced; ++i) {
+        clock.wait_for_waiters(1, std::chrono::milliseconds(100));
+        clock.advance(std::chrono::milliseconds(250));
+        clock.wait_for_woken_settled(std::chrono::seconds(2));
+        try {
+            (void)driver->get_slewing();
+        } catch (const alpacacore::AlpacaException& ex) {
+            CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+            CHECK(std::string(ex.what()).find("stopping tracking failed") != std::string::npos);
+            surfaced = true;
+        }
+    }
+    REQUIRE(surfaced);
+    CHECK_FALSE(driver->get_at_park());
     driver->set_connected(false);
 }
 
