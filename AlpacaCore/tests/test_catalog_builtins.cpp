@@ -466,13 +466,44 @@ void check_index_field(const FieldRef& f, std::string_view key) {
     CHECK(f.kind == FieldRef::Kind::Int);
     CHECK(f.role == Role::EnumerationIndex);
     CHECK_FALSE(f.required);
-    CHECK_FALSE(f.min.has_value());
-    CHECK_FALSE(f.max.has_value());
+    REQUIRE(f.min.has_value());
+    CHECK(*f.min == 0.0);
+    REQUIRE(f.max.has_value());
+    CHECK(*f.max == static_cast<double>(std::numeric_limits<int>::max()));
     REQUIRE(std::holds_alternative<std::int64_t>(f.default_value));
     CHECK(std::get<std::int64_t>(f.default_value) == 0);
 }
 
 }  // namespace
+
+TEST_CASE("Builtin catalog - Player One index range refuses values the int cast would wrap",
+          "[catalog][playerone][unit]") {
+    DeviceCatalog catalog;
+    register_builtin_schemas(catalog);
+    const std::pair<DeviceKey, const char*> targets[]{{kPlayerOneCameraKey, "cameraIndex"},
+                                                      {kPlayerOneSwitchKey, "cameraIndex"},
+                                                      {kPlayerOneWheelKey, "filterwheelIndex"}};
+    for (const auto& [key, field] : targets) {
+        for (const std::int64_t bad : {std::int64_t{1} << 31, std::int64_t{-1}}) {
+            INFO(std::string(field) + " = " + std::to_string(bad));
+            DeviceConfig config;
+            config.set(field, bad);
+            const auto result = catalog.normalize(key, config, Source::Api);
+            REQUIRE(result.rejection.has_value());
+            CHECK(result.rejection->find(field) != std::string::npos);
+            // A saved out-of-range value is dropped (the default, index 0, applies), never refused.
+            const auto persisted = catalog.normalize(key, config, Source::Persisted);
+            CHECK_FALSE(persisted.rejection.has_value());
+            CHECK_FALSE(persisted.config.has(field));
+            CHECK_FALSE(persisted.warnings.empty());
+        }
+        for (const std::int64_t good : {std::int64_t{0}, std::int64_t{std::numeric_limits<int>::max()}}) {
+            DeviceConfig config;
+            config.set(field, good);
+            CHECK_FALSE(catalog.normalize(key, config, Source::Api).rejection.has_value());
+        }
+    }
+}
 
 TEST_CASE("Builtin catalog - register_builtin_schemas describes the Player One devices in every build",
           "[catalog][playerone][unit]") {
