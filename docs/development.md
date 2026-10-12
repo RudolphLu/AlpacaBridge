@@ -360,6 +360,8 @@ When you add, remove or bump a directory under `AlpacaCore/external/`, edit `scr
 
 `python3 scripts/dependency_snapshot.py --spdx <file.deb>` writes the same inventory as an SPDX 2.3 SBOM rooted at that built package, with its SHA-256: runtime dependencies come from the package's own `Depends` field (so `${shlibs:Depends}` is resolved there), the vendored SDKs and FetchContent libraries are `CONTAINS`, and Build-Depends are `BUILD_DEPENDENCY_OF`. `release.yml` (beta) and `nightly-build.yml` attest that SBOM against the `.deb` they publish, next to its build provenance.
 
+Each `sdks` entry also carries a `sha256` pin: a digest of the git-tracked files under its `path`. After you change an SDK's files, check its `version` and run `python3 scripts/dependency_snapshot.py --pin`; `--check` fails until the pins match. `--spdx` unpacks the `.deb` and requires every file under `/usr/lib/alpacabridge/` and `/usr/lib/firmware/` to be byte-identical to a vendored file of a listed SDK (the package skips `dh_strip` and `dh_dwz` for `/usr/lib/alpacabridge/` for this reason); it lists each one in the SBOM with its SHA-1 and SHA-256 under its SDK, and stops with an error naming any file that matches none. Build-Depends carry the exact version `dpkg-query` reports in the build environment.
+
 ## Packaging
 
 The Debian package is built from the `debian/` directory. It installs:

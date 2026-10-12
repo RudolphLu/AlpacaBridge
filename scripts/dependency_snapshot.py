@@ -9,6 +9,7 @@ AlpacaCore/external/ (versions from scripts/dependency_sdk_versions.json).
   dependency_snapshot.py [--sha S] [--ref R] [--output FILE]   write the snapshot
   dependency_snapshot.py --check                               drift check
   dependency_snapshot.py --spdx DEB [--output FILE]            SPDX SBOM for a built .deb
+  dependency_snapshot.py --pin                                 rewrite the SDK sha256 pins
   dependency_snapshot.py --self-test
 
 Rules: Build-Depends become scope "development", Depends become "runtime".
@@ -37,6 +38,8 @@ ROOT = Path(__file__).resolve().parent.parent
 TABLE = "scripts/dependency_sdk_versions.json"
 EXTERNAL = "AlpacaCore/external"
 DEB_QUALIFIERS = "arch=arm64&distro=trixie"
+# Package directories holding vendor binaries and firmware copied from AlpacaCore/external/.
+SHIPPED_VENDOR_DIRS = ("usr/lib/alpacabridge", "usr/lib/firmware")
 SKIP = {"debhelper-compat"}
 DETECTOR = {"name": "alpacabridge-dependency-snapshot", "version": "1",
             "url": "https://github.com/open-astro/AlpacaBridge/blob/main/scripts/dependency_snapshot.py"}
@@ -117,14 +120,60 @@ def build_snapshot(root: Path, sha: str, ref: str, job_id: str, scanned: str) ->
             "manifests": manifests}
 
 
+def file_digests(data: bytes) -> dict[str, str]:
+    return {"sha1": hashlib.sha1(data).hexdigest(), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def tree_digest(root: Path, rel: str) -> str:
+    """SHA-256 over the git-tracked files under rel: path, then file bytes (or symlink target)."""
+    out = subprocess.run(["git", "-C", str(root), "ls-files", "-s", "-z", "--", rel],
+                         check=True, capture_output=True, text=True).stdout
+    h = hashlib.sha256()
+    for entry in sorted(e for e in out.split("\0") if e):
+        meta, path = entry.split("\t", 1)
+        p = root / path
+        if meta.split()[0] == "120000":
+            data = b"L" + os.readlink(p).encode()
+        else:
+            data = b"F" + hashlib.sha256(p.read_bytes()).digest()
+        h.update(path.encode() + b"\0" + data + b"\n")
+    return h.hexdigest()
+
+
+def pin_sdk_hashes(root: Path) -> None:
+    """Rewrite every 'sdks' entry's sha256 pin, keeping the table's one-entry-per-line layout."""
+    table = json.loads((root / TABLE).read_text(encoding="utf-8"))
+    for e in table["sdks"]:
+        e["sha256"] = tree_digest(root, e["path"])
+    lines = ["{"]
+    if "_comment" in table:
+        lines.append(f'  "_comment": {json.dumps(table["_comment"])},')
+    lines.append('  "sdks": [')
+    lines.append(",\n".join(f"    {json.dumps(e)}" for e in table["sdks"]))
+    lines.append("  ],")
+    lines.append('  "doc_only": [')
+    lines.append(",\n".join(f"    {json.dumps(p)}" for p in table["doc_only"]))
+    lines.append("  ]")
+    lines.append("}")
+    (root / TABLE).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def build_spdx(root: Path, deb: dict[str, str], file_name: str, sha256: str,
-               created: str, namespace: str) -> dict:
+               created: str, namespace: str, payload: dict[str, dict[str, str]] | None = None,
+               installed: dict[str, str] | None = None) -> dict:
     """SPDX 2.3 SBOM for one built .deb: the same inventory as the snapshot, rooted at the package.
 
     deb: the package's control fields (dpkg-deb -f). Runtime dependencies come from its
     Depends, where ${shlibs:Depends} is already resolved; vendored SDKs and FetchContent
-    libraries are CONTAINS; Build-Depends are BUILD_DEPENDENCY_OF.
+    libraries are CONTAINS; Build-Depends are BUILD_DEPENDENCY_OF, at the version in
+    installed (dpkg-query in the build environment) when one is given.
+
+    payload: {path inside the .deb: file_digests()} for the shipped vendor files. Each must be
+    byte-identical to a file under a listed SDK's path, and is reported as a file CONTAINS-ed by
+    that SDK; one that matches none raises ValueError.
     """
+    payload = payload or {}
+    installed = installed or {}
     packages: list[dict] = []
     ids: dict[str, str] = {}
 
@@ -149,11 +198,35 @@ def build_spdx(root: Path, deb: dict[str, str], file_name: str, sha256: str,
         rels.append((root_id, "DEPENDS_ON", add(deb_purl(n, v), n, v)))
     for repo, tag in parse_fetchcontent((root / "AlpacaHTTP/CMakeLists.txt").read_text(encoding="utf-8")):
         rels.append((root_id, "CONTAINS", add(f"pkg:github/{repo}@{tag}", repo, tag)))
+    vendored: dict[str, str] = {}
     for e in json.loads((root / TABLE).read_text(encoding="utf-8"))["sdks"]:
         ver = e.get("version")
-        rels.append((root_id, "CONTAINS", add(f"pkg:generic/{e['name']}{'@' + ver if ver else ''}", e["name"], ver)))
+        sdk_id = add(f"pkg:generic/{e['name']}{'@' + ver if ver else ''}", e["name"], ver)
+        rels.append((root_id, "CONTAINS", sdk_id))
+        for dirpath, _, names in os.walk(root / e["path"]):
+            for n in names:
+                p = Path(dirpath) / n
+                if p.is_file() and not p.is_symlink():
+                    vendored.setdefault(hashlib.sha256(p.read_bytes()).hexdigest(), sdk_id)
+    files = []
+    unmatched = []
+    for path in sorted(payload):
+        d = payload[path]
+        sdk_id = vendored.get(d["sha256"])
+        if sdk_id is None:
+            unmatched.append(path)
+            continue
+        file_id = f"SPDXRef-File-{len(files)}"
+        files.append({"fileName": f"./{path}", "SPDXID": file_id,
+                      "checksums": [{"algorithm": "SHA1", "checksumValue": d["sha1"]},
+                                    {"algorithm": "SHA256", "checksumValue": d["sha256"]}]})
+        rels.append((sdk_id, "CONTAINS", file_id))
+    if unmatched:
+        raise ValueError("shipped vendor files match no file under a 'sdks' path in "
+                         f"{TABLE} (changed in packaging, or not vendored): " + ", ".join(unmatched))
     control = parse_control((root / "debian/control").read_text(encoding="utf-8"))
     for n, v in control["development"]:
+        v = installed.get(n, v)
         rels.append((add(deb_purl(n, v), n, v), "BUILD_DEPENDENCY_OF", root_id))
     rels = list(dict.fromkeys(rels))
     return {"spdxVersion": "SPDX-2.3", "dataLicense": "CC0-1.0", "SPDXID": "SPDXRef-DOCUMENT",
@@ -161,6 +234,7 @@ def build_spdx(root: Path, deb: dict[str, str], file_name: str, sha256: str,
             "creationInfo": {"created": created,
                              "creators": [f"Tool: {DETECTOR['name']}-{DETECTOR['version']}"]},
             "packages": packages,
+            "files": files,
             "relationships": [{"spdxElementId": a, "relationshipType": t, "relatedSpdxElement": b}
                               for a, t, b in rels]}
 
@@ -174,6 +248,14 @@ def check_drift(root: Path) -> list[str]:
     for p in listed:
         if not (root / p).is_dir():
             errors.append(f"{TABLE}: stale entry {p} (directory gone): remove it from 'sdks' or 'doc_only'")
+    for e in table["sdks"]:
+        if not (root / e["path"]).is_dir():
+            continue
+        if not e.get("sha256"):
+            errors.append(f"{TABLE}: {e['path']} has no sha256 pin: run python3 scripts/dependency_snapshot.py --pin")
+        elif e["sha256"] != tree_digest(root, e["path"]):
+            errors.append(f"{TABLE}: the vendored files under {e['path']} changed since their sha256 pin: "
+                          "check 'version' and 'source', then run python3 scripts/dependency_snapshot.py --pin")
 
     def walk(rel: str) -> None:
         for child in sorted((root / rel).iterdir()):
@@ -223,7 +305,7 @@ def self_test() -> int:
             {"path": f"{EXTERNAL}/A/sdk-1", "name": "a-sdk", "version": "1"},
             {"path": f"{EXTERNAL}/Q/deep", "name": "q-sdk", "version": None}],
             "doc_only": [f"{EXTERNAL}/B"]}))
-        assert check_drift(r) == [], check_drift(r)
+        assert [e for e in check_drift(r) if "no sha256 pin" not in e] == [], check_drift(r)
         snap = build_snapshot(r, "a" * 40, "refs/heads/main", "1", "2026-01-01T00:00:00Z")
         for k in ("version", "job", "sha", "ref", "detector", "scanned", "manifests"):
             assert k in snap, k
@@ -264,6 +346,59 @@ def self_test() -> int:
         assert len(rels) == len(doc["relationships"]), "no duplicate relationships"
         for p in doc["packages"]:
             assert {"name", "SPDXID", "downloadLocation", "filesAnalyzed"} <= set(p), p
+        # --- Vendored file pins and the shipped-file gate ---
+        lib, fw = b"A-lib-bytes", b"Q-firmware"
+        (r / EXTERNAL / "A/sdk-1/lib").mkdir()
+        (r / EXTERNAL / "A/sdk-1/lib/liba.so.1.0").write_bytes(lib)
+        (r / EXTERNAL / "A/sdk-1/lib/liba.so").symlink_to("liba.so.1.0")
+        (r / EXTERNAL / "Q/deep/qhy.hex").write_bytes(fw)
+        subprocess.run(["git", "-C", d, "init", "-q"], check=True)
+        subprocess.run(["git", "-C", d, "add", "-A"], check=True)
+        errs = check_drift(r)
+        assert len(errs) == 2 and all("no sha256 pin" in e for e in errs), errs
+        pin_sdk_hashes(r)
+        assert check_drift(r) == [], check_drift(r)
+        pinned = json.loads((r / TABLE).read_text())["sdks"][0]["sha256"]
+        assert re.fullmatch(r"[0-9a-f]{64}", pinned) and pinned == tree_digest(r, f"{EXTERNAL}/A/sdk-1")
+        (r / EXTERNAL / "A/sdk-1/lib/liba.so.1.0").write_bytes(b"swapped")
+        errs = check_drift(r)
+        assert len(errs) == 1 and f"{EXTERNAL}/A/sdk-1" in errs[0] and "--pin" in errs[0], errs
+        (r / EXTERNAL / "A/sdk-1/lib/liba.so.1.0").write_bytes(lib)
+        assert check_drift(r) == [], "restoring the bytes restores the pin"
+        (r / EXTERNAL / "A/sdk-1/lib/liba.so").unlink()
+        (r / EXTERNAL / "A/sdk-1/lib/liba.so").symlink_to("other")
+        assert len(check_drift(r)) == 1, "a retargeted symlink changes the digest"
+        (r / EXTERNAL / "A/sdk-1/lib/liba.so").unlink()
+        (r / EXTERNAL / "A/sdk-1/lib/liba.so").symlink_to("liba.so.1.0")
+        payload = {"usr/lib/alpacabridge/liba.so.1.0": file_digests(lib),
+                   "usr/lib/firmware/qhy/qhy.hex": file_digests(fw)}
+        installed = {"cmake": "3.31.6-2", "libfoo": "1.2-3", "libc6": "2.41-12"}
+        doc = build_spdx(r, deb, "x.deb", "f" * 64, "2026-01-01T00:00:00Z", "https://example.test/sbom",
+                         payload=payload, installed=installed)
+        purl = {p["externalRefs"][0]["referenceLocator"]: p["SPDXID"] for p in doc["packages"]}
+        pkgs = {p["SPDXID"]: p for p in doc["packages"]}
+        files = {f["fileName"]: f for f in doc["files"]}
+        assert set(files) == {"./usr/lib/alpacabridge/liba.so.1.0", "./usr/lib/firmware/qhy/qhy.hex"}, files
+        f_lib = files["./usr/lib/alpacabridge/liba.so.1.0"]
+        assert {"algorithm": "SHA256", "checksumValue": hashlib.sha256(lib).hexdigest()} in f_lib["checksums"]
+        assert {"algorithm": "SHA1", "checksumValue": hashlib.sha1(lib).hexdigest()} in f_lib["checksums"]
+        rels = {(x["spdxElementId"], x["relationshipType"], x["relatedSpdxElement"]) for x in doc["relationships"]}
+        assert (purl["pkg:generic/a-sdk@1"], "CONTAINS", f_lib["SPDXID"]) in rels
+        assert (purl["pkg:generic/q-sdk"], "CONTAINS", files["./usr/lib/firmware/qhy/qhy.hex"]["SPDXID"]) in rels
+        # Build-Depends carry the version installed in the build environment.
+        cmake = pkgs[purl[deb_purl("cmake", "3.31.6-2")]]
+        assert cmake["versionInfo"] == "3.31.6-2"
+        assert (purl[deb_purl("cmake", "3.31.6-2")], "BUILD_DEPENDENCY_OF", purl[
+            "pkg:deb/debian/alpacabridge@5.0.0~beta2?arch=arm64&distro=trixie"]) in rels
+        assert deb_purl("g++", None) in purl, "a build dep not installed keeps no version"
+        # A shipped vendor file that matches no vendored file fails the SBOM.
+        try:
+            build_spdx(r, deb, "x.deb", "f" * 64, "t", "n",
+                       payload={"usr/lib/alpacabridge/libevil.so": file_digests(b"evil")}, installed={})
+        except ValueError as e:
+            assert "usr/lib/alpacabridge/libevil.so" in str(e), e
+        else:
+            raise AssertionError("an unmatched shipped file must fail")
         (r / EXTERNAL / "New").mkdir()
         errs = check_drift(r)
         assert len(errs) == 1 and f"{EXTERNAL}/New is not in {TABLE}" in errs[0], errs
@@ -287,9 +422,14 @@ def main() -> int:
     ap.add_argument("--ref")
     ap.add_argument("--output")
     ap.add_argument("--spdx", metavar="DEB")
+    ap.add_argument("--pin", action="store_true")
     a = ap.parse_args()
     if a.self_test:
         return self_test()
+    if a.pin:
+        pin_sdk_hashes(ROOT)
+        print(f"{TABLE}: sha256 pins rewritten")
+        return 0
     if a.spdx:
         deb_path = Path(a.spdx)
         fields = ("Package", "Version", "Architecture", "Depends")
@@ -297,10 +437,27 @@ def main() -> int:
                              check=True, capture_output=True, text=True).stdout
         deb = {k: v.strip() for k, _, v in (line.partition(":") for line in out.splitlines()) if k in fields}
         sha256 = hashlib.sha256(deb_path.read_bytes()).hexdigest()
+        payload = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["dpkg-deb", "-x", str(deb_path), tmp], check=True)
+            for top in SHIPPED_VENDOR_DIRS:
+                for dirpath, _, names in os.walk(Path(tmp) / top):
+                    for n in names:
+                        p = Path(dirpath) / n
+                        if p.is_file() and not p.is_symlink():
+                            payload[p.relative_to(tmp).as_posix()] = file_digests(p.read_bytes())
+        query = subprocess.run(["dpkg-query", "-W", "-f=${Package}\\t${Version}\\n"],
+                               check=True, capture_output=True, text=True).stdout
+        installed = dict(line.split("\t", 1) for line in query.splitlines() if "\t" in line)
         repo = os.environ.get("GITHUB_REPOSITORY", "open-astro/AlpacaBridge")
         created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        doc = build_spdx(ROOT, deb, deb_path.name, sha256, created,
-                         f"https://github.com/{repo}/sbom/{deb_path.name}-{sha256}")
+        try:
+            doc = build_spdx(ROOT, deb, deb_path.name, sha256, created,
+                             f"https://github.com/{repo}/sbom/{deb_path.name}-{sha256}",
+                             payload=payload, installed=installed)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 1
         text = json.dumps(doc, indent=2) + "\n"
         if a.output:
             Path(a.output).write_text(text, encoding="utf-8")
