@@ -691,6 +691,24 @@ TEST_CASE("QHY Camera Driver - a failed exposure is raised by ImageReady and Ima
     driver->set_connected(false);
 }
 
+TEST_CASE("QHY Camera Driver - AbortExposure clears a failure from a completed exposure", "[qhy][camera][unit]") {
+    auto fake = make_fake();
+    fake.frame_ok = false;
+    LockedQHYSDK sdk(fake);
+    auto driver = alpacacore::vendor::qhy::create_qhy_camera(0, "fake-qhy-0", sdk);
+    driver->set_connected(true);
+    driver->start_exposure(0.1, true);
+    REQUIRE(eventually([&] { return error_code_of([&] { (void)driver->get_image_ready(); }) != 0; }));
+
+    driver->abort_exposure();
+    bool ready = true;
+    CHECK_NOTHROW(ready = driver->get_image_ready());
+    CHECK_FALSE(ready);
+    CHECK_NOTHROW(driver->get_camera_state());
+    CHECK(driver->get_camera_state() == alpacacore::CameraState::Idle);
+    driver->set_connected(false);
+}
+
 TEST_CASE("QHY Camera Driver - malformed SDK frame never publishes ImageReady and recovers", "[qhy][camera][unit]") {
     auto fake = make_fake();
     fake.frame_width = 0;

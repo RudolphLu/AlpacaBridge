@@ -1833,11 +1833,20 @@ public:
 
 private:
     // Ends a running exposure and discards it. Returns at once when the
-    // exposure already finished, so a completed frame survives an abort.
+    // exposure already finished, so a completed frame survives an abort;
+    // a completed failure is cleared instead.
     void cancel_running_exposure() {
         ensure_connected();
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (exposure_status_ == QHYExposureStatus::Failed) {
+                // A failure from an already completed exposure is discarded.
+                exposure_status_ = QHYExposureStatus::Idle;
+                exposure_failure_.clear();
+                image_ready_ = false;
+                last_exposure_valid_ = false;
+                return;
+            }
             if (exposure_status_ != QHYExposureStatus::Working) {
                 return;
             }
