@@ -265,13 +265,10 @@ jobs:
           ls -l dist
 
       - name: Generate the SBOM
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c  # v0.24.3 pinned (immutable ref)
-        with:
-          file: dist/alpacabridge_${{ needs.release.outputs.notes_name }}_arm64.deb
-          format: spdx-json
-          output-file: dist/sbom.spdx.json
-          upload-artifact: false
-          upload-release-assets: false
+        # The repository's own inventory (scripts/dependency_snapshot.py), not a
+        # scanner: the vendored SDK .so files in the package carry no metadata a
+        # scanner could identify.
+        run: python3 scripts/dependency_snapshot.py --spdx "dist/alpacabridge_${NOTES_NAME}_arm64.deb" --output dist/sbom.spdx.json
 
       # Attestations are public records, so a dry run stops before them.
       - name: Attest build provenance

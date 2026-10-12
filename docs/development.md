@@ -358,6 +358,8 @@ GitHub's dependency graph parses only the workflow action pins. `.github/workflo
 
 When you add, remove or bump a directory under `AlpacaCore/external/`, edit `scripts/dependency_sdk_versions.json`: an SDK or library goes in `sdks` (path, name, version, where the version came from), a directory of documents or udev rules only goes in `doc_only`. The `docs-drift` CI job runs `python3 scripts/dependency_snapshot.py --check` and names the path to add or remove. Run `python3 scripts/dependency_snapshot.py` to print the snapshot; the VM never submits it.
 
+`python3 scripts/dependency_snapshot.py --spdx <file.deb>` writes the same inventory as an SPDX 2.3 SBOM rooted at that built package, with its SHA-256: runtime dependencies come from the package's own `Depends` field (so `${shlibs:Depends}` is resolved there), the vendored SDKs and FetchContent libraries are `CONTAINS`, and Build-Depends are `BUILD_DEPENDENCY_OF`. `release.yml` (beta) and `nightly-build.yml` attest that SBOM against the `.deb` they publish, next to its build provenance.
+
 ## Packaging
 
 The Debian package is built from the `debian/` directory. It installs:
