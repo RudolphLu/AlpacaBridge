@@ -195,7 +195,8 @@ TEST_CASE("SkyWatcher async - Park dispatch failure persists through Slewing and
     FakeSkyWatcherMount mount(alpacacore::test::FakeMountProfile::wave_100i(), clock);
     REQUIRE(mount.ok());
     auto driver = connected_driver(mount, clock);
-    mount.reject_start_motion(1, 1);
+    // RA starts, then DEC dispatch fails: cleanup must stop both axes.
+    mount.reject_start_motion(2, 1);
 
     REQUIRE_NOTHROW(driver->park());
     std::string message;
@@ -205,6 +206,10 @@ TEST_CASE("SkyWatcher async - Park dispatch failure persists through Slewing and
     CHECK(message.find("Park failed") != std::string::npos);
     CHECK(read_slewing(*driver) == SlewingRead::Threw);
     CHECK_FALSE(driver->get_at_park());
+    CHECK(mount.stop_count(1) > 0);
+    CHECK(mount.stop_count(2) > 0);
+    CHECK_FALSE(mount.axis_running(1));
+    CHECK_FALSE(mount.axis_running(2));
     REQUIRE_NOTHROW(driver->abort_slew());
     CHECK(read_slewing(*driver) == SlewingRead::False);
     driver->set_connected(false);
@@ -229,6 +234,7 @@ TEST_CASE("SkyWatcher async - AutoHome failure persists through Slewing and AtHo
     CHECK(message.find("axis 1") != std::string::npos);
     CHECK(read_slewing(*driver) == SlewingRead::Threw);
     CHECK_FALSE(driver->get_at_home());
+    CHECK(mount.stop_count(2) > 0);  // DEC stop is still attempted after the RA stop fails.
     REQUIRE_NOTHROW(driver->abort_slew());
     CHECK(read_slewing(*driver) == SlewingRead::False);
     driver->set_connected(false);
