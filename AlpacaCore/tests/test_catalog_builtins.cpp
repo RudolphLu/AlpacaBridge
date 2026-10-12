@@ -491,6 +491,11 @@ TEST_CASE("Builtin catalog - Player One index range refuses values the int cast 
             const auto result = catalog.normalize(key, config, Source::Api);
             REQUIRE(result.rejection.has_value());
             CHECK(result.rejection->find(field) != std::string::npos);
+            // A saved out-of-range value is dropped (the default, index 0, applies), never refused.
+            const auto persisted = catalog.normalize(key, config, Source::Persisted);
+            CHECK_FALSE(persisted.rejection.has_value());
+            CHECK_FALSE(persisted.config.has(field));
+            CHECK_FALSE(persisted.warnings.empty());
         }
         for (const std::int64_t good : {std::int64_t{0}, std::int64_t{std::numeric_limits<int>::max()}}) {
             DeviceConfig config;
