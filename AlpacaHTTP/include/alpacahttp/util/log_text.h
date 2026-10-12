@@ -66,11 +66,28 @@ inline std::size_t utf8_sequence_length(std::string_view s, std::size_t i) {
     return len;
 }
 
+// True for the well-formed sequence of len bytes at s[i] when it encodes a C1
+// control (U+0080..U+009F; some terminals read U+009B as CSI) or a bidi control
+// (U+202A..U+202E, U+2066..U+2069; they can reorder a displayed log line).
+inline bool is_c1_or_bidi_control(std::string_view s, std::size_t i, std::size_t len) {
+    const auto b0 = static_cast<unsigned char>(s[i]);
+    if (len == 2) {
+        return b0 == 0xC2 && static_cast<unsigned char>(s[i + 1]) <= 0x9F;
+    }
+    if (len == 3 && b0 == 0xE2) {
+        const auto b1 = static_cast<unsigned char>(s[i + 1]);
+        const auto b2 = static_cast<unsigned char>(s[i + 2]);
+        return (b1 == 0x80 && b2 >= 0xAA && b2 <= 0xAE) || (b1 == 0x81 && b2 >= 0xA6 && b2 <= 0xA9);
+    }
+    return false;
+}
+
 }  // namespace detail
 
 // Makes a client-supplied string safe to put in a log line. Bytes below 0x20,
-// 0x7f and bytes that are not well-formed UTF-8 become `\xNN`, so a client
-// cannot forge or garble log lines. Output stops before the first code point
+// 0x7f, bytes that are not well-formed UTF-8, and the C1 controls and bidi
+// controls (each UTF-8 byte of those) become `\xNN`, so a client cannot forge
+// or garble log lines. Output stops before the first code point
 // that would end past `max_bytes` input bytes (never mid-sequence), and a cut
 // appends `... (<original length> bytes)`.
 inline std::string escape_for_log(std::string_view s, std::size_t max_bytes = 256) {
@@ -89,6 +106,13 @@ inline std::string escape_for_log(std::string_view s, std::size_t max_bytes = 25
             out += "\\x";
             out += kHex[b >> 4];
             out += kHex[b & 0x0f];
+        } else if (detail::is_c1_or_bidi_control(s, i, len)) {
+            for (std::size_t k = 0; k < len; ++k) {
+                const auto bk = static_cast<unsigned char>(s[i + k]);
+                out += "\\x";
+                out += kHex[bk >> 4];
+                out += kHex[bk & 0x0f];
+            }
         } else {
             out.append(s.data() + i, len);
         }
