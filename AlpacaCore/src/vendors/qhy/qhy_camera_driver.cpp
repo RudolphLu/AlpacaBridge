@@ -583,7 +583,7 @@ public:
         case QHYExposureStatus::Failed:
             // A failed exposure leaves the camera fully ready for the next
             // one — the failure is raised by ImageReady and ImageArray until the
-            // next StartExposure. A sticky Error state poisons every
+            // next StartExposure or AbortExposure. A sticky Error state poisons every
             // subsequent operation (same class ConformU exposed on the ZWO
             // camera: one transient failure cascaded into 18 issues).
             return CameraState::Idle;
@@ -960,7 +960,7 @@ public:
             return false;
         }
         // A failure after the exposure started is reported by raising here,
-        // until the next StartExposure.
+        // until the next StartExposure or AbortExposure.
         if (exposure_status_ == QHYExposureStatus::Failed) {
             throw AlpacaException(exposure_failure_, AlpacaError::DriverException);
         }
@@ -2053,7 +2053,7 @@ private:
     // CURTEMP was probed and the SDK says the camera has no such control.
     bool telemetry_temp_unsupported_{false};
     // Why the last exposure failed; reported by ImageReady/ImageArray until the
-    // next StartExposure. Guarded by mutex_.
+    // next StartExposure or AbortExposure. Guarded by mutex_.
     mutable std::string exposure_failure_;
     bool telemetry_power_valid_{false};
 
