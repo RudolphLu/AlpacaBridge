@@ -311,7 +311,7 @@ if python3 scripts/check_falsified_by.py --self-test; then
   elif [[ "$(git branch --show-current 2>/dev/null)" == merge-down/* ]] \
        && python3 scripts/merge_down.py --exempt --head-ref "$(git branch --show-current 2>/dev/null)" \
             --base-ref "${BASE}" --base-rev "${MERGE_BASE}" \
-            --stable-remote "$(case "${BASE}" in */*) echo "${BASE%%/*}" ;; *) echo origin ;; esac)"; then
+            --stable-remote "$(if [[ "${BASE}" == */* ]] && git remote | grep -Fxq -e "${base_remote}"; then echo "${base_remote}"; else echo origin; fi)"; then
     # Same exemption, same script as the falsified-by CI job: a merge down
     # (merge-down/X.Y-to-<target> against that target, nothing that is not
     # already on stable/X.Y) carries test cases already gated on their fix PRs
