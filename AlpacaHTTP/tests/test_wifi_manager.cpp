@@ -129,8 +129,8 @@ std::string connection_id(const WifiSettings& settings) { return setting(setting
 }  // namespace
 
 int main() {
-    // case: WifiManager saves new profile IDs and exact SSID bytes
     {
+        // case: WifiManager saves new profile IDs and exact SSID bytes
         const std::vector<std::pair<std::string, std::string>> cases = {{"HomeNet", "HomeNet"},
                                                                         {"\xc3\xa9", "\xc3\xa9"},
                                                                         {std::string("\xff", 1), "Wi-Fi ff"},
@@ -170,8 +170,8 @@ int main() {
         }
     }
 
-    // case: WifiManager updates an exact profile and preserves its identity
     {
+        // case: WifiManager updates an exact profile and preserves its identity
         FakeWifiProfileBackend backend;
         backend.connections.emplace_back("/saved/ap", saved_profile(std::string("\xff", 1), "ap"));
         backend.connections.emplace_back("/saved/other", saved_profile(std::string("\xfe", 1)));
@@ -206,8 +206,8 @@ int main() {
                                          {"Priority", 4}}));
     }
 
-    // case: WifiManager supplies a safe ID when an existing profile has none
     {
+        // case: WifiManager supplies a safe ID when an existing profile has none
         FakeWifiProfileBackend backend;
         backend.connections.emplace_back(
             "/saved/no-id", saved_profile(std::string("a\0b", 3), "infrastructure", std::nullopt, "uuid-no-id"));
@@ -219,8 +219,8 @@ int main() {
         EXPECT(result["Id"] == "Wi-Fi 610062");
     }
 
-    // case: WifiManager preserves security settings and never returns secrets
     {
+        // case: WifiManager preserves security settings and never returns secrets
         FakeWifiProfileBackend new_open_backend;
         WifiManager new_open_manager("unused", new_open_backend);
         const auto open_result = new_open_manager.save_profile("OpenNet", "", true, 0);
@@ -274,8 +274,8 @@ int main() {
         EXPECT(!replacement_result.contains("Passphrase"));
     }
 
-    // case: WifiManager pins dual-interface profiles to the client interface
     {
+        // case: WifiManager pins dual-interface profiles to the client interface
         FakeWifiProfileBackend dual;
         dual.roles = {"/client", "wlan0", "/ap", "ap0", 2};
         WifiManager dual_manager("unused", dual);
@@ -297,8 +297,8 @@ int main() {
         EXPECT(!has_setting(missing_interface.added_settings, "connection", "interface-name"));
     }
 
-    // case: WifiManager validates profile inputs before backend access
     {
+        // case: WifiManager validates profile inputs before backend access
         struct InvalidProfile {
             std::string ssid;
             std::string passphrase;
@@ -330,8 +330,8 @@ int main() {
         EXPECT(backend.add_calls == 1);
     }
 
-    // case: WifiManager propagates profile backend failures without success
     {
+        // case: WifiManager propagates profile backend failures without success
         for (const auto failure : {FakeWifiProfileBackend::Failure::Connections, FakeWifiProfileBackend::Failure::Roles,
                                    FakeWifiProfileBackend::Failure::Add}) {
             FakeWifiProfileBackend backend;
@@ -364,8 +364,8 @@ int main() {
         EXPECT(backend.update_calls == 1);
     }
 
-    // case: WifiManager country guard cannot reach NetworkManager in injected mode
     {
+        // case: WifiManager country guard cannot reach NetworkManager in injected mode
         TemporaryDirectory dir;
         FakeWifiProfileBackend backend;
         WifiManager manager(dir.path(), backend);
