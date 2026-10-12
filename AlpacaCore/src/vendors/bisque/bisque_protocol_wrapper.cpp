@@ -227,11 +227,13 @@ public:
         std::string response = read_until_hash_locked(connection_info_.response_timeout_ms);
         std::string value = strip_error_prefix(response);
 
-        int complete = 0;
-        if (std::sscanf(value.c_str(), "%d", &complete) != 1) {
-            throw AlpacaException("Failed to parse IsSlewComplete from TheSkyX: " + value);
+        if (value == "0") {
+            return false;
         }
-        return complete == 1;
+        if (value == "1") {
+            return true;
+        }
+        throw AlpacaException("Failed to parse IsSlewComplete from TheSkyX: " + value);
     }
 
     void sync_to_coordinates(double ra_hours, double dec_degrees) {
