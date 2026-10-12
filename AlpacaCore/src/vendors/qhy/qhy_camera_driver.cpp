@@ -583,7 +583,7 @@ public:
         case QHYExposureStatus::Failed:
             // A failed exposure leaves the camera fully ready for the next
             // one — the failure is raised by ImageReady and ImageArray until the
-            // next StartExposure. A sticky Error state poisons every
+            // next StartExposure or AbortExposure. A sticky Error state poisons every
             // subsequent operation (same class ConformU exposed on the ZWO
             // camera: one transient failure cascaded into 18 issues).
             return CameraState::Idle;
@@ -960,7 +960,7 @@ public:
             return false;
         }
         // A failure after the exposure started is reported by raising here,
-        // until the next StartExposure.
+        // until the next StartExposure or AbortExposure.
         if (exposure_status_ == QHYExposureStatus::Failed) {
             throw AlpacaException(exposure_failure_, AlpacaError::DriverException);
         }
@@ -1761,8 +1761,8 @@ public:
                 return;
             }
             // The watchdog may have already marked this exposure Failed: that
-            // failure stands until the next StartExposure, so a late frame
-            // (or a late error) must not overwrite it.
+            // failure stands until the next StartExposure or AbortExposure, so a
+            // late frame (or a late error) must not overwrite it.
             if (exposure_status_ != QHYExposureStatus::Working) {
                 return;
             }
@@ -1833,11 +1833,20 @@ public:
 
 private:
     // Ends a running exposure and discards it. Returns at once when the
-    // exposure already finished, so a completed frame survives an abort.
+    // exposure already finished, so a completed frame survives an abort;
+    // a completed failure is cleared instead.
     void cancel_running_exposure() {
         ensure_connected();
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (exposure_status_ == QHYExposureStatus::Failed) {
+                // A failure from an already completed exposure is discarded.
+                exposure_status_ = QHYExposureStatus::Idle;
+                exposure_failure_.clear();
+                image_ready_ = false;
+                last_exposure_valid_ = false;
+                return;
+            }
             if (exposure_status_ != QHYExposureStatus::Working) {
                 return;
             }
@@ -2044,7 +2053,7 @@ private:
     // CURTEMP was probed and the SDK says the camera has no such control.
     bool telemetry_temp_unsupported_{false};
     // Why the last exposure failed; reported by ImageReady/ImageArray until the
-    // next StartExposure. Guarded by mutex_.
+    // next StartExposure or AbortExposure. Guarded by mutex_.
     mutable std::string exposure_failure_;
     bool telemetry_power_valid_{false};
 
