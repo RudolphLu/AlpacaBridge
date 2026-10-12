@@ -714,7 +714,9 @@ public:
             if (alignment != AlignmentMode::AltAz && !site_info_valid_) {
                 throw AlpacaException("Set SiteLatitude before enabling equatorial tracking", AlpacaError::ValueNotSet);
             }
-            const int mode = alignment == AlignmentMode::AltAz ? 1 : (site_latitude_cached_ < 0.0 ? 3 : 2);
+            // SynScan "T" modes (protocol v3.3): 1 = Alt/Az, 2 = equatorial in either hemisphere, 3 = PEC. The
+            // handset applies its own site; 3 is not "EQ south" as it is on a Celestron.
+            const int mode = alignment == AlignmentMode::AltAz ? 1 : 2;
             protocol.set_tracking_mode(mode);
             tracking_mode_cached_ = mode;
         } else {

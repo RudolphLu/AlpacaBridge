@@ -1,0 +1,2 @@
+### Fixed
+- **SynScan: southern-hemisphere tracking no longer switches the handset into PEC mode** (AlpacaCore, found investigating issue #1030): `Tracking=true` at a southern site sent `T3`, which the Sky-Watcher SynScan Serial Communication Protocol v3.3 defines as PEC mode (Sidereal + PEC), not "EQ south" (that is Celestron's numbering); equatorial tracking now sends `T2` in either hemisphere and the handset applies its own site, so a handset holding a PEC recording no longer plays it back during every tracked session south of the equator.
