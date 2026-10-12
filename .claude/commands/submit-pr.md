@@ -156,10 +156,16 @@ branch's sections. Resolve any other conflict by hand, then check and push:
 ```bash
 python3 scripts/check_docs_drift.py          # VERSION and badge agree (check 4)
 # Stop on an unresolved conflict: check 4 reads only the first badge line, so it passes over markers.
-[ -z "$(git diff --name-only --diff-filter=U)" ] && ! git diff --cached | grep -qE '^\+(<{7}|>{7})( |$)' &&
-git commit --no-edit
-git push -u origin "${HEAD_BRANCH}"
-gh pr create --base "${BASE_BRANCH}" --head "${HEAD_BRANCH}" --title "Merge stable/${SRC} into ${BASE_BRANCH}"
+# A tripped guard commits, pushes and opens nothing.
+if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+  echo "STOPPED: unresolved paths (git diff --diff-filter=U): $(git diff --name-only --diff-filter=U | tr '\n' ' ')"
+elif git diff --cached | grep -qE '^\+(<{7}|>{7})( |$)'; then
+  echo "STOPPED: conflict markers in the staged diff (git diff --cached)"
+else
+  git commit --no-edit &&
+  git push -u origin "${HEAD_BRANCH}" &&
+  gh pr create --base "${BASE_BRANCH}" --head "${HEAD_BRANCH}" --title "Merge stable/${SRC} into ${BASE_BRANCH}"
+fi
 ```
 
 Run the pre-flight with `PREFLIGHT_BASE=origin/${BASE_BRANCH}`. Skip the fragment, version and
