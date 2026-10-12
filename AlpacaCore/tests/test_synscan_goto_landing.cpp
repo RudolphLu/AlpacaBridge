@@ -553,12 +553,47 @@ TEST_CASE("SynScan GOTO landing - AbortSlew during a refinement pass stops it (#
     }
     REQUIRE(st->nudge_starts.load() == 1);  // the landing move is under way
 
+    const auto abort_started = Clock::now();
     REQUIRE_NOTHROW(driver->abort_slew());
+    CHECK(Clock::now() - abort_started < std::chrono::milliseconds(1500));  // not the move's remaining 4 s
     CHECK_FALSE(driver->get_slewing());
     std::this_thread::sleep_for(std::chrono::milliseconds(600));
     CHECK_FALSE(driver->get_slewing());
     CHECK(st->nudge_count.load() == 1);  // the move was stopped at once, not after its 4 s
     CHECK(st->goto_count.load() == 1);
+    driver->set_connected(false);
+}
+
+TEST_CASE(
+    "SynScan GOTO landing - a read on either side of a slightly misplaced tick is resolved by the last known RA "
+    "(#1030)",
+    "[synscan][telescope][goto-landing]") {
+    auto st = std::make_shared<LandingOffsetHandset>();
+    st->ra_offset_counts.store(165);
+    st->sawtooth_epoch.store(Clock::now().time_since_epoch().count());
+    st->sawtooth.store(true);
+    alpacacore::test::FakeMountServer server(responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
+        0, endpoint(server.port()), alpacacore::vendor::synscan::SynScanVersion::V4);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    use_fast_guide_rate(*driver);
+    REQUIRE_NOTHROW(driver->slew_to_coordinates(kTargetRa, kTargetDec));
+    const auto epoch = st->sawtooth_epoch.load();
+
+    // The handset's tick 150 ms later than the driver's anchor: a read 40 ms before the tick is at the bottom of
+    // the ramp while the anchor says the second just began (12.8" low uncorrected). Then 150 ms earlier: a read
+    // 40 ms after the tick is at the top while the anchor says the second is nearly over (12.8" high). Each is a
+    // whole second off without the other side; the shift is well outside the anchor's own 25 ms uncertainty.
+    // Once the side is right the residual is the shift itself (150 ms = 2.25") plus the anchor's and the phase
+    // wait's own margins; the wrong side is 12-14" off.
+    for (const auto [shift_ms, phase] : {std::pair{150, 0.96}, std::pair{-150, 0.04}}) {
+        st->sawtooth_epoch.store(epoch + Clock::duration(std::chrono::milliseconds(shift_ms)).count());
+        std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+        wait_for_sawtooth_phase(*st, phase);
+        INFO("tick shifted " << shift_ms << " ms, read at phase " << phase);
+        CHECK(ra_error_arcsec(*driver, kTargetRa) < 5.0);
+    }
     driver->set_connected(false);
 }
 

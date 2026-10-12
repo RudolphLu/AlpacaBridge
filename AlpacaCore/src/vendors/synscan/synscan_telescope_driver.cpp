@@ -2001,11 +2001,16 @@ private:
         }
         const double since = std::chrono::duration<double>(at - readback_tick_).count();
         double corrected = std::fmod(raw_hours + (since - std::floor(since)) / 3600.0 + 24.0, 24.0);
-        if (readback_top_valid_) {
-            const double alternative = std::fmod(corrected - 1.0 / 3600.0 + 24.0, 24.0);
-            if (std::abs(shortest_ra_delta_hours(corrected, readback_top_hours_)) > kReadbackDisambiguationHours &&
-                std::abs(shortest_ra_delta_hours(alternative, readback_top_hours_)) <= kReadbackDisambiguationHours) {
-                corrected = alternative;
+        if (readback_top_valid_ &&
+            std::abs(shortest_ra_delta_hours(corrected, readback_top_hours_)) > kReadbackDisambiguationHours) {
+            // An anchor a little late puts a post-tick read one second high; a little early, a pre-tick read one
+            // second low. Whichever neighbour sits by the last known RA is the read.
+            for (const double side : {-1.0, 1.0}) {
+                const double alternative = std::fmod(corrected + side / 3600.0 + 24.0, 24.0);
+                if (std::abs(shortest_ra_delta_hours(alternative, readback_top_hours_)) <=
+                    kReadbackDisambiguationHours) {
+                    return alternative;
+                }
             }
         }
         return corrected;
@@ -2109,10 +2114,9 @@ private:
         if (axis == 0) {
             move_arcsec -= kRaNudgeStopGapArcsec;  // the stop/restart gap adds RA whichever way the move goes
         }
-        double seconds = std::min(std::abs(move_arcsec) / rate_arcsec_per_sec, kNudgeMaxSeconds);
-        if (seconds < 0.05) {
-            return true;
-        }
+        // A residual just over the tolerance can call for a move shorter than the handset resolves once the RA
+        // gap is allowed for; a 50 ms minimum keeps it from being skipped round after round.
+        const double seconds = std::clamp(std::abs(move_arcsec) / rate_arcsec_per_sec, 0.05, kNudgeMaxSeconds);
         // RA east is the negative variable rate, as pulse_guide sends it; Dec north is positive unless the mount
         // is on the west side of the pier, where the Dec motor runs the other way.
         double signed_rate = axis == 0 ? (move_arcsec > 0.0 ? -rate_deg_per_sec : rate_deg_per_sec)
