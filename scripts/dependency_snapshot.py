@@ -150,8 +150,13 @@ def file_digests(data: bytes) -> dict[str, str]:
 def tracked_files(root: Path, rel: str) -> list[tuple[str, bool]]:
     """(path, is_symlink) for every git-tracked file under rel, sorted. The pins and the
     --spdx match both use this set, so an untracked file can satisfy neither."""
-    out = subprocess.run(["git", "-C", str(root), "ls-files", "-s", "-z", "--", rel],
-                         check=True, capture_output=True, text=True).stdout
+    # safe.directory for this one read: the release jobs run as root in a container over a
+    # checkout owned by the runner user, and git refuses such a repository by default.
+    proc = subprocess.run(["git", "-c", f"safe.directory={root.resolve()}", "-C", str(root),
+                           "ls-files", "-s", "-z", "--", rel], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"git ls-files {rel} failed: {proc.stderr.strip()}")
+    out = proc.stdout
     entries = []
     for entry in sorted(e for e in out.split("\0") if e):
         meta, path = entry.split("\t", 1)
