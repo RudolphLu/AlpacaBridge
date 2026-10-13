@@ -8691,7 +8691,8 @@ bool Router::register_device_from_config(const nlohmann::json& config, std::stri
         const std::string supplied_unique_id = unique_id;
         const bool unique_id_supplied = !unique_id.empty();
 
-        if (camera_id < 0 && camera_index < 0 && configured_serial.empty() && configured_name.empty()) {
+        if (camera_id < 0 && camera_index < 0 && configured_serial.empty() && configured_name.empty() &&
+            source == ConfigSource::Api) {
             error_message = "ZWO camera requires cameraIndex or cameraId";
             return false;
         }
