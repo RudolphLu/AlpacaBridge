@@ -276,6 +276,7 @@ TEST_CASE("Celestron async - a GOTO the hand controller never acknowledges surfa
     CHECK(read_slewing(*driver) == SlewingRead::True);
     REQUIRE(wait_until([&] { return st->goto_count.load() > 0; }, 5000));
     REQUIRE(wait_until([&] { return read_slewing(*driver) == SlewingRead::False; }, 15000));
+    CHECK(st->goto_count.load() == 1);  // the retried slew sends exactly one GOTO
     driver->set_connected(false);
 }
 
