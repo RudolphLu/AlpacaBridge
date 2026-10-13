@@ -15,6 +15,7 @@
 #include <alpacacore/version.h>
 
 #include <functional>
+#include <limits>
 #include <set>
 #include <string>
 
@@ -128,6 +129,9 @@ TEST_CASE("ZWO Camera Driver - Sub-exposure not supported", "[zwo][camera][unit]
 TEST_CASE("ZWO Camera Driver - ASCOM Error Codes", "[zwo][camera][unit]") {
     auto driver = alpacacore::vendor::zwo::create_zwo_camera_by_index(0, 0);
 
+    require_alpaca_error([&]() { driver->start_exposure(-1.0, true); }, alpacacore::AlpacaError::InvalidValue);
+    require_alpaca_error([&]() { driver->start_exposure(std::numeric_limits<double>::quiet_NaN(), true); },
+                         alpacacore::AlpacaError::InvalidValue);
     require_alpaca_error([&]() { driver->get_ccd_temperature(); }, alpacacore::AlpacaError::NotConnected);
     require_alpaca_error([&]() { driver->get_gain(); }, alpacacore::AlpacaError::NotConnected);
     require_alpaca_error([&]() { driver->set_gain(100); }, alpacacore::AlpacaError::NotConnected);

@@ -379,8 +379,8 @@
     "available": true,
     "buildOption": "ALPACACORE_ENABLE_ZWO",
     "fields": [
-      {"key": "filterwheelIndex", "type": "int", "default": -1, "required": false, "secret": false, "role": "EnumerationIndex"},
-      {"key": "filterwheelId", "type": "int", "default": -1, "required": false, "secret": false, "role": "DeviceId"},
+      {"key": "filterwheelIndex", "type": "int", "default": -1, "required": false, "secret": false, "role": "EnumerationIndex", "range": {"min": -1, "max": 2147483647}},
+      {"key": "filterwheelId", "type": "int", "default": -1, "required": false, "secret": false, "role": "DeviceId", "range": {"min": -1, "max": 2147483647}},
       {"key": "filterNames", "type": "stringList", "required": false, "secret": false, "role": "Plain"}
     ]
   },
@@ -391,8 +391,8 @@
     "available": true,
     "buildOption": "ALPACACORE_ENABLE_ZWO",
     "fields": [
-      {"key": "focuserIndex", "type": "int", "default": -1, "required": false, "secret": false, "role": "EnumerationIndex"},
-      {"key": "focuserId", "type": "int", "default": -1, "required": false, "secret": false, "role": "DeviceId"}
+      {"key": "focuserIndex", "type": "int", "default": -1, "required": false, "secret": false, "role": "EnumerationIndex", "range": {"min": -1, "max": 2147483647}},
+      {"key": "focuserId", "type": "int", "default": -1, "required": false, "secret": false, "role": "DeviceId", "range": {"min": -1, "max": 2147483647}}
     ]
   },
   {
@@ -402,8 +402,8 @@
     "available": true,
     "buildOption": "ALPACACORE_ENABLE_ZWO",
     "fields": [
-      {"key": "rotatorIndex", "type": "int", "default": -1, "required": false, "secret": false, "role": "EnumerationIndex"},
-      {"key": "rotatorId", "type": "int", "default": -1, "required": false, "secret": false, "role": "DeviceId"}
+      {"key": "rotatorIndex", "type": "int", "default": -1, "required": false, "secret": false, "role": "EnumerationIndex", "range": {"min": -1, "max": 2147483647}},
+      {"key": "rotatorId", "type": "int", "default": -1, "required": false, "secret": false, "role": "DeviceId", "range": {"min": -1, "max": 2147483647}}
     ]
   },
   {
@@ -414,8 +414,8 @@
     "buildOption": "ALPACACORE_ENABLE_ZWO",
     "fields": [
       {"key": "switchType", "type": "string", "default": "dewheater", "required": false, "secret": false, "role": "Discriminator"},
-      {"key": "cameraIndex", "type": "int", "default": -1, "required": false, "secret": false, "role": "EnumerationIndex", "appliesWhen": {"key": "switchType", "value": "dewheater"}},
-      {"key": "cameraId", "type": "int", "default": -1, "required": false, "secret": false, "role": "DeviceId", "appliesWhen": {"key": "switchType", "value": "dewheater"}},
+      {"key": "cameraIndex", "type": "int", "default": -1, "required": false, "secret": false, "role": "EnumerationIndex", "appliesWhen": {"key": "switchType", "value": "dewheater"}, "range": {"min": -1, "max": 2147483647}},
+      {"key": "cameraId", "type": "int", "default": -1, "required": false, "secret": false, "role": "DeviceId", "appliesWhen": {"key": "switchType", "value": "dewheater"}, "range": {"min": -1, "max": 2147483647}},
       {"key": "gpioChip", "type": "string", "default": "/dev/gpiochip0", "required": false, "secret": false, "role": "Plain", "appliesWhen": {"key": "switchType", "value": "asiair"}},
       {"key": "devicePath", "type": "string", "default": "/dev/pwm-gpio-misc", "required": false, "secret": false, "role": "Plain", "appliesWhen": {"key": "switchType", "value": "asiair-plus-rk3568"}},
       {"key": "pwmFrequencyHz", "type": "int", "default": 1000, "required": false, "secret": false, "role": "Plain"},
