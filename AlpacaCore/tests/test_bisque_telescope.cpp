@@ -536,7 +536,7 @@ TEST_CASE("Bisque async slew - completion poll errors are surfaced and valid rep
                 case 2:
                     return "|No error. Error = 0.0#";
                 default:
-                    return "|No error. Error = 0.1#";
+                    return "|No error. Error = 0.2#";  // TheSkyX documents non-zero as complete.
             }
         }
         return "|No error. Error = 0.OK#";

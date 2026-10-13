@@ -1032,7 +1032,7 @@ public:
         // open-astro#575: a fresh initiator is a clean start -- a client
         // that jogs an axis after a failed GOTO must not be told the OLD
         // goto failed.
-        invalidate_slew_error_locked();
+        supersede_slew_dispatch_locked();
     }
 
     std::pair<double, double> get_axis_rate_range(int axis) const override {
@@ -1270,13 +1270,10 @@ public:
         auto& protocol = iOptronProtocolWrapper::instance();
         // Use a direct go-to-zero command to avoid aggressive sensor searches.
         protocol.go_to_home();
+        supersede_slew_dispatch_locked();
         slew_override_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         status_cache_valid_ = false;
         position_cache_valid_ = false;
-        // open-astro#575: a fresh initiator is a clean start -- a client
-        // that calls FindHome after a failed GOTO must not be told the OLD
-        // goto failed while it's homing.
-        invalidate_slew_error_locked();
     }
 
     void park() override {
@@ -1299,6 +1296,7 @@ public:
             throw AlpacaException(std::string("Failed to park mount: ") + e.what(),
                                   AlpacaError::DriverException);
         }
+        supersede_slew_dispatch_locked();
         park_override_until_ = std::chrono::steady_clock::time_point{};
         cached_status_.is_parked = false;
         cached_status_.is_slewing = true;
@@ -1307,10 +1305,6 @@ public:
         last_status_update_ = std::chrono::steady_clock::now();
         slew_override_until_ = last_status_update_ + std::chrono::seconds(5);
         position_cache_valid_ = false;
-        // open-astro#575: a fresh initiator is a clean start -- a client
-        // that calls Park after a failed GOTO must not be told the OLD goto
-        // failed while it's parking.
-        invalidate_slew_error_locked();
         // HAE29C firmware quirk (hardware-verified 2026-07-14): :MP1# park
         // slews complete physically but the mount keeps reporting
         // system-status 2 ("slewing") forever instead of 6 ("parked");
@@ -1498,7 +1492,6 @@ public:
             double phys_dec = dec - sync_offset_dec_degrees_;
             prepare_slew_state_locked(ra, dec, phys_ra, phys_dec, "SlewToCoordinates");
             dispatch_slew_command_locked(phys_ra, phys_dec, false, "SlewToCoordinates");
-            invalidate_slew_error_locked();
         }
         wait_for_slew_completion("SlewToCoordinates");
     }
@@ -1515,9 +1508,8 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             phys_ra = normalize_ra_hours(ra - sync_offset_ra_hours_);
             phys_dec = dec - sync_offset_dec_degrees_;
-            prepare_slew_state_locked(ra, dec, phys_ra, phys_dec, "SlewToCoordinatesAsync");
             previous_slew_error = last_slew_error_;
-            invalidate_slew_error_locked();
+            prepare_slew_state_locked(ra, dec, phys_ra, phys_dec, "SlewToCoordinatesAsync");
             generation = slew_operation_generation_;
         }
         try {
@@ -1540,6 +1532,9 @@ public:
             slew_dispatch_thread_ = std::thread([this, phys_ra, phys_dec, generation]() {
                 if (before_slew_worker_lock_) before_slew_worker_lock_();
                 std::lock_guard<std::mutex> lock(mutex_);
+                // A superseding initiator already cleared/replaced the GOTO
+                // state before bumping this generation; never publish or
+                // clear state owned by that newer operation.
                 if (generation != slew_operation_generation_) return;
                 if (!connected_ || slew_dispatch_cancel_.load()) {
                     slew_in_progress_ = false;
@@ -1660,7 +1655,7 @@ public:
             }
             ensure_not_parked_locked("SlewToAltAzAsync");
             previous_slew_error = last_slew_error_;
-            invalidate_slew_error_locked();
+            supersede_slew_dispatch_locked();
             generation = slew_operation_generation_;
             slew_in_progress_ = true;
             // Same reason as prepare_slew_state_locked(): Slewing must read
@@ -1697,7 +1692,8 @@ public:
                         altitude, azimuth, site_latitude_cached_, site_longitude_cached_, current_utc_time_locked());
                     double ra_hours = converted.first;
                     double dec_degrees = converted.second;
-                    prepare_slew_state_locked(ra_hours, dec_degrees, ra_hours, dec_degrees, "SlewToAltAzAsync");
+                    // The initiator already claimed and published this generation.
+                    prepare_slew_state_locked(ra_hours, dec_degrees, ra_hours, dec_degrees, "SlewToAltAzAsync", false);
                     dispatch_slew_command_locked(ra_hours, dec_degrees, true, "SlewToAltAzAsync");
                 } catch (const std::exception& e) {
                     slew_in_progress_ = false;
@@ -1770,6 +1766,7 @@ public:
             throw AlpacaException(std::string("Failed to unpark mount: ") + e.what(),
                                   AlpacaError::DriverException);
         }
+        supersede_slew_dispatch_locked();
         cached_status_.is_parked = false;
         cached_status_.is_slewing = true;
         cached_status_.is_at_home = false;
@@ -1937,11 +1934,11 @@ private:
         }
     }
 
-    void prepare_slew_state_locked(double ascom_ra, double ascom_dec,
-                                    double phys_ra, double phys_dec,
-                                    const char* label) {
+    void prepare_slew_state_locked(double ascom_ra, double ascom_dec, double phys_ra, double phys_dec,
+                                   const char* label, bool supersede = true) {
         check_connected();
         ensure_not_parked_locked(label);
+        if (supersede) supersede_slew_dispatch_locked();
 
         target_ra_hours_ = ascom_ra;
         target_dec_degrees_ = ascom_dec;
@@ -1964,6 +1961,14 @@ private:
     void invalidate_slew_error_locked() {
         ++slew_operation_generation_;
         last_slew_error_.clear();
+    }
+
+    void supersede_slew_dispatch_locked() {
+        // Clear an unsent GOTO's state before a stale worker observes its
+        // generation mismatch, preventing a ghost slew/trim after newer motion.
+        invalidate_slew_error_locked();
+        slew_in_progress_ = false;
+        clear_slew_override_locked();
     }
 
     void clear_slew_override_locked() { slew_override_until_ = std::chrono::steady_clock::time_point{}; }
@@ -2000,7 +2005,6 @@ private:
     void start_slew_to_coordinates_locked(double ra, double dec, bool allow_soft_fail) {
         prepare_slew_state_locked(ra, dec, ra, dec, "SlewToCoordinates");
         dispatch_slew_command_locked(ra, dec, allow_soft_fail, "SlewToCoordinates");
-        if (!allow_soft_fail) invalidate_slew_error_locked();
     }
 
     void wait_for_slew_completion(const char* label) {

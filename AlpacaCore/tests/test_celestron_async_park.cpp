@@ -57,6 +57,7 @@ struct FakeCelestronState {
     // #832: `tracking_on` makes the 't' query answer EQ-North so the completion
     // tail has a tracking restore to perform; `t_count` counts every 'T' write.
     std::atomic<bool> tracking_on{false};
+    std::atomic<bool> reject_level_start{false};
     std::atomic<bool> invalid_home_status{false};
     std::atomic<int> home_status_polls{0};
     std::atomic<int> t_count{0};
@@ -106,6 +107,7 @@ alpacacore::test::FakeMountServer::Responder celestron_responder(std::shared_ptr
                 const unsigned char op = chunk.size() > 3 ? static_cast<unsigned char>(chunk[3]) : 0;
                 if (op == 0x0B) {
                     st->level_start_count.fetch_add(1);
+                    if (st->reject_level_start.load()) return "";
                     return "#";
                 }
                 if (op == 0x12) {
@@ -295,6 +297,38 @@ TEST_CASE("Celestron FindHome - refuses during Park without replacing the park t
     driver->set_connected(false);
 }
 
+TEST_CASE("Celestron FindHome - dispatch failure persists through Slewing and AtHome",
+          "[celestron][telescope][async][homefailure]") {
+    auto st = std::make_shared<FakeCelestronState>();
+    st->reject_level_start.store(true);
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    try {
+        driver->find_home();
+        FAIL("FindHome returned normally although MC_LEVEL_START was unanswered");
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+        CHECK(std::string(ex.what()).find("FindHome dispatch failed") != std::string::npos);
+    }
+    CHECK(st->level_start_count.load() == 1);
+    CHECK(read_slewing_error(*driver));
+    try {
+        static_cast<void>(driver->get_at_home());
+        FAIL("AtHome returned normally after its FindHome dispatch failed");
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+        CHECK(std::string(ex.what()).find("FindHome dispatch failed") != std::string::npos);
+    }
+
+    REQUIRE_NOTHROW(driver->abort_slew());
+    CHECK_FALSE(driver->get_at_home());
+    CHECK_FALSE(driver->get_slewing());
+    driver->set_connected(false);
+}
+
 // #742: the three stops Unpark sends to cancel a park in flight (cancel GOTO,
 // then both axes to rate 0) sat in one empty catch, and Unpark then set
 // Slewing false and returned success. With a handset that answers nothing,
@@ -322,6 +356,7 @@ TEST_CASE("Celestron async - Unpark reports stops a silent handset never answere
         CHECK(std::string(ex.what()).rfind("Unpark could not stop the park slew: ", 0) == 0);
     }
     CHECK_FALSE(driver->get_at_park());
+    CHECK_FALSE(driver->get_at_home());
     try {
         static_cast<void>(driver->get_slewing());
         FAIL("Slewing must surface the failed Unpark stop");
@@ -368,6 +403,7 @@ TEST_CASE("Celestron async - a failed park logs the stops a silent handset never
     CHECK(stop_errors.load() == 1);
     CHECK(st->silent.load());  // the handset is still silent
     CHECK_FALSE(driver->get_at_park());
+    CHECK_FALSE(driver->get_at_home());
     try {
         static_cast<void>(driver->get_slewing());
         FAIL("Slewing must surface the failed Park");

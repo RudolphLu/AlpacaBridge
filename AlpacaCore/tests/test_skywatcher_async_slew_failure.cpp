@@ -259,4 +259,26 @@ TEST_CASE("SkyWatcher async - count-frame FindHome failure persists through Slew
     driver->set_connected(false);
 }
 
+TEST_CASE("SkyWatcher async - count-frame FindHome rejects a short landing", "[skywatcher][async][homefailure]") {
+    alpacacore::test::FakeTaskClock clock;
+    FakeSkyWatcherMount mount(alpacacore::test::FakeMountProfile::eqm35_pro(), clock);
+    REQUIRE(mount.ok());
+    auto driver = connected_driver(mount, clock);
+    mount.jump_axis_degrees(1, 5.0);
+    mount.land_short_by(1, 1, 0.2, 60000);
+
+    REQUIRE_NOTHROW(driver->find_home());
+    std::string message;
+    REQUIRE(run_clock_until(
+        clock, [&] { return read_slewing(*driver, &message) == SlewingRead::Threw; },
+        std::chrono::milliseconds(10000)));
+    CHECK(message.find("FindHome count-frame slew did not reach home") != std::string::npos);
+    CHECK_FALSE(driver->get_at_home());
+    CHECK(std::abs(mount.axis_degrees(1)) > 0.1);
+
+    REQUIRE_NOTHROW(driver->abort_slew());
+    CHECK(read_slewing(*driver) == SlewingRead::False);
+    driver->set_connected(false);
+}
+
 #endif  // _WIN32

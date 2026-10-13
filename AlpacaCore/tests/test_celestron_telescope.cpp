@@ -598,13 +598,32 @@ TEST_CASE("Celestron Telescope Driver - AbortSlew reports a stop it could not se
     alpacacore::test::FakeMountServer server([log, log_mutex](const std::string& command) {
         std::lock_guard<std::mutex> lock(*log_mutex);
         log->push_back(command);
-        if (command == "L") return std::string("0#");
-        if (command == "M") return std::string("#");
-        if (command.size() >= 4 && command[0] == 'P' && static_cast<unsigned char>(command[3]) == 0xFE) {
-            return std::string("\x01\x00#", 3);
+        if (command.empty()) return std::string("#");
+        switch (command[0]) {
+            case 'V':
+                return std::string("\x05\x23#", 3);
+            case 'm':
+                return std::string("\x18#", 2);
+            case 'e':
+            case 'E':
+            case 'z':
+            case 'Z':
+                return std::string("00000000,00000000#");
+            case 'J':
+                return std::string("\x01#", 2);
+            case 'L':
+                return std::string("0#");
+            case 'M':
+            case 'T':
+                return std::string("#");
+            case 'P':
+                if (command.size() >= 4 && static_cast<unsigned char>(command[3]) == 0xFE) {
+                    return std::string("\x01\x00#", 3);
+                }
+                return std::string("#");
+            default:
+                return std::string("#");
         }
-        if (!command.empty() && command[0] == 'P') return std::string(8, '\0') + "#";
-        return std::string("00000000,00000000#");
     });
     REQUIRE(server.ok());
     alpacacore::vendor::celestron::ConnectionInfo conn;
@@ -642,6 +661,7 @@ TEST_CASE("Celestron Telescope Driver - AbortSlew reports a stop it could not se
             CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
             CHECK(std::string(ex.what()).rfind("AbortSlew stop failed: ", 0) == 0);
         }
+        CHECK_FALSE(driver->get_at_home());
         try {
             (void)driver->get_slewing();
             FAIL("Slewing returned a completion value after the stop failed");

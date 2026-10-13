@@ -304,6 +304,52 @@ TEST_CASE("iOptron async - a stale worker cannot publish over a newer accepted s
     driver->set_connected(false);
 }
 
+TEST_CASE("iOptron - rejected synchronous GOTO clears the prior async failure",
+          "[ioptron][telescope][async][slewfailure]") {
+    alpacacore::test::FakeIoptronMount mount("0012", 0.0);
+    REQUIRE(mount.ok());
+    auto driver = alpacacore::vendor::ioptron::create_ioptron_telescope(0, endpoint(mount.port()));
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    mount.set_reject_goto(true);
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(5.5, 20.0));
+    REQUIRE(wait_until([&] { return read_slewing(*driver) == SlewingRead::Threw; }, 10000));
+
+    try {
+        driver->slew_to_coordinates(6.5, 25.0);
+        FAIL("Synchronous SlewToCoordinates returned after the mount refused the target");
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+        CHECK(std::string(ex.what()).find("Slew rejected by mount") != std::string::npos);
+    }
+    mount.set_reject_goto(false);
+    CHECK(read_slewing(*driver) == SlewingRead::False);
+    driver->set_connected(false);
+}
+
+TEST_CASE("iOptron - MoveAxis clears a superseded dispatch before its stale worker returns",
+          "[ioptron][telescope][async][slewfailure]") {
+    alpacacore::test::FakeIoptronMount mount("0012", 0.0);
+    REQUIRE(mount.ok());
+    WorkerGate gate;
+    gate.arm();
+    auto driver = alpacacore::vendor::ioptron::create_ioptron_telescope_with_slew_worker_hook(
+        0, endpoint(mount.port()), [&] { gate.before_worker_lock(mount); });
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(0.001, 0.0));
+    const bool worker_paused = gate.wait_until_entered();
+    if (!worker_paused) gate.release();
+    REQUIRE(worker_paused);
+
+    REQUIRE_NOTHROW(driver->move_axis(0, 0.0));
+    gate.release();
+    REQUIRE(wait_until([&] { return read_slewing(*driver) == SlewingRead::False; }, 2000));
+    driver->set_connected(false);  // joins the stale dispatch before checking the wire
+    CHECK(mount.count(":MS1#") == 0);
+    CHECK(mount.count(":Z") == 0);  // a ghost GOTO must not trigger the HAE16 RA trim
+}
+
 TEST_CASE("iOptron async - a newer initiator cannot be reaped by an older handoff",
           "[ioptron][telescope][async][slewfailure]") {
     alpacacore::test::FakeIoptronMount mount("0012", 0.0);

@@ -327,7 +327,7 @@ public:
             position_link_health_.reset();
             publish_link_fault_locked();
             last_site_info_attempt_ = util::TaskClock::clock::time_point::min();
-            last_slew_error_.clear();
+            clear_motion_errors_locked();
 
             try {
                 mount_firmware_version_ = protocol.get_handset_firmware_version();
@@ -473,7 +473,7 @@ public:
             sync_completed_this_session_ = false;
             skip_next_ra_learn_ = false;
             flip_in_progress_ = false;
-            last_slew_error_.clear();
+            clear_motion_errors_locked();
             position_link_health_.reset();
             publish_link_fault_locked();
         }
@@ -564,14 +564,17 @@ public:
     bool get_at_home() const override {
         std::lock_guard<std::mutex> lock(mutex_);
         check_connected();
-        if (!last_slew_error_.empty()) {
-            throw AlpacaException(last_slew_error_);
+        // AtHome is affected only by FindHome failures. A failed goto or Park
+        // still surfaces through Slewing without making this independent flag
+        // unreadable.
+        if (!last_home_error_.empty()) {
+            throw AlpacaException(last_home_error_);
         }
         if (homing_ && connected_) {
             check_homing_complete_locked();
         }
-        if (!last_slew_error_.empty()) {
-            throw AlpacaException(last_slew_error_);
+        if (!last_home_error_.empty()) {
+            throw AlpacaException(last_home_error_);
         }
         return at_home_;
     }
@@ -1088,7 +1091,7 @@ public:
         // open-astro#575: a fresh initiator is a clean start -- a client
         // that calls FindHome after a failed GOTO must not be told the OLD
         // goto failed while it's homing.
-        last_slew_error_.clear();
+        clear_motion_errors_locked();
     }
 
     // Park is an asynchronous initiator (ITelescopeV4; ConformU 4.5 times it
@@ -1163,7 +1166,7 @@ public:
             // open-astro#575: a fresh initiator is a clean start -- a client
             // that calls Park after a failed GOTO must not be told the OLD
             // goto failed while it's parking.
-            last_slew_error_.clear();
+            clear_motion_errors_locked();
             parking_ = true;
             ++motion_generation_;
         }
@@ -1213,16 +1216,22 @@ public:
     // answered (#742). mutex_ must be held.
     std::string stop_park_slew_locked() const { return util::stop_goto_and_axes(CelestronProtocolWrapper::instance()); }
 
+    void clear_motion_errors_locked() {
+        last_slew_error_.clear();
+        last_home_error_.clear();
+    }
+
     // Park task failure path: stop the hardware so the reported idle state
     // (Slewing false, AtPark false) matches reality, then drop the parking
-    // state so the caller can retry. When a stop fails the mount may still
-    // be moving, so Slewing keeps its cached value. mutex_ must be held.
+    // state so the caller can retry. A failed stop leaves a persistent Slewing
+    // error because the mount may still be moving. mutex_ must be held.
     void fail_park_locked(const std::string& message, util::OperationContext& ctx) {
         const std::string stop_error = stop_park_slew_locked();
         if (!connected_ || ctx.stop_reason() != util::StopReason::None) {
             return;
         }
         parking_ = false;
+        last_home_error_.clear();
         last_slew_error_ = message;
         if (stop_error.empty()) {
             slewing_cached_ = false;
@@ -1242,6 +1251,7 @@ public:
         if (!connected_ || ctx.stop_reason() != util::StopReason::None) {
             return;
         }
+        last_home_error_.clear();
         last_slew_error_ = message;
         if (stop_error.empty()) {
             slewing_cached_ = false;
@@ -1270,6 +1280,7 @@ public:
             ALPACA_LOG_ERROR("Celestron",
                              "stop after FindHome failure failed: " + stop_error + "; the mount may still be moving");
         }
+        last_home_error_ = last_slew_error_;
         ALPACA_LOG_WARN("Celestron", message);
     }
 
@@ -1511,7 +1522,7 @@ public:
             // open-astro#575: a fresh initiator is a clean start -- a client
             // that retries a rejected goto must not be told the OLD goto
             // failed.
-            last_slew_error_.clear();
+            clear_motion_errors_locked();
             slew_force_until_ = clock_.now() + std::chrono::seconds(8);
             position_override_until_ = util::TaskClock::clock::time_point::min();
             flip_in_progress_ = do_flip;
@@ -1747,8 +1758,8 @@ public:
             if (was_parking) {
                 // Unpark during a park wins the race: stop the park slew and
                 // drop the parking state; the task below is then joined. A
-                // failed stop leaves Slewing at its cached value, since the
-                // park slew may still be running.
+                // failed stop leaves Slewing to report the stored error, since
+                // the park slew may still be running.
                 parking_ = false;
                 stop_error = stop_park_slew_locked();
                 if (stop_error.empty()) {
@@ -1759,8 +1770,9 @@ public:
                 flip_in_progress_ = false;
             }
             if (stop_error.empty()) {
-                last_slew_error_.clear();
+                clear_motion_errors_locked();
             } else {
+                last_home_error_.clear();
                 last_slew_error_ = "Unpark could not stop the park slew: " + stop_error;
             }
         }
@@ -1816,7 +1828,7 @@ public:
             at_home_ = false;
         }
         CelestronProtocolWrapper::instance().move_axis_variable_rate(axis, moving ? rate : 0.0);
-        last_slew_error_.clear();
+        clear_motion_errors_locked();
     }
 
     std::pair<double, double> get_axis_rate_range(int axis) const override {
@@ -1876,13 +1888,14 @@ public:
                 try_stop([&protocol]() { protocol.move_axis_fixed_rate(0, 0); });
                 try_stop([&protocol]() { protocol.move_axis_fixed_rate(1, 0); });
                 if (!stop_error.empty()) {
+                    last_home_error_.clear();
                     last_slew_error_ = "AbortSlew stop failed: " + stop_error;
                     // The mount may still be moving: leave Slewing and the slew state as they were.
                     throw AlpacaException("AbortSlew stop failed: " + stop_error, AlpacaError::DriverException);
                 }
                 // AbortSlew clears a stored motion error only after all stop
                 // commands are acknowledged.
-                last_slew_error_.clear();
+                clear_motion_errors_locked();
                 pulse_guide_active_.fill(false);
                 pulse_guide_end_time_.fill(util::TaskClock::clock::time_point::min());
                 homing_ = false;
@@ -2439,7 +2452,7 @@ private:
         // open-astro#575: a fresh initiator is a clean start -- a client
         // that retries a rejected goto (even via the blocking SlewToCoordinates)
         // must not be told the OLD goto failed.
-        last_slew_error_.clear();
+        clear_motion_errors_locked();
         slew_force_until_ = clock_.now() + std::chrono::seconds(8);
         position_override_until_ = util::TaskClock::clock::time_point::min();
 
@@ -2635,6 +2648,7 @@ private:
     // the next slew initiator, AbortSlew, and connect/disconnect. Consulted by
     // get_slewing() before the cached bool.
     mutable std::string last_slew_error_;
+    mutable std::string last_home_error_;  // FindHome's completion error, not every motion error.
     mutable util::TaskClock::clock::time_point slew_force_until_;
     mutable util::TaskClock::clock::time_point position_override_until_;
     mutable bool manual_axis_slewing_[2] = {false, false};

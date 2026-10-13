@@ -268,6 +268,7 @@ TEST_CASE("Celestron async - a GOTO the hand controller never acknowledges surfa
     CHECK_FALSE(message.empty());
     CHECK(message.find("Slew") != std::string::npos);
     CHECK(read_slewing(*driver) == SlewingRead::Threw);  // preserved, not one-shot
+    CHECK_FALSE(driver->get_at_home());                  // a GOTO failure does not compromise the home flag
 
     // A retried initiator against a responsive controller clears it.
     st->reject_goto.store(false);
@@ -294,6 +295,66 @@ TEST_CASE("Celestron async - HC completion-poll failure persists through Slewing
     REQUIRE(wait_until([&] { return read_slewing(*driver, &message) == SlewingRead::Threw; }, 10000));
     CHECK(message.find("Slew completion polling failed") != std::string::npos);
     CHECK(read_slewing(*driver) == SlewingRead::Threw);
+    driver->set_connected(false);
+}
+
+TEST_CASE("Celestron Slewing - a direct hardware status-poll failure is propagated",
+          "[celestron][telescope][async][slewfailure]") {
+    auto st = std::make_shared<FakeCelestronState>();
+    st->malformed_slew_status.store(1);
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    try {
+        static_cast<void>(driver->get_slewing());
+        FAIL("Slewing returned the cached state after its hardware poll failed");
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+        CHECK(std::string(ex.what()).find("invalid response") != std::string::npos);
+    }
+    CHECK(st->slew_status_polls.load() > 0);
+    driver->set_connected(false);
+}
+
+TEST_CASE("Celestron sync slew - a status-poll failure aborts the wait", "[celestron][telescope][async][slewfailure]") {
+    alpacacore::test::FakeTaskClock clock;
+    auto st = std::make_shared<FakeCelestronState>();
+    st->clock = &clock;
+    st->hold_slew.store(true);
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = make_driver(server.port(), clock);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    std::exception_ptr slew_error;
+    std::atomic<bool> finished{false};
+    std::thread slew([&] {
+        try {
+            driver->slew_to_coordinates(no_flip_ra_hours(), 20.0);
+        } catch (...) {
+            slew_error = std::current_exception();
+        }
+        finished.store(true);
+    });
+    const bool goto_dispatched = wait_until([&] { return st->goto_count.load() > 0; }, 5000);
+    const bool waiting_for_poll = clock.wait_for_waiters(1, std::chrono::seconds(2));
+    st->malformed_slew_status.store(1);
+    clock.advance(std::chrono::seconds(9));
+    clock.wait_for_woken_settled(std::chrono::seconds(2));
+    const bool finished_after_bad_poll = wait_until([&] { return finished.load(); }, 5000);
+    slew.join();
+    REQUIRE(goto_dispatched);
+    REQUIRE(waiting_for_poll);
+    REQUIRE(finished_after_bad_poll);
+    REQUIRE(slew_error);
+    try {
+        std::rethrow_exception(slew_error);
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+        CHECK(std::string(ex.what()).find("invalid response") != std::string::npos);
+    }
     driver->set_connected(false);
 }
 
