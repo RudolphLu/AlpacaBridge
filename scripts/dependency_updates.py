@@ -51,6 +51,7 @@ UPDATE_LABELS = ("dependencies", "enhancement", "P4")
 BROKEN_LABELS = ("dependencies", "bug", "P4")
 OSV_LABELS = ("dependencies", "bug", "P2")
 TAG_PAGES = 10
+LIST_LIMIT = 5000  # issues read back for their markers; the OSV dedupe needs closed ones too
 OSV_THRESHOLD = 7.0  # CVSS: High is 7.0-8.9, Critical 9.0-10.0
 
 HttpGet = Callable[[str], str]
@@ -160,6 +161,7 @@ def targets(snap: dict, table: dict) -> tuple[list[dict], list[str]]:
 
 def check(t: dict, get: HttpGet) -> dict:
     try:
+        parse_version(t["current"])  # a pin that is no version (a commit SHA) is a broken entry
         if t["check"][0] == "github":
             latest = latest_github(t["check"][1], get)
         else:
@@ -197,7 +199,7 @@ class GhIssues:
         return subprocess.run(["gh", *args], input=stdin, check=True, capture_output=True, text=True).stdout
 
     def list(self, state: str) -> list[dict]:
-        out = self._gh("issue", "list", "--label", "dependencies", "--state", state, "--limit", "500",
+        out = self._gh("issue", "list", "--label", "dependencies", "--state", state, "--limit", str(LIST_LIMIT),
                        "--json", "number,title,body,state")
         return json.loads(out or "[]")
 
@@ -211,7 +213,9 @@ class GhIssues:
         self._gh("issue", "edit", str(number), "--title", title, "--body-file", "-", stdin=body)
         self._gh("issue", "comment", str(number), "--body-file", "-", stdin=comment)
 
-    def close(self, number: int, comment: str) -> None:
+    def close(self, number: int, comment: str, body: str | None = None) -> None:
+        if body is not None:
+            self._gh("issue", "edit", str(number), "--body-file", "-", stdin=body)
         self._gh("issue", "close", str(number), "--comment", comment)
 
 
@@ -235,13 +239,27 @@ def broken_body(r: dict) -> str:
             "comes from. This issue closes by itself when the source reads again.\n")
 
 
-def reconcile(results: list[dict], issues, open_issues: list[dict]) -> list[str]:
-    """Open, retitle and close issues so they match results. Returns one line per action."""
-    by = {}
-    for i in open_issues:
+def resolved_body(issue: dict, state: dict) -> str:
+    """The issue body with its marker flagged ``resolved``: closed by this script, not by hand."""
+    return MARKER_RE.sub(lambda _: marker({**state, "resolved": True}), issue.get("body", ""), count=1)
+
+
+def reconcile(results: list[dict], issues, all_issues: list[dict]) -> list[str]:
+    """Open, retitle and close issues so they match results. Returns one line per action.
+
+    all_issues holds open and closed issues. A closed update issue whose marker is not
+    ``resolved`` was closed by a maintainer ("won't bump"), so that version is skipped until
+    upstream releases a newer one. An open issue for a dependency no longer in results closes.
+    """
+    by, declined = {}, set()
+    for i in all_issues:
         st = read_marker(i.get("body", ""))
-        if st and st.get("kind") in ("update", "broken") and "key" in st:
+        if not (st and st.get("kind") in ("update", "broken") and "key" in st):
+            continue
+        if i.get("state", "OPEN").upper() == "OPEN":
             by[(st["kind"], st["key"])] = (i, st)
+        elif st["kind"] == "update" and not st.get("resolved"):
+            declined.add((st["key"], st.get("version")))
     log = []
     for r in results:
         broken = by.get(("broken", r["key"]))
@@ -251,12 +269,15 @@ def reconcile(results: list[dict], issues, open_issues: list[dict]) -> list[str]
                 log.append(f"opened broken-source issue for {r['name']}")
             continue
         if broken:
-            issues.close(broken[0]["number"], f"The source reads again (`{r['latest']}`).")
+            issues.close(broken[0]["number"], f"The source reads again (`{r['latest']}`).",
+                         resolved_body(*broken))
             log.append(f"closed broken-source issue #{broken[0]['number']}")
         upd = by.get(("update", r["key"]))
         newer = is_newer(r["latest"], r["current"])
         title = f"Update {r['name']} {r['current']} -> {r['latest']}"
         if newer and not upd:
+            if (r["key"], r["latest"]) in declined:
+                continue
             issues.create(title, update_body(r), UPDATE_LABELS)
             log.append(f"opened update issue for {r['name']} {r['latest']}")
         elif newer and upd is not None and (upd[1].get("version"), upd[1].get("current")) != (r["latest"], r["current"]):
@@ -266,8 +287,14 @@ def reconcile(results: list[dict], issues, open_issues: list[dict]) -> list[str]
             log.append(f"retitled #{upd[0]['number']} to {r['current']} -> {r['latest']}")
         elif not newer and upd is not None:
             issues.close(upd[0]["number"], f"The repository is now at `{r['current']}`; "
-                                           f"upstream latest is `{r['latest']}`.")
+                                           f"upstream latest is `{r['latest']}`.", resolved_body(*upd))
             log.append(f"closed update issue #{upd[0]['number']}")
+    tracked = {r["key"] for r in results}
+    for (kind, key), (issue, st) in sorted(by.items(), key=lambda kv: kv[1][0]["number"]):
+        if key not in tracked:
+            issues.close(issue["number"], f"`{key}` is no longer in the dependency inventory.",
+                         resolved_body(issue, st))
+            log.append(f"closed {kind} issue #{issue['number']} (no longer tracked)")
     return log
 
 
@@ -363,15 +390,17 @@ def self_test() -> int:
             self.issues[number - 1].update(title=title, body=body)
             self.calls.append(("update", number, title))
 
-        def close(self, number, comment):
+        def close(self, number, comment, body=None):
             self.issues[number - 1]["state"] = "CLOSED"
+            if body is not None:
+                self.issues[number - 1]["body"] = body
             self.calls.append(("close", number))
 
         def open(self):
             return [i for i in self.issues if i["state"] == "OPEN"]
 
     f = Fake()
-    reconcile(results, f, f.open())
+    reconcile(results, f, f.issues)
     titles = sorted(i["title"] for i in f.issues)
     assert titles == ["Update a/b v1.0.0 -> v2.0.0", "Update check broken: e/f",
                       "Update libgpiod 2.2.4 -> 2.3.1"], titles
@@ -379,13 +408,13 @@ def self_test() -> int:
     assert {i["title"]: i["labels"] for i in f.issues}["Update a/b v1.0.0 -> v2.0.0"] == UPDATE_LABELS
     # Same results again: nothing to do (no duplicate issues).
     f.calls.clear()
-    assert reconcile(results, f, f.open()) == [] and f.calls == []
+    assert reconcile(results, f, f.issues) == [] and f.calls == []
     # A still newer upstream retitles the open issue instead of opening a second one.
     pages["https://api.github.com/repos/a/b/releases/latest"] = json.dumps({"tag_name": "v2.1.0"})
     pages["https://api.github.com/repos/e/f/releases/latest"] = json.dumps({"tag_name": "1.0"})
     results = [check(t, get) for t in ts]
     f.calls.clear()
-    reconcile(results, f, f.open())
+    reconcile(results, f, f.issues)
     assert ("update", 1, "Update a/b v1.0.0 -> v2.1.0") in f.calls, f.calls
     assert ("close", 2) in f.calls, "the broken source reads again: its issue closes"
     assert not any(c[0] == "create" for c in f.calls), f.calls
@@ -393,14 +422,43 @@ def self_test() -> int:
     snap["manifests"]["ci.yml"]["resolved"] = {"pkg:github/a/b@v2.0.0": {}}
     ts, _ = targets(snap, table)
     f.calls.clear()
-    reconcile([check(t, get) for t in ts], f, f.open())
+    reconcile([check(t, get) for t in ts], f, f.issues)
     assert ("update", 1, "Update a/b v2.0.0 -> v2.1.0") in f.calls, f.calls
     # The repository catches up: the update issue closes.
     snap["manifests"]["ci.yml"]["resolved"] = {"pkg:github/a/b@v2.1.0": {}}
     ts, _ = targets(snap, table)
     f.calls.clear()
-    reconcile([check(t, get) for t in ts], f, f.open())
+    reconcile([check(t, get) for t in ts], f, f.issues)
     assert ("close", 1) in f.calls, f.calls
+    # A maintainer closes an update issue by hand ("won't bump"): the same version stays skipped,
+    # and only a newer upstream release opens a new issue.
+    snap["manifests"]["ci.yml"]["resolved"] = {"pkg:github/a/b@v1.0.0": {}}
+    ts, _ = targets(snap, table)
+    reconcile([check(t, get) for t in ts], f, f.issues)
+    reopened = [i for i in f.issues if i["state"] == "OPEN" and i["title"].startswith("Update a/b")]
+    assert len(reopened) == 1, reopened
+    reopened[0]["state"] = "CLOSED"
+    f.calls.clear()
+    reconcile([check(t, get) for t in ts], f, f.issues)
+    assert f.calls == [], "a hand-closed issue for this version is not reopened"
+    pages["https://api.github.com/repos/a/b/releases/latest"] = json.dumps({"tag_name": "v2.2.0"})
+    reconcile([check(t, get) for t in ts], f, f.issues)
+    assert ("create", "Update a/b v1.0.0 -> v2.2.0") in f.calls, f.calls
+    # A pin that is not a version (a commit SHA) is a broken entry, not a crash of the whole run.
+    snap["manifests"]["ci.yml"]["resolved"] = {"pkg:github/a/b@deadbeef": {}}
+    ts, _ = targets(snap, table)
+    res = {r["key"]: r for r in (check(t, get) for t in ts)}
+    assert res["a/b"]["error"] and "deadbeef" in res["a/b"]["error"], res["a/b"]
+    f.calls.clear()
+    reconcile(list(res.values()), f, f.issues)
+    assert ("create", "Update check broken: a/b") in f.calls, f.calls
+    # A dependency that leaves the inventory: its open update and broken issues close.
+    snap["manifests"]["ci.yml"]["resolved"] = {}
+    ts, _ = targets(snap, table)
+    f.calls.clear()
+    reconcile([check(t, get) for t in ts], f, f.issues)
+    assert not [i for i in f.issues if i["state"] == "OPEN" and "a/b" in i["title"]], \
+        [i["title"] for i in f.issues if i["state"] == "OPEN"]
     # A body someone edited into garbage is not mistaken for a tracked issue.
     assert read_marker("<!-- dependency-updates: {not json} -->") is None and read_marker("") is None
 
@@ -453,7 +511,7 @@ def main() -> int:
         print(f"| {r['name']} | {r['current']} | {r['latest'] or '-'} | {status} |")
     for name in manual:
         print(f"| {name} | - | - | manual check (no `updates` source) |")
-    log = reconcile(results, issues, issues.list("open"))
+    log = reconcile(results, issues, issues.list("all"))
     print("\n" + ("\n".join(f"- {line}" for line in log) or "- no issue changes"))
     return 0
 
