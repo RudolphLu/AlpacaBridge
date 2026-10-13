@@ -708,8 +708,13 @@ jobs:
         # and AlpacaCore/external/ to the dependency graph. --check fails a
         # directory under AlpacaCore/external/ that
         # scripts/dependency_sdk_versions.json does not list, so a new SDK
-        # cannot reach the graph unreported.
-        run: python3 scripts/dependency_snapshot.py --self-test && python3 scripts/dependency_snapshot.py --check
+        # cannot reach the graph unreported. dependency_updates.py (run weekly by
+        # dependency-updates.yml and osv-scan.yml) is self-tested here so a
+        # broken checker fails the PR, not the next scheduled run.
+        run: |
+          python3 scripts/dependency_snapshot.py --self-test
+          python3 scripts/dependency_snapshot.py --check
+          python3 scripts/dependency_updates.py --self-test
 
       - name: Self-test the release-notes extractor
         # release.yml runs this too, but only on a tag push; here a broken
