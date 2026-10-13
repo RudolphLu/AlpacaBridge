@@ -656,6 +656,25 @@ def filter_sarif(sarif: dict, report: dict, direct: set[str]) -> dict:
     return out
 
 
+def osv_scope_unreadable(report: dict, sources: str) -> bool:
+    """True when the JSON names a package by its binary name (libcurl4t64) rather than its Debian
+    source (curl): the direct-dependency scope would then match nothing and open no issue, silently.
+    sources: the same "binary source" lines direct_sources() reads."""
+    binary_only = set()
+    source_names = set()
+    for line in sources.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            binary, source = parts[0].split(":")[0], parts[1]
+            source_names.add(source)
+            if binary != source:
+                binary_only.add(binary)
+    binary_only -= source_names
+    named = {(p.get("package") or {}).get("name") for res in report.get("results") or []
+             for p in res.get("packages") or []}
+    return bool(named & binary_only)
+
+
 def sarif_unreadable(sarif: dict) -> tuple[int, int]:
     """(results, results whose message SARIF_PACKAGE_RE cannot read)."""
     results = [r for run in sarif.get("runs") or [] for r in run.get("results") or []]
@@ -1004,6 +1023,28 @@ def self_test() -> int:
             assert e.code == 2, "--filter-sarif without --report/--output/--direct-* is a usage error"
         else:
             raise AssertionError("--filter-sarif alone must be refused")
+    # The summary's scope relies on the JSON naming Debian source packages, as the SARIF does. If no
+    # package that has findings is named like a direct dependency (binary names, say), fail loudly.
+    # The check is on naming, not on findings: a scan where only base-system packages have findings
+    # (direct dependencies clean) is a legitimate result, not an error.
+    assert osv_scope_unreadable(scoped, sources_txt) is False
+    base_only = {"results": [{"packages": [scoped["results"][0]["packages"][0]]}]}
+    assert osv_scope_unreadable(base_only, sources_txt) is False, "clean direct dependencies are not a scope error"
+    binary_named = {"results": [{"packages": [
+        pkg("libcurl4t64", [{"ids": ["DEBIAN-CVE-2026-10"], "max_severity": "9.0"}],
+            [vuln("DEBIAN-CVE-2026-10", {"Debian:13": "8.14.1-2+deb13u2"}, name="curl")])]}]}
+    assert osv_scope_unreadable(binary_named, sources_txt) is True
+    assert osv_scope_unreadable({"results": []}, sources_txt) is False
+    with tempfile.TemporaryDirectory() as tmp:  # the --osv-summary CLI refuses before touching issues
+        t = Path(tmp)
+        (t / "deps").write_text(depends)
+        (t / "src").write_text(sources_txt)
+        (t / "osv.json").write_text(json.dumps(binary_named))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            assert main(["--osv-summary", str(t / "osv.json"), "--direct-depends", str(t / "deps"),
+                         "--direct-sources", str(t / "src")]) == 1
+        assert "binary name" in err.getvalue(), err.getvalue()
     # A marker from the first summary format (kind "osv", #1135) does not suppress a finding.
     g = Fake()
     g.issues.append({"number": 1, "title": "old", "state": "CLOSED",
@@ -1274,6 +1315,10 @@ def main(argv: list[str] | None = None) -> int:
     issues = GhIssues(a.dry_run)
     if a.osv_summary:
         report = json.loads(Path(a.osv_summary).read_text(encoding="utf-8"))
+        if direct is not None and osv_scope_unreadable(report, Path(a.direct_sources).read_text(encoding="utf-8")):
+            print("error: osv-scanner's JSON names packages by binary name, not Debian source package; the "
+                  "direct-dependency scope would match nothing. Not opening a misleading summary.", file=sys.stderr)
+            return 1
         repo = os.environ.get("GH_REPO", "open-astro/AlpacaBridge")
         log = osv_summary(report, issues, issues.list("all"), repo, direct)
         print("\n".join(log) or "no new High/Critical findings")
