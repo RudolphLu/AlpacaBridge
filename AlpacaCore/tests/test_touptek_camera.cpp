@@ -244,3 +244,35 @@ TEST_CASE("ToupTek Camera Driver - Disconnect during the stream restart is not u
     CHECK(ms < 1000);
     CHECK(fake.call_count("trigger") == 0);
 }
+
+TEST_CASE("ToupTek Camera Driver - AbortExposure clears a failure from a completed exposure",
+          "[touptek][camera][unit]") {
+    alpacacore::test::FakeToupTekSDK fake;
+    fake.cameras.push_back(alpacacore::test::FakeToupTekSDK::default_camera("fake-cam-0", "FakeCam One"));
+    auto driver = alpacacore::vendor::touptek::create_touptek_camera(0, 0, fake);
+    driver->set_connected(true);
+    driver->start_exposure(0.01, true);  // the fake delivers no frame: the exposure fails
+
+    const auto image_ready_fails = [&] {
+        try {
+            (void)driver->get_image_ready();
+        } catch (const alpacacore::AlpacaException& e) {
+            return e.error_code() == alpacacore::AlpacaError::DriverException;
+        }
+        return false;
+    };
+    bool failed = false;
+    for (int i = 0; i < 400 && !failed; ++i) {
+        failed = image_ready_fails();
+        if (!failed) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(failed);
+
+    driver->abort_exposure();
+    bool ready = true;
+    CHECK_NOTHROW(ready = driver->get_image_ready());
+    CHECK_FALSE(ready);
+    CHECK_NOTHROW(driver->get_camera_state());
+    CHECK(driver->get_camera_state() == alpacacore::CameraState::Idle);
+    driver->set_connected(false);
+}

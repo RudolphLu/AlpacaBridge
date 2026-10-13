@@ -64,6 +64,11 @@ struct FakeSynScanState {
     std::atomic<int> goto_count{0};
     std::atomic<Clock::rep> goto_started{0};
     std::atomic<bool> goto_stopped{false};
+    // The position a precise GOTO landed on; empty until the first one (#1105). With land_on_goto false the mount
+    // never moves, so the driver's landing check fails the slew after one repeat GOTO.
+    std::atomic<bool> land_on_goto{true};
+    std::mutex landed_mutex;
+    std::string landed;
     std::mutex command_mutex;
     std::vector<std::string> commands;
     void record(const std::string& command) {
@@ -102,14 +107,21 @@ alpacacore::test::FakeMountServer::Responder synscan_responder(const std::shared
             case 'e':
             case 'E':
             case 'z':
-            case 'Z':
-                return "12AB0500,20000500#";
+            case 'Z': {
+                std::lock_guard<std::mutex> lock(st->landed_mutex);
+                return st->landed.empty() ? "12AB0500,20000500#" : st->landed;
+            }
             case 'r':
             case 'R':
             case 'b':
             case 'B':
                 if (st->reject_goto.load()) {
                     return "";  // no reply at all: the response timeout fires inside the slew task
+                }
+                if (chunk[0] == 'r' && chunk.size() >= 18 && st->land_on_goto.load()) {
+                    // A precise GOTO lands on its aim, so the landing check after it (#1105) sees an arrival.
+                    std::lock_guard<std::mutex> lock(st->landed_mutex);
+                    st->landed = chunk.substr(1, 17) + "#";
                 }
                 st->goto_started.store(st->now().time_since_epoch().count());
                 st->goto_stopped.store(false);
@@ -391,9 +403,12 @@ TEST_CASE("SynScan PulseGuide - cross-axis pulses keep the RA tracking restore",
     REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
     driver->set_tracking(true);
 
+    const auto started = std::chrono::steady_clock::now();
     driver->pulse_guide(2, 1500);  // East, RA
     driver->pulse_guide(0, 300);   // North, Dec; must not cancel the RA timer
     REQUIRE(wait_until([&] { return !driver->get_is_pulse_guiding(); }, 5000));
+    // The RA pulse ran its whole 1.5 s: a cancelled timer would also end it with T, but early.
+    CHECK(std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(1500));
 
     const auto commands = st->command_snapshot();
     int last_ra = -1;
@@ -407,7 +422,8 @@ TEST_CASE("SynScan PulseGuide - cross-axis pulses keep the RA tracking restore",
         }
     }
     REQUIRE(last_ra >= 0);
-    CHECK(is_zero_rate_command(commands[static_cast<std::size_t>(last_ra)]));
+    // An RA move replaces tracking on the handset and ends with the tracking command, not a stop (#1030).
+    CHECK_FALSE(is_zero_rate_command(commands[static_cast<std::size_t>(last_ra)]));
     CHECK(tracking_restored_after_ra_stop);
     CHECK(driver->get_tracking());
     driver->set_connected(false);
@@ -453,6 +469,7 @@ TEST_CASE("SynScan PulseGuide - guide position does not publish as target", "[sy
 
 TEST_CASE("SynScan async slew - position reports mount feedback after PulseGuide", "[synscan][telescope][async]") {
     auto st = std::make_shared<FakeSynScanState>();
+    st->land_on_goto.store(false);
     alpacacore::test::FakeMountServer server(synscan_responder(st));
     REQUIRE(server.ok());
     auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
@@ -471,7 +488,8 @@ TEST_CASE("SynScan async slew - position reports mount feedback after PulseGuide
     CHECK(position_is_distinct);
     driver->slew_to_coordinates_async(target_ra, target_dec);
     REQUIRE(wait_until([&] { return st->goto_count.load() > 0; }, 5000));
-    REQUIRE(wait_until([&] { return !driver->get_slewing(); }, 12000));
+    // The mount never moves, so the slew ends with the far-miss failure after one repeat GOTO (#1105).
+    REQUIRE(wait_until([&] { return read_slewing(*driver) != SlewingRead::True; }, 30000));
 
     // The fake mount acknowledges the GOTO but stays at its fixed position.
     // Completion must not make the requested target masquerade as readback.
@@ -562,25 +580,30 @@ TEST_CASE("SynScan position - stale cache faults after repeated failed polls and
     driver->set_connected(false);
 }
 
-TEST_CASE("SynScan tracking - mode follows mount geometry and site hemisphere", "[synscan][telescope][tracking]") {
+// SynScan "T" modes (protocol v3.3): 1 = Alt/Az, 2 = equatorial in either hemisphere, 3 = PEC. The handset applies
+// its own site, so a southern site must still send 2; 3 would start PEC playback.
+TEST_CASE("SynScan tracking - mode follows mount geometry, the same in either hemisphere",
+          "[synscan][telescope][tracking]") {
     using alpacacore::vendor::synscan::SynScanAlignmentSetting;
     struct Expected {
         unsigned char model_id;
         SynScanAlignmentSetting setting;
         alpacacore::AlignmentMode alignment;
+        bool south;
         unsigned char tracking_mode;
     };
     for (const auto& expected :
-         {Expected{50, SynScanAlignmentSetting::Auto, alpacacore::AlignmentMode::GermanPolar, 2},
-          Expected{50, SynScanAlignmentSetting::Auto, alpacacore::AlignmentMode::GermanPolar, 3},
-          Expected{128, SynScanAlignmentSetting::Auto, alpacacore::AlignmentMode::AltAz, 1},
+         {Expected{50, SynScanAlignmentSetting::Auto, alpacacore::AlignmentMode::GermanPolar, false, 2},
+          Expected{50, SynScanAlignmentSetting::Auto, alpacacore::AlignmentMode::GermanPolar, true, 2},
+          Expected{128, SynScanAlignmentSetting::Auto, alpacacore::AlignmentMode::AltAz, false, 1},
+          Expected{128, SynScanAlignmentSetting::Auto, alpacacore::AlignmentMode::AltAz, true, 1},
           // #860: the configured geometry decides for an AZ-EQ mount (5 = AZ-EQ6, 6 = AZ-EQ5) ...
-          Expected{5, SynScanAlignmentSetting::Equatorial, alpacacore::AlignmentMode::GermanPolar, 2},
-          Expected{6, SynScanAlignmentSetting::Equatorial, alpacacore::AlignmentMode::GermanPolar, 3},
-          Expected{5, SynScanAlignmentSetting::AltAz, alpacacore::AlignmentMode::AltAz, 1},
+          Expected{5, SynScanAlignmentSetting::Equatorial, alpacacore::AlignmentMode::GermanPolar, false, 2},
+          Expected{6, SynScanAlignmentSetting::Equatorial, alpacacore::AlignmentMode::GermanPolar, true, 2},
+          Expected{5, SynScanAlignmentSetting::AltAz, alpacacore::AlignmentMode::AltAz, false, 1},
           // ... and is ignored for a mount whose geometry the model ID fixes.
-          Expected{50, SynScanAlignmentSetting::AltAz, alpacacore::AlignmentMode::GermanPolar, 2},
-          Expected{128, SynScanAlignmentSetting::Equatorial, alpacacore::AlignmentMode::AltAz, 1}}) {
+          Expected{50, SynScanAlignmentSetting::AltAz, alpacacore::AlignmentMode::GermanPolar, false, 2},
+          Expected{128, SynScanAlignmentSetting::Equatorial, alpacacore::AlignmentMode::AltAz, false, 1}}) {
         auto st = std::make_shared<FakeSynScanState>();
         st->model_id.store(expected.model_id);
         alpacacore::test::FakeMountServer server(synscan_responder(st));
@@ -589,7 +612,7 @@ TEST_CASE("SynScan tracking - mode follows mount geometry and site hemisphere", 
             0, endpoint(server.port()), alpacacore::vendor::synscan::SynScanVersion::V4, std::nullopt, std::nullopt,
             std::nullopt, std::nullopt, expected.setting);
         REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
-        driver->set_site_latitude(expected.tracking_mode == 2 ? 41.3 : -41.3);
+        driver->set_site_latitude(expected.south ? -41.3 : 41.3);
         driver->set_site_longitude(174.8);
         CHECK(driver->get_alignment_mode() == expected.alignment);
         driver->set_tracking(true);

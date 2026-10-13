@@ -1411,6 +1411,7 @@ public:
         }
         std::lock_guard<std::mutex> lock(mutex_);
         image_ready_ = false;
+        exposure_failure_.clear();  // a failure from an already completed exposure
         image_cached_ = false;
         exposure_deadline_valid_ = false;
         // Stream was stopped; force the next exposure to re-init it. Mark the ROI
