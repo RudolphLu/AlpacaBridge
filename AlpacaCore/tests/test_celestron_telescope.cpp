@@ -600,6 +600,9 @@ TEST_CASE("Celestron Telescope Driver - AbortSlew reports a stop it could not se
         log->push_back(command);
         if (command == "L") return std::string("0#");
         if (command == "M") return std::string("#");
+        if (command.size() >= 4 && command[0] == 'P' && static_cast<unsigned char>(command[3]) == 0xFE) {
+            return std::string("\x01\x00#", 3);
+        }
         if (!command.empty() && command[0] == 'P') return std::string(8, '\0') + "#";
         return std::string("00000000,00000000#");
     });
