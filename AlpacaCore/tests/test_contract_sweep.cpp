@@ -56,6 +56,8 @@
 
 #ifdef ALPACACORE_ENABLE_ZWO
 #include <alpacacore/vendor/zwo/zwo_telescope_driver.h>
+
+#include "fake_zwo_sdk.h"
 #endif
 #ifdef ALPACACORE_ENABLE_CELESTRON
 #include <alpacacore/vendor/celestron/celestron_protocol_wrapper.h>
@@ -111,15 +113,16 @@
 #include "fake_touptek_sdk.h"
 #include "locked_touptek_sdk.h"
 #endif
-#ifdef ALPACACORE_ENABLE_PLAYERONE
-#include <alpacacore/vendor/playerone/playerone_camera_driver.h>
-
-#include "fake_playerone_sdk.h"
-#endif
 #ifdef ALPACACORE_ENABLE_SVBONY
 #include <alpacacore/vendor/svbony/svbony_camera_driver.h>
 
 #include "fake_svbony_sdk.h"
+#include "locked_svbony_sdk.h"
+#endif
+#ifdef ALPACACORE_ENABLE_PLAYERONE
+#include <alpacacore/vendor/playerone/playerone_camera_driver.h>
+
+#include "fake_playerone_sdk.h"
 #endif
 #ifdef ALPACACORE_ENABLE_GPHOTO
 #include <alpacacore/vendor/gphoto/gphoto_camera_driver.h>
@@ -800,6 +803,29 @@ Tier2Host tier2_host_zwo_telescope() {
             return zwo::create_zwo_telescope(0, info);
         });
 }
+
+Tier2Host tier2_host_zwo_camera() {
+    Tier2Host h{"zwo_camera", "zwo", "camera", "fake_zwo_sdk.h", DeviceType::Camera, "zwo_camera", {}, true, {}, ""};
+    h.connectable = [](bool hold) {
+        auto sdk = std::make_shared<alpacacore::test::FakeZWOSDK>();
+        if (hold) {
+            sdk->before_call = [](const std::string& name) {
+                if (name == "open_camera") std::this_thread::sleep_for(kHold);
+            };
+        }
+        return host_over(sdk, [](alpacacore::test::FakeZWOSDK& fake) -> std::unique_ptr<AlpacaDriver> {
+            return alpacacore::vendor::zwo::create_zwo_camera(0, fake.camera.camera_id, fake);
+        });
+    };
+    h.failing = []() {
+        auto sdk = std::make_shared<alpacacore::test::FakeZWOSDK>();
+        sdk->fail_open = true;
+        return host_over(sdk, [](alpacacore::test::FakeZWOSDK& fake) -> std::unique_ptr<AlpacaDriver> {
+            return alpacacore::vendor::zwo::create_zwo_camera(0, fake.camera.camera_id, fake);
+        });
+    };
+    return h;
+}
 #endif
 
 #ifdef ALPACACORE_ENABLE_CELESTRON
@@ -1397,7 +1423,7 @@ Tier2Host tier2_host_wandererastro_switch() {
 // with no such probe (invalid_probe_reason_for() in contract_sweep.h states why; the guard case pins it).
 // clang-format off
 #ifdef ALPACACORE_ENABLE_ZWO
-#define CS2_ZWO(X) X(zwo_telescope, TEL)
+#define CS2_ZWO(X) X(zwo_telescope, TEL) X(zwo_camera, NPR)
 #else
 #define CS2_ZWO(X)
 #endif
@@ -1441,15 +1467,15 @@ Tier2Host tier2_host_wandererastro_switch() {
 #else
 #define CS2_TOUPTEK(X)
 #endif
-#ifdef ALPACACORE_ENABLE_PLAYERONE
-#define CS2_PLAYERONE(X) X(playerone_camera, NPR)
-#else
-#define CS2_PLAYERONE(X)
-#endif
 #ifdef ALPACACORE_ENABLE_SVBONY
 #define CS2_SVBONY(X) X(svbony_camera, NPR)
 #else
 #define CS2_SVBONY(X)
+#endif
+#ifdef ALPACACORE_ENABLE_PLAYERONE
+#define CS2_PLAYERONE(X) X(playerone_camera, NPR)
+#else
+#define CS2_PLAYERONE(X)
 #endif
 #ifdef ALPACACORE_ENABLE_GPHOTO
 #define CS2_GPHOTO(X) X(gphoto_camera, NPR)
@@ -1471,8 +1497,8 @@ Tier2Host tier2_host_wandererastro_switch() {
     CS2_GEMINI(X) \
     CS2_QHY(X) \
     CS2_TOUPTEK(X) \
-    CS2_PLAYERONE(X) \
     CS2_SVBONY(X) \
+    CS2_PLAYERONE(X) \
     CS2_GPHOTO(X) \
     CS2_WANDERERASTRO(X)
 // clang-format on
@@ -1574,11 +1600,11 @@ TEST_CASE("Contract sweep tier 2 - hosts match kFakeConnectableRoster", "[contra
 #ifdef ALPACACORE_ENABLE_TOUPTEK
     CS2_ENABLED("touptek")
 #endif
-#ifdef ALPACACORE_ENABLE_PLAYERONE
-    CS2_ENABLED("playerone")
-#endif
 #ifdef ALPACACORE_ENABLE_SVBONY
     CS2_ENABLED("svbony")
+#endif
+#ifdef ALPACACORE_ENABLE_PLAYERONE
+    CS2_ENABLED("playerone")
 #endif
 #ifdef ALPACACORE_ENABLE_GPHOTO
     CS2_ENABLED("gphoto")
@@ -1687,8 +1713,9 @@ TEST_CASE("Contract sweep - every available catalog descriptor has a registry en
 // The reverse direction, which the gate's ORPHAN ENTRY rule no longer covers for catalog vendors: a
 // registry entry whose vendor has descriptors or factories names one of them. A vendor counts by its
 // factories too, so dropping its whole schema registration leaves its entries checked, not skipped.
-// No vendor builds some device types through the catalog and others through a router arm today; one
-// that does lists its router pairs here.
+// A vendor that builds some device types through the catalog and others through a router arm lists its
+// router pairs in `router_pairs` below. ZWO's camera stays a router arm until its catalog slice lands,
+// which removes the entry.
 TEST_CASE("Contract sweep - every registry entry of a catalog vendor has a descriptor",
           "[contract][contract-sweep-guard]") {
     alpacacore::catalog::DeviceCatalog catalog;
@@ -1700,8 +1727,10 @@ TEST_CASE("Contract sweep - every registry entry of a catalog vendor has a descr
         catalog_vendors.insert(v.key.vendor);
     }
     for (const auto& k : catalog.factory_keys()) catalog_vendors.insert(k.vendor);
+    const std::set<CatalogPair> router_pairs = {{"zwo", "camera"}};
     for (const auto& e : alpacacore::test::contract::contract_entries()) {
         if (catalog_vendors.count(e.vendor) == 0) continue;
+        if (router_pairs.count({e.vendor, e.device_type}) == 1) continue;
         INFO(e.id << " is in the registry but the catalog has no " << e.vendor << "/" << e.device_type
                   << " descriptor");
         CHECK(described.count({e.vendor, e.device_type}) == 1);

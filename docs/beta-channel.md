@@ -32,12 +32,32 @@ file with `sha256sum -c alpacabridge_X.Y.Z-beta.N_arm64.deb.sha256`, then run
 `sudo apt install ./alpacabridge_X.Y.Z-beta.N_arm64.deb`. apt does not offer the next beta to a
 build installed this way; repeat the download for each beta, or opt in as above.
 
+To check the file was built by this repository's release workflow from the beta's tag, and not
+just that it matches its `.sha256`, run on any machine with the GitHub CLI signed in:
+`gh attestation verify alpacabridge_X.Y.Z-beta.N_arm64.deb --repo open-astro/AlpacaBridge`.
+The same works for a nightly `.deb`. Each attestation, and the SBOM attached to it, is also
+listed under the repository's Actions > Attestations.
+
 **Opt out** by removing `beta` from the apt line and restoring the default
 `update_packages_url`. apt does not downgrade on its own, so a user who leaves mid-beta stays
 on the beta build until the stable release overtakes it.
 
 Every stable release is published to both `main` and `beta`, so the beta index always holds the
 newest build of either kind.
+
+## Nightly builds
+
+`.github/workflows/nightly-build.yml` builds `main` every night (03:17 UTC, skipped when `main` has not
+moved) and replaces the assets of the `nightly-build` pre-release on GitHub, whose tag moves to the built
+commit. A nightly is unreleased, unvalidated code for trying a merged fix before a beta carries it;
+it is never published to apt. Install it the way a beta is installed by hand above: download the
+`.deb` and its `.sha256` from the `nightly-build` release, check the sum, `sudo apt install ./<file>`.
+
+Its version is `<next>~nightly<YYYYMMDDHHMM>.g<sha7>`, where `<next>` is what
+`changelog_fragments.py --bump` prints on `main`, so `5.0.0~beta2 < 5.0.0~nightly202610120317.gabc1234 < 5.0.0`:
+apt upgrades a nightly to the release when it ships. It also sorts above every beta of that
+version, so apt offers a tester on a nightly no later beta; install the next one by hand. A maintainer can force a build with
+`gh workflow run nightly-build.yml --repo open-astro/AlpacaBridge -f force=true`.
 
 ## Branch model
 
@@ -121,6 +141,11 @@ newest build of either kind.
   A PR that misses the bar is retargeted with `gh pr edit --base main` before review, not
   reviewed on the branch.
 - Fixes land on the stable branch and reach `main` through the merge down. No cherry-picks.
+- GitHub closes `Closes #N` issues only for a PR merged into `main`, so a merged PR into `stable/**`
+  closes its issues through `.github/workflows/close-linked-issues.yml` (`scripts/close_linked_issues.py`):
+  every issue of this repository named with a closing keyword (`Closes`, `Fixes`, `Resolves` and their
+  other forms) in the PR body is closed as completed with a comment naming the PR and merge commit.
+  `Refs #N`, other repositories and pull-request numbers are ignored.
 - Fix PRs target `stable/X.Y` (`/submit-pr --base stable/X.Y`), run the same CI and review bot, and
   each adds its `changelog.d/` fragment as usual; the fragment travels to `main` in the merge down
   and is consumed at promotion.

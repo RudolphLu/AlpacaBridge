@@ -23,6 +23,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <thread>
 
 namespace alpacacore::vendor::skywatcher {
 
@@ -119,6 +120,24 @@ std::unique_ptr<TelescopeDriver> create_skywatcher_telescope(
     std::unique_ptr<SkyWatcherProtocolWrapper> protocol = {}, util::MotionLimits motion_limits = {},
     util::TaskClock& clock = util::default_task_clock(),
     DecAxisSenseSetting dec_axis_sense = DecAxisSenseSetting::Auto);
+
+/// Test seam: replaces the thread factory of the driver's slew slot, so a case
+/// can hold a new body's thread back until a replaced body has finished its
+/// tail. Call only while no start is in flight. `driver` must come from the
+/// factories above; anything else is ignored.
+void set_slew_spawn_for_testing(TelescopeDriver& driver, std::function<std::thread(std::function<void()>)> spawn);
+
+/// Test seam: while paused the driver's status poll (decision 0010) wakes and
+/// samples nothing, so a case can age the snapshot's frame on the task clock
+/// without the board going quiet. `driver` must come from the factories above;
+/// anything else is ignored.
+void set_status_poll_paused_for_testing(TelescopeDriver& driver, bool paused);
+
+/// Test seam: `hook` runs on the poll thread between a poll's sample and its
+/// publish, with no driver lock held, so a case can land a client write in that
+/// window. Pass an empty function to clear it, and release anything the hook
+/// blocks on before the driver is destroyed.
+void set_status_poll_after_sample_hook_for_testing(TelescopeDriver& driver, std::function<void()> hook);
 
 /// Endpoint resolved at connect time by `connection_resolver` (#659); the
 /// auto-detect factory below wraps it, tests inject a fake's endpoint.

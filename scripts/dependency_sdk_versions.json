@@ -1,0 +1,27 @@
+{
+  "_comment": "Hand-kept inventory of AlpacaCore/external/ for scripts/dependency_snapshot.py. 'sdks': one entry per vendored package (path, name, version, source of the version; version null = none exists in the tree, so the purl carries none; sha256 = digest of the git-tracked files under path, written by `dependency_snapshot.py --pin`). 'doc_only': directories that hold protocol documents, udev rules or other non-package files. Update this file when a directory under AlpacaCore/external/ is added, removed or its SDK is bumped (then run --pin; --check fails until you do) (docs/development.md, 'Dependency graph').",
+  "sdks": [
+    {"path": "AlpacaCore/external/PlayerOne/PlayerOne_Camera_SDK_Linux_V3.10.0", "name": "playerone-camera-sdk", "version": "3.10.0", "source": "directory name", "sha256": "33e27a62b3c9dbe84df02954674275cea37aa2b60db2776794feb1fc7554be62"},
+    {"path": "AlpacaCore/external/PlayerOne/PlayerOne_FilterWheel_SDK_Linux_V1.2.3", "name": "playerone-filterwheel-sdk", "version": "1.2.3", "source": "directory name", "sha256": "2328aa18487261be2ded9893151506201b5d8fa6713448679cee7a26d04efc4b"},
+    {"path": "AlpacaCore/external/QHY/sdk_linux_arm64_26.06.04", "name": "qhy-sdk", "version": "26.06.04", "source": "directory name", "sha256": "fe4bceb20aebce017b22bbffe10ec218c375b8183797aa8d04b67a1f7a5ad893"},
+    {"path": "AlpacaCore/external/ToupTek/toupcamsdk.20260128", "name": "toupcam-sdk", "version": "20260128", "source": "directory name", "sha256": "af3a667685eba5bd7ccf32983d68889f4ed4f354197c01dce82b0ac4b7953408"},
+    {"path": "AlpacaCore/external/ZWO/ASI_Camera_SDK", "name": "zwo-asi-camera-sdk", "version": "1.40", "source": "ASI_Camera_SDK/README.md, static libASICamera2.a 1.40; the shipped libASICamera2.so is 1.41", "sha256": "58069059279c518519ec2f6fa3aa9c719929a9173519ea8ef6d2bc72899edcf1"},
+    {"path": "AlpacaCore/external/ZWO/EAF", "name": "zwo-eaf-sdk", "version": "1.7.7", "source": "lib/armv8/libEAFFocuser.so.1.7.7", "sha256": "0a347c24b7d3e1d9ec20fc14556c862d911e178e72293dab372a4a78350839da"},
+    {"path": "AlpacaCore/external/ZWO/EFW", "name": "zwo-efw-sdk", "version": "1.8.4", "source": "lib/armv8/libEFWFilter.so.1.8.4", "sha256": "8c9848a1e154dc4b3329f797a2de31db7055bd423bcfa22aca6b55865d5f4443"},
+    {"path": "AlpacaCore/external/ZWO/CAA", "name": "zwo-caa-sdk", "version": "1.5.9", "source": "lib/armv8/libCAA.so.1.5.9", "sha256": "5f4b12464a5da3d01206789f41931dd702a58133060bfc0c8e64a1797c4fcdfe"},
+    {"path": "AlpacaCore/external/SVBONY", "name": "svbony-camera-sdk", "version": "1.13.4", "source": "readme.txt, newest changelog entry", "sha256": "6152b8186aadb2aad5936ecb021813d1f02c7f99a6d8d4437693b5ffa8dde0cf"},
+    {"path": "AlpacaCore/external/libgpiod", "name": "libgpiod", "version": "2.2.4", "source": "libgpiod-2.2.4.tar.xz", "sha256": "68d08b96e79407fb1bad5e28ccea524c61e281c67a2785d5a8d7d4148bc3fd30"}
+  ],
+  "doc_only": [
+    "AlpacaCore/external/Bisque",
+    "AlpacaCore/external/Celestron",
+    "AlpacaCore/external/Gemini",
+    "AlpacaCore/external/Losmandy",
+    "AlpacaCore/external/SynScan",
+    "AlpacaCore/external/WandererAstro",
+    "AlpacaCore/external/iOptron",
+    "AlpacaCore/external/oasisastro",
+    "AlpacaCore/external/ZWO/AM",
+    "AlpacaCore/external/ZWO/asiair-plus"
+  ]
+}

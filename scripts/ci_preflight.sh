@@ -365,7 +365,9 @@ if python3 scripts/check_docs_drift.py --self-test && python3 scripts/check_docs
    && python3 scripts/changelog_fragments.py --check \
    && python3 scripts/changelog_to_deb.py --self-test \
    && python3 scripts/release_tag.py --self-test \
-   && python3 scripts/merge_down.py --self-test; then
+   && python3 scripts/merge_down.py --self-test \
+   && python3 scripts/dependency_snapshot.py --self-test \
+   && python3 scripts/dependency_snapshot.py --check; then
   record PASS "docs drift check"
 else
   record FAIL "docs drift check"
@@ -401,6 +403,14 @@ fi
 # --- gate 3: build + unit tests, vendor-neutral ----------------------------
 
 section "Build + tests (vendors OFF)"
+# Catch2 probe (issue #593): without it AlpacaCore/tests/CMakeLists.txt returns
+# early and ctest can only say "No tests were found", so name the cause here.
+if ! compgen -G "/usr/lib/cmake/Catch2" >/dev/null \
+   && ! compgen -G "/usr/lib/*/cmake/Catch2" >/dev/null \
+   && ! compgen -G "/usr/local/lib/cmake/Catch2" >/dev/null \
+   && ! compgen -G "/usr/share/cmake/Catch2" >/dev/null; then
+  echo "Catch2 not found: install catch2 (apt) or the AlpacaCore tests will not configure"
+fi
 if ALPACACORE_ENABLE_ALL_VENDORS=OFF ./run_all_tests.sh; then
   record PASS "build+test (vendors OFF)"
 else
@@ -446,6 +456,7 @@ elif ensure_tool clang-tidy clang-tidy; then
   cmake -S AlpacaHTTP -B AlpacaHTTP/build \
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
     -DALPACAHTTP_BUILD_TESTS=ON \
+    -DALPACACORE_BUILD_TESTS=ON \
     -DALPACACORE_ENABLE_ALL_VENDORS=ON >/dev/null
   cmake --build AlpacaHTTP/build --parallel "${PARALLEL}" >/dev/null
   tidy_diff="$(dpkg -L clang-tidy 2>/dev/null | grep -m1 -E 'clang-tidy-diff.*\.py' || true)"
