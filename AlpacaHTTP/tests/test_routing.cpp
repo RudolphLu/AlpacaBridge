@@ -2593,6 +2593,14 @@ int main() {
         EXPECT(integral_float.listed);
         EXPECT(integral_float.config.contains("cameraIndex"));
         EXPECT(integral_float.config.at("cameraIndex").get<double>() == 0.0);
+        const auto inapplicable_default = persisted_attempt({{"vendor", "zwo"},
+                                                             {"deviceType", "switch"},
+                                                             {"deviceNumber", device_number + 1},
+                                                             {"switchType", "asiair"},
+                                                             {"cameraIndex", -1}},
+                                                            "Switch");
+        EXPECT(inapplicable_default.listed);
+        EXPECT(inapplicable_default.config.value("cameraIndex", 0) == -1);
 
         const ScopedCwd scratch;
         const std::filesystem::path persisted_file = std::filesystem::path("config") / "registered_devices.json";

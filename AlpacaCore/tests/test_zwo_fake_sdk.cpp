@@ -270,6 +270,9 @@ TEST_CASE("ZWO fake SDK - overlapping start is rejected without replacing the ac
         std::unique_lock lock(gate_mutex);
         trigger_held = gate_cv.wait_for(lock, std::chrono::seconds(2), [&] { return start_entered; });
     }
+    std::atomic<bool> ready_during_start{true};
+    const int ready_start_code =
+        trigger_held ? error_code([&] { ready_during_start.store(camera->get_image_ready()); }) : 0;
     {
         std::lock_guard lock(gate_mutex);
         release_readback = true;
@@ -294,6 +297,92 @@ TEST_CASE("ZWO fake SDK - overlapping start is rejected without replacing the ac
     CHECK(array_rejected_before_start_finished);
     CHECK(array_code.load() == AlpacaError::InvalidOperation);
     CHECK(data_calls_before_release == 0);
+    CHECK(start_code.load() == -1);
+    if (trigger_held) {
+        CHECK(ready_start_code == -1);
+        CHECK_FALSE(ready_during_start.load());
+    }
+}
+
+TEST_CASE("ZWO fake SDK - a status poll cannot publish ready during a new exposure start", "[zwo][camera][unit]") {
+    FakeZWOSDK sdk;
+    sdk.auto_complete_exposure = false;
+    auto camera = create_zwo_camera(0, sdk.camera.camera_id, sdk);
+    connect_camera(*camera);
+    camera->start_exposure(0.001, true);
+    sdk.set_exposure_status(FakeZWOSDK::ExposureStatus::Success);
+
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    bool poll_entered = false;
+    bool release_poll = false;
+    bool start_entered = false;
+    bool release_start = false;
+    std::atomic<int> status_calls{0};
+    sdk.before_call = [&](const std::string& name) {
+        if (name == "get_exposure_status" && status_calls.fetch_add(1) == 0) {
+            std::unique_lock lock(gate_mutex);
+            poll_entered = true;
+            gate_cv.notify_all();
+            gate_cv.wait(lock, [&] { return release_poll; });
+        } else if (name == "start_exposure") {
+            std::unique_lock lock(gate_mutex);
+            start_entered = true;
+            gate_cv.notify_all();
+            gate_cv.wait(lock, [&] { return release_start; });
+        }
+    };
+
+    std::atomic<int> ready_code{0};
+    std::atomic<bool> ready_value{true};
+    std::atomic<bool> ready_done{false};
+    std::thread poller([&] {
+        ready_code.store(error_code([&] { ready_value.store(camera->get_image_ready()); }));
+        ready_done.store(true);
+    });
+    bool poll_held = false;
+    {
+        std::unique_lock lock(gate_mutex);
+        poll_held = gate_cv.wait_for(lock, std::chrono::seconds(2), [&] { return poll_entered; });
+    }
+
+    std::atomic<int> start_code{0};
+    std::thread starter;
+    bool trigger_held = false;
+    if (poll_held) {
+        starter = std::thread([&] { start_code.store(error_code([&] { camera->start_exposure(0.002, true); })); });
+        std::unique_lock lock(gate_mutex);
+        trigger_held = gate_cv.wait_for(lock, std::chrono::seconds(2), [&] { return start_entered; });
+    }
+
+    std::atomic<bool> ready_during_start{true};
+    const int immediate_ready_code =
+        trigger_held ? error_code([&] { ready_during_start.store(camera->get_image_ready()); }) : 0;
+    {
+        std::lock_guard lock(gate_mutex);
+        release_poll = true;
+    }
+    gate_cv.notify_all();
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (poll_held && trigger_held && !ready_done.load() && std::chrono::steady_clock::now() < ready_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool poll_finished_during_start = ready_done.load() && !release_start;
+    {
+        std::lock_guard lock(gate_mutex);
+        release_start = true;
+    }
+    gate_cv.notify_all();
+    poller.join();
+    if (starter.joinable()) starter.join();
+
+    CHECK(poll_held);
+    CHECK(trigger_held);
+    CHECK(poll_finished_during_start);
+    CHECK(ready_code.load() == -1);
+    CHECK_FALSE(ready_value.load());
+    CHECK(immediate_ready_code == -1);
+    CHECK_FALSE(ready_during_start.load());
     CHECK(start_code.load() == -1);
 }
 
@@ -582,7 +671,7 @@ TEST_CASE("ZWO fake SDK - mismatched ROI metadata cannot publish ready", "[zwo][
     CHECK(camera->get_image_array().data.front() == 1);
 }
 
-TEST_CASE("ZWO fake SDK - abort invalidates an in-flight lazy download", "[zwo][camera][unit]") {
+TEST_CASE("ZWO fake SDK - abort rejects an in-flight lazy download", "[zwo][camera][unit]") {
     FakeZWOSDK sdk;
     sdk.frame_bytes = make_raw16_frame(16, 8);
     auto camera = create_zwo_camera(0, sdk.camera.camera_id, sdk);
@@ -593,15 +682,17 @@ TEST_CASE("ZWO fake SDK - abort invalidates an in-flight lazy download", "[zwo][
     std::atomic<int> result{-1};
     std::thread download([&] { result.store(error_code([&] { static_cast<void>(camera->get_image_array()); })); });
     const bool download_started = sdk.wait_for_download(std::chrono::seconds(2));
-    camera->abort_exposure();
+    const int abort_code = error_code([&] { camera->abort_exposure(); });
     const int stop_calls = sdk.call_count("stop_exposure");
     sdk.release_download();
     download.join();
 
     CHECK(download_started);
-    CHECK(stop_calls > 0);
-    CHECK(result.load() == AlpacaError::InvalidOperation);
-    CHECK_FALSE(camera->get_image_ready());
+    CHECK(abort_code == AlpacaError::InvalidOperation);
+    CHECK(stop_calls == 0);
+    CHECK(result.load() == -1);
+    CHECK(camera->get_image_ready());
+    CHECK(camera->get_image_array().data.front() == 1);
     CHECK(sdk.call_count("get_data_after_exposure") == 1);
 
     camera->start_exposure(0.001, true);

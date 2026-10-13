@@ -620,7 +620,7 @@ public:
                 throw AlpacaException("Camera not connected", AlpacaError::NotConnected);
             }
             if (exposure_starting_) {
-                throw AlpacaException("Exposure start is in progress", AlpacaError::InvalidOperation);
+                return false;
             }
             if (!image_failure_.empty()) throw_image_failure_locked();
             if (!last_exposure_valid_ || !exposure_frame_.has_value()) {
@@ -638,6 +638,9 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (!connected_.load()) {
             throw AlpacaException("Camera not connected", AlpacaError::NotConnected);
+        }
+        if (exposure_starting_) {
+            return false;
         }
         if (!last_exposure_valid_ || exposure_seq_ != poll_seq) {
             // A stop/abort or disconnect raced the unlocked poll — do not
@@ -862,7 +865,7 @@ public:
         throw AlpacaException("Sub-exposure duration not supported", AlpacaError::NotImplemented);
     }
 
-    void abort_exposure() override { stop_exposure_impl(); }
+    void abort_exposure() override { stop_exposure_impl(true); }
 
     void pulse_guide(int direction, int duration) override {
         ensure_connected();
@@ -1025,10 +1028,10 @@ public:
         exposure_starting_ = false;
     }
 
-    void stop_exposure() override { stop_exposure_impl(); }
+    void stop_exposure() override { stop_exposure_impl(false); }
 
 private:
-    void stop_exposure_impl() {
+    void stop_exposure_impl(bool abort) {
         ensure_connected();
         // Serialize against start_exposure and an in-flight retry burst, so
         // a stop can never land between a retry's decide and its re-trigger
@@ -1045,10 +1048,18 @@ private:
             if (!camera_id_.has_value()) {
                 throw AlpacaException("Camera ID not set", AlpacaError::NotConnected);
             }
-            if (image_failure_.empty() &&
-                (image_cached_ || image_ready_ || !last_exposure_valid_ || !exposure_frame_.has_value())) {
-                return;
+            if (image_failure_.empty()) {
+                if (image_cached_ || !last_exposure_valid_ || !exposure_frame_.has_value()) return;
             }
+            std::unique_lock<std::mutex> image_lock(image_operation_mutex_, std::try_to_lock);
+            if (!image_lock.owns_lock()) {
+                if (abort) {
+                    throw AlpacaException("Cannot abort while image download is in progress",
+                                          AlpacaError::InvalidOperation);
+                }
+                return;  // StopExposure is ignored once readout is in progress.
+            }
+            if (image_failure_.empty() && image_ready_) return;  // no exposure is in progress
             stop_id = camera_id_.value();
             // The stop is authoritative for this exposure regardless of how
             // the SDK call below fares: retries are cancelled and pending
