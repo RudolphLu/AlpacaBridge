@@ -102,12 +102,21 @@ jobs:
       - name: Keep the findings in the .deb's own dependencies
         # Base-system packages and the C/C++ runtime (glibc, gcc) are dropped,
         # and so is anything Debian rates unimportant: none of it is actionable
-        # here. The full result stays in this run as osv-all.sarif.
+        # here. The full result is kept as the run's osv-full-results artifact.
         run: |
           set -o pipefail
           python3 scripts/dependency_updates.py --filter-sarif osv-all.sarif --report osv-all.json \
             --direct-depends direct-depends.txt --direct-sources direct-sources.txt --output osv.sarif \
             | tee -a "${GITHUB_STEP_SUMMARY}"
+
+      - name: Keep the full unfiltered result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: osv-full-results
+          path: |
+            osv-all.sarif
+            osv-all.json
+          retention-days: 14
 
       - name: Upload to code scanning
         uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2  # v4.38.2

@@ -54,6 +54,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -603,7 +604,13 @@ def direct_sources(depends: str, sources: str) -> set[str]:
         parts = line.split()
         if len(parts) >= 2:
             to_source[parts[0].split(":")[0]] = parts[1]
-    found = {to_source.get(name, name) for name, _ in snapshot.parse_relations(depends)}
+    names = set()
+    for group in depends.replace("\n", " ").split(","):
+        for alt in group.split("|"):  # every alternative: the image may have installed any of them
+            m = re.match(r"\s*([a-z0-9][a-z0-9+.\-]*)", alt)
+            if m:
+                names.add(m.group(1))
+    found = {to_source.get(name, name) for name in names}
     return {src for src in found if not is_toolchain_runtime(src)}
 
 
@@ -614,7 +621,11 @@ def is_toolchain_runtime(source: str) -> bool:
 
 
 def osv_unimportant(report: dict, vid: str, name: str) -> bool:
-    """True when the report's record of ``vid`` has Debian rate it "unimportant" for ``name``."""
+    """True when the report's record of ``vid`` has Debian rate it "unimportant" for ``name``.
+
+    The first record of the ID is enough: a Debian advisory (DEBIAN-CVE-*, DSA, DLA) is the same
+    record wherever the report repeats it, with one affected entry per source package and release.
+    """
     for res in report.get("results") or []:
         for p in res.get("packages") or []:
             for v in p.get("vulnerabilities") or []:
@@ -643,6 +654,12 @@ def filter_sarif(sarif: dict, report: dict, direct: set[str]) -> dict:
                 kept.append(r)
         run["results"] = kept
     return out
+
+
+def sarif_unreadable(sarif: dict) -> tuple[int, int]:
+    """(results, results whose message SARIF_PACKAGE_RE cannot read)."""
+    results = [r for run in sarif.get("runs") or [] for r in run.get("results") or []]
+    return len(results), sum(1 for r in results if not SARIF_PACKAGE_RE.search((r.get("message") or {}).get("text", "")))
 
 
 def osv_findings(report: dict, direct: set[str] | None = None) -> list[dict]:
@@ -696,8 +713,10 @@ def osv_summary(report: dict, issues, all_issues: list[dict], repo: str, direct:
             f"| CVSS | Package | Fixed in | Advisories |\n|---|---|---|---|\n"
             f"{rows}\n\n"
             + (f"{rest} more are not listed here; the next scan opens an issue for them.\n\n" if rest > 0 else "")
-            + f"Findings with no trixie fix, rated unimportant by Debian, or below High are listed only under "
-            f"https://github.com/{repo}/security/code-scanning (tool `osv-scanner`). A fixed version reaches users "
+            + f"Findings below High or with no trixie fix yet are listed only under "
+            f"https://github.com/{repo}/security/code-scanning (tool `osv-scanner`). Base-system packages, the "
+            "C/C++ runtime and findings Debian rates unimportant are left out of both; they are only in the "
+            "scan run's `osv-full-results` artifact. A fixed version reaches users "
             "through `apt upgrade`; act here when AlpacaBridge should require it (a higher minimum version in "
             "`Depends`) or when a build or test image still carries the affected version.\n\n"
             "Opened by `.github/workflows/osv-scan.yml`.\n")
@@ -954,6 +973,37 @@ def self_test() -> int:
                      "Package 'libgphoto2@1.0' is vulnerable to 'DEBIAN-CVE-2026-11'."], texts
     assert len(kept["runs"][0]["tool"]["driver"]["rules"]) == 5, "rules stay: results refer to them by index"
     assert len(sarif["runs"][0]["results"]) == 5, "the input SARIF is not modified"
+    # Every alternative of an "a | b" dependency counts: the image may have installed either.
+    assert direct_sources("libcurl4t64 | libcurl3t64-gnutls, adduser",
+                          "libcurl4t64 curl\nlibcurl3t64-gnutls curl-gnutls\n") == {"curl", "curl-gnutls", "adduser"}
+    # The --filter-sarif CLI: scoped output written; and if osv-scanner's SARIF wording changes so no
+    # result can be read, it fails loudly instead of uploading an empty, quiet code-scanning result.
+    with tempfile.TemporaryDirectory() as tmp:
+        t = Path(tmp)
+        (t / "deps").write_text(depends)
+        (t / "src").write_text(sources_txt)
+        (t / "report.json").write_text(json.dumps(sarif_report))
+        (t / "in.sarif").write_text(json.dumps(sarif))
+        args = ["--filter-sarif", str(t / "in.sarif"), "--report", str(t / "report.json"), "--output",
+                str(t / "out.sarif"), "--direct-depends", str(t / "deps"), "--direct-sources", str(t / "src")]
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert main(args) == 0
+        assert len(json.loads((t / "out.sarif").read_text())["runs"][0]["results"]) == 2
+        reworded = json.loads(json.dumps(sarif))
+        for r in reworded["runs"][0]["results"]:
+            r["message"]["text"] = r["message"]["text"].replace("is vulnerable to", "has advisory")
+        (t / "in.sarif").write_text(json.dumps(reworded))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            assert main(args) == 1
+        assert "message format" in err.getvalue(), err.getvalue()
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                main(["--filter-sarif", str(t / "in.sarif")])
+        except SystemExit as e:
+            assert e.code == 2, "--filter-sarif without --report/--output/--direct-* is a usage error"
+        else:
+            raise AssertionError("--filter-sarif alone must be refused")
     # A marker from the first summary format (kind "osv", #1135) does not suppress a finding.
     g = Fake()
     g.issues.append({"number": 1, "title": "old", "state": "CLOSED",
@@ -1186,7 +1236,7 @@ def self_test() -> int:
     return 0
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
@@ -1196,7 +1246,7 @@ def main() -> int:
     ap.add_argument("--output", metavar="FILE", help="filtered SARIF, for --filter-sarif")
     ap.add_argument("--direct-depends", metavar="FILE", help="the .deb's Depends field (dpkg-deb -f DEB Depends)")
     ap.add_argument("--direct-sources", metavar="FILE", help="'binary source' lines from dpkg-query in the image")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
     direct = None
@@ -1208,6 +1258,12 @@ def main() -> int:
             ap.error("--filter-sarif needs --report, --output, --direct-depends and --direct-sources")
         sarif = json.loads(Path(a.filter_sarif).read_text(encoding="utf-8"))
         report = json.loads(Path(a.report).read_text(encoding="utf-8"))
+        total, unreadable = sarif_unreadable(sarif)
+        if total and unreadable == total:
+            print(f"error: none of the {total} SARIF results matches the expected message format "
+                  f"({SARIF_PACKAGE_RE.pattern!r}); has osv-scanner changed it? Not uploading an empty result.",
+                  file=sys.stderr)
+            return 1
         out = filter_sarif(sarif, report, direct)
         Path(a.output).write_text(json.dumps(out), encoding="utf-8")
         before = sum(len(r.get("results") or []) for r in sarif.get("runs") or [])
