@@ -57,8 +57,10 @@ constexpr double kSiderealDegPerSec = 15.0411 / 3600.0;
 // +/-10" in Dec per GOTO, up to 20", open-astro#1027) is not something another pass can remove, and failing the
 // slew there turned a plate-solvable 15" landing into an error.
 constexpr double kLandingToleranceArcsec = 3.0;
-// A readback this far from the target is not a landing error a fine re-GOTO corrects (a refused or limit-stopped
-// GOTO, a mount that never moved): it is left as it was before refinement existed and logged, not chased.
+// A readback this far from the target is not a landing error a fine re-GOTO corrects. The handset sometimes ends a
+// GOTO ~49' east of the aim (EQM-35 Pro, HC 06.03.00, open-astro#1105) and a repeat GOTO to the same target lands, so
+// the GOTO is repeated once unchanged; a second miss this large (a refused or limit-stopped GOTO, a mount that never
+// moved) fails the slew.
 constexpr double kLandingRefineLimitArcsec = 600.0;
 // How long a refinement GOTO forces Slewing true while the handset starts moving (the first GOTO uses 8 s).
 constexpr auto kRefineStartForce = std::chrono::seconds(2);
@@ -2590,9 +2592,10 @@ private:
     // off by more than kLandingToleranceArcsec, finish the landing with timed guide-rate moves, at most
     // kMaxLandingRounds rounds (open-astro#880). The handset re-rolls every GOTO landing by a whole second of RA,
     // so a residual is never chased with another GOTO; only one beyond a timed move's reach gets a single re-GOTO
-    // first. 16-bit handsets (V3) step ~19.8" in RA, so they are not refined. `lock` is held on entry and on
-    // return. Returns false when the slew was superseded, aborted or cancelled; throws when a move fails. A
-    // residual left after the last round is logged as a WARN, not thrown (open-astro#1027).
+    // first. A landing beyond kLandingRefineLimitArcsec gets one repeat GOTO to the same target, and throws if it
+    // misses that far again (open-astro#1105). 16-bit handsets (V3) step ~19.8" in RA, so they are not refined.
+    // `lock` is held on entry and on return. Returns false when the slew was superseded, aborted or cancelled; throws
+    // when a move fails. A residual left after the last round is logged as a WARN, not thrown (open-astro#1027).
     bool refine_goto_landing_locked(std::unique_lock<std::mutex>& lock, double ra, double dec,
                                     uint64_t owner_generation, bool async_task) {
         if (!use_precise_commands_) {
@@ -2603,6 +2606,7 @@ private:
         const double nudge_reach_arcsec = kNudgeMaxSeconds * std::min(guide_rate_.ra, guide_rate_.dec) * 3600.0;
         const bool timed_finish = equatorial_geometry_locked();
         bool regoto_done = false;
+        bool far_miss_repeated = false;
         for (int round = 0;; ++round) {
             if (motion_generation_ != owner_generation || (cancel != nullptr && cancel->load())) {
                 return false;
@@ -2628,10 +2632,25 @@ private:
                 return true;
             }
             if (ra_error_arcsec > kLandingRefineLimitArcsec || dec_error_arcsec > kLandingRefineLimitArcsec) {
-                ALPACA_LOG_WARN("SynScan", "GOTO ended " + std::to_string(ra_error_arcsec) + " arcsec (RA) and " +
-                                               std::to_string(dec_error_arcsec) +
-                                               " arcsec (Dec) from the target; too far for a landing refinement");
-                return true;
+                const std::string miss = "GOTO ended " + std::to_string(ra_error_arcsec) + " arcsec (RA) and " +
+                                         std::to_string(dec_error_arcsec) + " arcsec (Dec) from the target";
+                if (far_miss_repeated) {
+                    throw AlpacaException(miss + " after a repeat GOTO", AlpacaError::DriverException);
+                }
+                ALPACA_LOG_WARN("SynScan", miss + "; repeating the GOTO once (open-astro#1105)");
+                // The same target, not one aimed by the residual: the miss is the handset's, not an offset to
+                // correct, and an aim moved by 49' would land 49' the other way.
+                far_miss_repeated = true;
+                equatorial_cache_valid_ = false;
+                altaz_cache_valid_ = false;
+                guide_position_valid_ = false;
+                slewing_cached_ = true;
+                slew_force_until_ = std::chrono::steady_clock::now() + kRefineStartForce;
+                protocol.goto_ra_dec_raw(encode_ra_raw(ra, 24), encode_angle(dec, 24), true);
+                if (!wait_for_slew_complete(lock, owner_generation, false, cancel)) {
+                    return false;
+                }
+                continue;
             }
             if (round >= kMaxLandingRounds) {
                 ALPACA_LOG_WARN("SynScan", "SynScan GOTO landed " + std::to_string(ra_error_arcsec) +
