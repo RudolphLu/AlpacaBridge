@@ -189,7 +189,7 @@ TEST_CASE("SkyWatcher async - AbortSlew's own cancellation is not reported as a 
     driver->set_connected(false);
 }
 
-TEST_CASE("SkyWatcher async - Park dispatch failure persists through Slewing and AtPark",
+TEST_CASE("SkyWatcher async - Park dispatch failure surfaces through Slewing and leaves AtPark false",
           "[skywatcher][async][parkfailure]") {
     alpacacore::test::FakeTaskClock clock;
     FakeSkyWatcherMount mount(alpacacore::test::FakeMountProfile::wave_100i(), clock);
@@ -215,7 +215,7 @@ TEST_CASE("SkyWatcher async - Park dispatch failure persists through Slewing and
     driver->set_connected(false);
 }
 
-TEST_CASE("SkyWatcher async - AutoHome failure persists through Slewing and AtHome",
+TEST_CASE("SkyWatcher async - AutoHome failure surfaces through Slewing and leaves AtHome false",
           "[skywatcher][async][homefailure]") {
     alpacacore::test::FakeTaskClock clock;
     FakeSkyWatcherMount mount(alpacacore::test::FakeMountProfile::wave_100i(), clock);

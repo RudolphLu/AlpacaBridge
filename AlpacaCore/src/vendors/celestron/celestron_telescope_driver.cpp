@@ -1221,10 +1221,10 @@ public:
         last_home_error_.clear();
     }
 
-    // Park task failure path: stop the hardware so the reported idle state
-    // (Slewing false, AtPark false) matches reality, then drop the parking
-    // state so the caller can retry. A failed stop leaves a persistent Slewing
-    // error because the mount may still be moving. mutex_ must be held.
+    // Park task failure path: stop the hardware, then drop the parking state so
+    // the caller can retry. A successful stop publishes Slewing=false; a failed
+    // stop leaves a persistent Slewing error because the mount may still move.
+    // mutex_ must be held.
     void fail_park_locked(const std::string& message, util::OperationContext& ctx) {
         const std::string stop_error = stop_park_slew_locked();
         if (!connected_ || ctx.stop_reason() != util::StopReason::None) {
