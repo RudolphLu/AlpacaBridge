@@ -112,14 +112,15 @@ def http_fetch(url: str) -> tuple[bytes, str]:
         headers["Authorization"] = f"Bearer {token}"
     try:
         with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=120) as r:
-            body, ctype = r.read(), r.headers.get("Content-Type", "")
-            if r.headers.get("Content-Encoding", "").lower() == "gzip":
-                body = gzip.decompress(body)
-            return body, ctype
+            return decode_body(r.read(), r.headers.get("Content-Encoding", "")), r.headers.get("Content-Type", "")
     except urllib.error.HTTPError as e:
         raise FetchError(f"HTTP {e.code} from {url}") from e
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         raise FetchError(f"{url}: {e}") from e
+
+
+def decode_body(body: bytes, encoding: str) -> bytes:
+    return gzip.decompress(body) if encoding.strip().lower() == "gzip" else body
 
 
 def http_get(url: str) -> str:
@@ -444,8 +445,11 @@ def _reconcile_one(r: dict, issues, by: dict, declined: set, declined_broken: di
         issues.update(upd[0]["number"], title, update_body(r), note)
         log.append(f"retitled #{upd[0]['number']} to {r['current']} -> {r['latest']}")
     elif not newer and upd is not None:
-        issues.close(upd[0]["number"], f"The repository is now at `{r['current']}`; "
-                                       f"upstream latest is `{r['latest']}`.", resolved_body(*upd))
+        if r.get("document"):
+            note = f"The recorded baseline now matches upstream (`{short(r['current'])}`)."
+        else:
+            note = f"The repository is now at `{r['current']}`; upstream latest is `{r['latest']}`."
+        issues.close(upd[0]["number"], note, resolved_body(*upd))
         log.append(f"closed update issue #{upd[0]['number']}")
     return log
 
@@ -561,6 +565,7 @@ def self_test() -> int:
 
         def close(self, number, comment, body=None):
             self.issues[number - 1]["state"] = "CLOSED"
+            self.issues[number - 1]["closing_comment"] = comment
             if body is not None:
                 self.issues[number - 1]["body"] = body
             self.calls.append(("close", number))
@@ -660,6 +665,7 @@ def self_test() -> int:
     assert osv_summary(report, f, f.issues, "o/r") and "CVE-2026-5" in f.issues[1]["body"]
     assert "CVE-2026-4" not in f.issues[1]["body"], "only the new finding is listed"
     # --- SDK and document providers ---
+    assert decode_body(gzip.compress(b"page"), "gzip") == b"page" and decode_body(b"page", "") == b"page"
     assert parse_version("V1.41") == ((1, 41), False) and highest(["2.0.2.1", "2.1.0.1"]) == "2.1.0.1"
     zwo = "https://zwo.test/sdk"
     pages[zwo] = json.dumps([{"acf": {"software_downloads": [
@@ -723,8 +729,10 @@ def self_test() -> int:
     ts, _ = targets({"manifests": {}}, table)
     f.calls.clear()
     reconcile([check(t, get, fetch) for t in ts], f, f.issues)
-    assert ("close", 1) in f.calls or any(c[0] == "close" for c in f.calls), f.calls
+    assert any(c[0] == "close" for c in f.calls), f.calls
     assert not [i for i in f.issues if i["state"] == "OPEN" and "indi-x" in i["title"]]
+    closed = [i for i in f.issues if "indi-x" in i["title"]][0]["closing_comment"]
+    assert "baseline now matches" in closed and "b" * 13 not in closed, closed
 
     # A large first scan: the issue body stays under GitHub's 65536-character limit, and the
     # findings it could not list stay unreported for the next run instead of failing every day.
