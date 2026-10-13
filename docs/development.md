@@ -358,6 +358,8 @@ GitHub's dependency graph parses only the workflow action pins. `.github/workflo
 
 When you add, remove or bump a directory under `AlpacaCore/external/`, edit `scripts/dependency_sdk_versions.json`: an SDK or library goes in `sdks` (path, name, version, where the version came from), a directory of documents or udev rules only goes in `doc_only`. The `docs-drift` CI job runs `python3 scripts/dependency_snapshot.py --check` and names the path to add or remove. Run `python3 scripts/dependency_snapshot.py` to print the snapshot; the VM never submits it.
 
+`python3 scripts/dependency_snapshot.py --spdx <file.deb>` writes the same inventory as an SPDX 2.3 SBOM rooted at that built package, with its SHA-256: runtime dependencies come from the package's own `Depends` field (so `${shlibs:Depends}` is resolved there), the vendored SDKs and FetchContent libraries are `CONTAINS`, and Build-Depends are `BUILD_DEPENDENCY_OF`. `release.yml` (beta) and `nightly-build.yml` attest that SBOM against the `.deb` they publish, next to its build provenance.
+
 ## Packaging
 
 The Debian package is built from the `debian/` directory. It installs:
@@ -373,7 +375,7 @@ The Debian package is built from the `debian/` directory. It installs:
 The only install channel is the OpenAstro APT repository ([apt.openastro.net](https://apt.openastro.net)): install once, then `apt upgrade`. Every version published there is also marked in this repository so a shipped build has a name:
 
 - A git tag `vX.Y.Z` on the merge commit that carried the release (the `VERSION` file, the README badge, and the dated CHANGELOG heading all agree at that commit).
-- A GitHub Release for that tag, created automatically by `.github/workflows/release.yml`. Its notes are the plain-language `docs/releases/X.Y.Z.md` (falling back to the version's CHANGELOG section). A stable release's only assets are the source archives GitHub attaches itself; no `.deb` is attached, use apt. A beta pre-release (`vX.Y.Z-beta.N`) also carries the arm64 `.deb` and its `.sha256`, built by the same workflow in a Debian trixie container, so testers can install a named beta with `sudo apt install ./alpacabridge_X.Y.Z-beta.N_arm64.deb` ([beta channel](beta-channel.md)).
+- A GitHub Release for that tag, created automatically by `.github/workflows/release.yml`. Its notes are the plain-language `docs/releases/X.Y.Z.md` (falling back to the version's CHANGELOG section). A stable release's only assets are the source archives GitHub attaches itself; no `.deb` is attached, use apt. A beta pre-release (`vX.Y.Z-beta.N`) also carries the arm64 `.deb` and its `.sha256`, built by the same workflow in a Debian trixie container, so testers can install a named beta with `sudo apt install ./alpacabridge_X.Y.Z-beta.N_arm64.deb` ([beta channel](beta-channel.md)). That `.deb`, like each nightly's, also gets a signed build provenance attestation and an SPDX SBOM attestation, listed under the repository's Actions > Attestations; stable `.deb`s are built outside this repository and carry neither.
 
 To cut a release or a beta, run `/bump-release` (Claude Code skill, `.claude/commands/bump-release.md`). It does the whole flow: writes `VERSION`, updates the README badge and device count, assembles the changelog fragments into a dated CHANGELOG section, writes plain-language notes to `docs/releases/X.Y.Z.md`, opens and merges the release PR, tags the merge commit, and verifies the Release. By hand the same steps are:
 

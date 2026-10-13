@@ -6,7 +6,9 @@
 # its release notes. The release job compiles nothing, so it runs in seconds.
 # Beta pre-releases are the exception: the beta-deb job builds the arm64 .deb
 # in a Debian trixie container and attaches it with a .sha256, so a tester can
-# install a named beta without building it.
+# install a named beta without building it. That .deb also gets a signed build
+# provenance attestation and an SPDX SBOM attestation (Actions > Attestations),
+# so `gh attestation verify` proves this workflow built it from the tag.
 #
 # Flow: `/bump-release` cuts the release on a PR (VERSION, README badge,
 # dated CHANGELOG heading, plain-language notes in docs/releases/X.Y.Z.md),
@@ -215,7 +217,9 @@ jobs:
     # notes-only; their .deb ships through apt.openastro.net alone.
     name: Attach the .deb to a beta pre-release
     permissions:
-      contents: write   # gh release upload
+      contents: write       # gh release upload
+      id-token: write       # OIDC token Sigstore signs the attestations with
+      attestations: write   # store the provenance and SBOM attestations
     needs: release
     if: needs.release.outputs.prerelease == 'true'
     runs-on: ubuntu-24.04-arm
@@ -259,6 +263,26 @@ jobs:
           (cd dist && sha256sum "alpacabridge_${NOTES_NAME}_arm64.deb" > "alpacabridge_${NOTES_NAME}_arm64.deb.sha256")
           dpkg-deb --info "dist/alpacabridge_${NOTES_NAME}_arm64.deb" | sed -n '/Package:/,/Depends:/p'
           ls -l dist
+
+      - name: Generate the SBOM
+        # The repository's own inventory (scripts/dependency_snapshot.py), not a
+        # scanner: the vendored SDK .so files in the package carry no metadata a
+        # scanner could identify.
+        run: python3 scripts/dependency_snapshot.py --spdx "dist/alpacabridge_${NOTES_NAME}_arm64.deb" --output dist/sbom.spdx.json
+
+      # Attestations are public records, so a dry run stops before them.
+      - name: Attest build provenance
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2 pinned (immutable ref)
+        with:
+          subject-path: dist/alpacabridge_${{ needs.release.outputs.notes_name }}_arm64.deb
+
+      - name: Attest the SBOM
+        if: github.event_name == 'push'
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e  # v4.1.0 pinned (immutable ref)
+        with:
+          subject-path: dist/alpacabridge_${{ needs.release.outputs.notes_name }}_arm64.deb
+          sbom-path: dist/sbom.spdx.json
 
       - name: Attach to the pre-release
         if: github.event_name == 'push'

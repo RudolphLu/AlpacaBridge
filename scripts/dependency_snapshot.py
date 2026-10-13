@@ -8,6 +8,7 @@ AlpacaCore/external/ (versions from scripts/dependency_sdk_versions.json).
 
   dependency_snapshot.py [--sha S] [--ref R] [--output FILE]   write the snapshot
   dependency_snapshot.py --check                               drift check
+  dependency_snapshot.py --spdx DEB [--output FILE]            SPDX SBOM for a built .deb
   dependency_snapshot.py --self-test
 
 Rules: Build-Depends become scope "development", Depends become "runtime".
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -115,6 +117,54 @@ def build_snapshot(root: Path, sha: str, ref: str, job_id: str, scanned: str) ->
             "manifests": manifests}
 
 
+def build_spdx(root: Path, deb: dict[str, str], file_name: str, sha256: str,
+               created: str, namespace: str) -> dict:
+    """SPDX 2.3 SBOM for one built .deb: the same inventory as the snapshot, rooted at the package.
+
+    deb: the package's control fields (dpkg-deb -f). Runtime dependencies come from its
+    Depends, where ${shlibs:Depends} is already resolved; vendored SDKs and FetchContent
+    libraries are CONTAINS; Build-Depends are BUILD_DEPENDENCY_OF.
+    """
+    packages: list[dict] = []
+    ids: dict[str, str] = {}
+
+    def add(purl: str, name: str, version: str | None) -> str:
+        if purl in ids:
+            return ids[purl]
+        spdx_id = f"SPDXRef-Package-{len(packages)}"
+        pkg = {"name": name, "SPDXID": spdx_id, "downloadLocation": "NOASSERTION", "filesAnalyzed": False,
+               "externalRefs": [{"referenceCategory": "PACKAGE-MANAGER", "referenceType": "purl",
+                                 "referenceLocator": purl}]}
+        if version:
+            pkg["versionInfo"] = version
+        packages.append(pkg)
+        ids[purl] = spdx_id
+        return spdx_id
+
+    root_id = add(deb_purl(deb["Package"], deb["Version"]), deb["Package"], deb["Version"])
+    packages[0]["packageFileName"] = file_name
+    packages[0]["checksums"] = [{"algorithm": "SHA256", "checksumValue": sha256}]
+    rels = [("SPDXRef-DOCUMENT", "DESCRIBES", root_id)]
+    for n, v in parse_relations(deb.get("Depends", "")):
+        rels.append((root_id, "DEPENDS_ON", add(deb_purl(n, v), n, v)))
+    for repo, tag in parse_fetchcontent((root / "AlpacaHTTP/CMakeLists.txt").read_text(encoding="utf-8")):
+        rels.append((root_id, "CONTAINS", add(f"pkg:github/{repo}@{tag}", repo, tag)))
+    for e in json.loads((root / TABLE).read_text(encoding="utf-8"))["sdks"]:
+        ver = e.get("version")
+        rels.append((root_id, "CONTAINS", add(f"pkg:generic/{e['name']}{'@' + ver if ver else ''}", e["name"], ver)))
+    control = parse_control((root / "debian/control").read_text(encoding="utf-8"))
+    for n, v in control["development"]:
+        rels.append((add(deb_purl(n, v), n, v), "BUILD_DEPENDENCY_OF", root_id))
+    rels = list(dict.fromkeys(rels))
+    return {"spdxVersion": "SPDX-2.3", "dataLicense": "CC0-1.0", "SPDXID": "SPDXRef-DOCUMENT",
+            "name": file_name, "documentNamespace": namespace,
+            "creationInfo": {"created": created,
+                             "creators": [f"Tool: {DETECTOR['name']}-{DETECTOR['version']}"]},
+            "packages": packages,
+            "relationships": [{"spdxElementId": a, "relationshipType": t, "relatedSpdxElement": b}
+                              for a, t, b in rels]}
+
+
 def check_drift(root: Path) -> list[str]:
     table = json.loads((root / TABLE).read_text(encoding="utf-8"))
     sdks = [e["path"] for e in table["sdks"]]
@@ -188,6 +238,32 @@ def self_test() -> int:
         assert "pkg:github/nlohmann/json@v3.11.3" in snap["manifests"]["AlpacaHTTP/CMakeLists.txt"]["resolved"]
         assert snap["manifests"]["debian/control"]["resolved"][deb_purl("cmake", None)]["scope"] == "development"
         assert snap["manifests"]["debian/control"]["resolved"][deb_purl("adduser", None)]["scope"] == "runtime"
+        deb = {"Package": "alpacabridge", "Version": "5.0.0~beta2", "Architecture": "arm64",
+               "Depends": "libc6 (>= 2.38), libgpiod3 (>= 2.1), libusb-1.0-0 (>= 2:1.0.16), adduser"}
+        doc = build_spdx(r, deb, "x.deb", "f" * 64, "2026-01-01T00:00:00Z", "https://example.test/sbom")
+        assert doc["spdxVersion"] == "SPDX-2.3" and doc["SPDXID"] == "SPDXRef-DOCUMENT"
+        assert doc["dataLicense"] == "CC0-1.0" and doc["documentNamespace"] == "https://example.test/sbom"
+        pkgs = {p["SPDXID"]: p for p in doc["packages"]}
+        assert len(pkgs) == len(doc["packages"]), "SPDXIDs must be unique"
+        purl = {p["externalRefs"][0]["referenceLocator"]: p["SPDXID"] for p in doc["packages"]}
+        root_id = purl["pkg:deb/debian/alpacabridge@5.0.0~beta2?arch=arm64&distro=trixie"]
+        assert pkgs[root_id]["checksums"] == [{"algorithm": "SHA256", "checksumValue": "f" * 64}]
+        assert pkgs[root_id]["packageFileName"] == "x.deb"
+        rels = {(x["spdxElementId"], x["relationshipType"], x["relatedSpdxElement"]) for x in doc["relationships"]}
+        assert ("SPDXRef-DOCUMENT", "DESCRIBES", root_id) in rels
+        # Runtime: the BUILT package's Depends (shlibs resolved), not debian/control's.
+        for name in ("libc6", "libgpiod3", "libusb-1.0-0", "adduser"):
+            assert (root_id, "DEPENDS_ON", purl[deb_purl(name, None)]) in rels, name
+        assert deb_purl("libusb-1.0-0", None) in purl and deb_purl("libc6", None) in purl
+        # Vendored SDKs and FetchContent libraries ship inside the package.
+        for p in ("pkg:generic/a-sdk@1", "pkg:generic/q-sdk", "pkg:github/nlohmann/json@v3.11.3"):
+            assert (root_id, "CONTAINS", purl[p]) in rels, p
+        # Build-Depends are build-only.
+        assert (purl[deb_purl("cmake", None)], "BUILD_DEPENDENCY_OF", root_id) in rels
+        assert (purl[deb_purl("libfoo", "1.2-3")], "BUILD_DEPENDENCY_OF", root_id) in rels
+        assert len(rels) == len(doc["relationships"]), "no duplicate relationships"
+        for p in doc["packages"]:
+            assert {"name", "SPDXID", "downloadLocation", "filesAnalyzed"} <= set(p), p
         (r / EXTERNAL / "New").mkdir()
         errs = check_drift(r)
         assert len(errs) == 1 and f"{EXTERNAL}/New is not in {TABLE}" in errs[0], errs
@@ -210,9 +286,27 @@ def main() -> int:
     ap.add_argument("--sha")
     ap.add_argument("--ref")
     ap.add_argument("--output")
+    ap.add_argument("--spdx", metavar="DEB")
     a = ap.parse_args()
     if a.self_test:
         return self_test()
+    if a.spdx:
+        deb_path = Path(a.spdx)
+        fields = ("Package", "Version", "Architecture", "Depends")
+        out = subprocess.run(["dpkg-deb", "-f", str(deb_path), *fields],
+                             check=True, capture_output=True, text=True).stdout
+        deb = {k: v.strip() for k, _, v in (line.partition(":") for line in out.splitlines()) if k in fields}
+        sha256 = hashlib.sha256(deb_path.read_bytes()).hexdigest()
+        repo = os.environ.get("GITHUB_REPOSITORY", "open-astro/AlpacaBridge")
+        created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        doc = build_spdx(ROOT, deb, deb_path.name, sha256, created,
+                         f"https://github.com/{repo}/sbom/{deb_path.name}-{sha256}")
+        text = json.dumps(doc, indent=2) + "\n"
+        if a.output:
+            Path(a.output).write_text(text, encoding="utf-8")
+        else:
+            sys.stdout.write(text)
+        return 0
     if a.check:
         errs = check_drift(ROOT)
         for e in errs:
