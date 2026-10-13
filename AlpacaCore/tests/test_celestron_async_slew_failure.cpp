@@ -280,7 +280,7 @@ TEST_CASE("Celestron async - a GOTO the hand controller never acknowledges surfa
     driver->set_connected(false);
 }
 
-TEST_CASE("Celestron MoveAxis - failed dispatch preserves and successful dispatch clears a slew error",
+TEST_CASE("Celestron MoveAxis - failed dispatch preserves a stored slew error",
           "[celestron][telescope][async][slewfailure]") {
     auto st = std::make_shared<FakeCelestronState>();
     alpacacore::test::FakeMountServer server(celestron_responder(st));
@@ -293,16 +293,29 @@ TEST_CASE("Celestron MoveAxis - failed dispatch preserves and successful dispatc
     REQUIRE(wait_until([&] { return read_slewing(*driver) == SlewingRead::Threw; }, 10000));
 
     st->reject_goto.store(false);
-    st->mute.store(true);
+    REQUIRE(server.drop_connections());
     try {
         driver->move_axis(0, 0.5);
         FAIL("MoveAxis returned although the controller did not answer");
     } catch (const alpacacore::AlpacaException& ex) {
         CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
     }
-    st->mute.store(false);
     CHECK(read_slewing(*driver) == SlewingRead::Threw);
+    driver->set_connected(false);
+}
 
+TEST_CASE("Celestron MoveAxis - successful dispatch clears a stored slew error", "[celestron][telescope][async][slewfailure]") {
+    auto st = std::make_shared<FakeCelestronState>();
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    st->reject_goto.store(true);
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0));
+    REQUIRE(wait_until([&] { return read_slewing(*driver) == SlewingRead::Threw; }, 10000));
+
+    st->reject_goto.store(false);
     REQUIRE_NOTHROW(driver->move_axis(0, 0.5));
     CHECK(driver->get_slewing());
     REQUIRE_NOTHROW(driver->move_axis(0, 0.0));
