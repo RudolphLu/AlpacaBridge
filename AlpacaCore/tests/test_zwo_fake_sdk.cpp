@@ -700,6 +700,31 @@ TEST_CASE("ZWO fake SDK - abort rejects an in-flight lazy download", "[zwo][came
     CHECK(camera->get_image_array().data.front() == 1);
 }
 
+TEST_CASE("ZWO fake SDK - stop leaves an in-flight lazy download alone", "[zwo][camera][unit]") {
+    FakeZWOSDK sdk;
+    sdk.frame_bytes = make_raw16_frame(16, 8);
+    auto camera = create_zwo_camera(0, sdk.camera.camera_id, sdk);
+    connect_camera(*camera);
+    camera->start_exposure(0.001, true);
+    sdk.hold_download();
+
+    std::atomic<int> result{0};
+    std::thread download([&] { result.store(error_code([&] { static_cast<void>(camera->get_image_array()); })); });
+    const bool download_started = sdk.wait_for_download(std::chrono::seconds(2));
+    const int stop_code = error_code([&] { camera->stop_exposure(); });
+    const int stop_calls = sdk.call_count("stop_exposure");
+    sdk.release_download();
+    download.join();
+
+    CHECK(download_started);
+    CHECK(stop_code == -1);
+    CHECK(stop_calls == 0);
+    CHECK(result.load() == -1);
+    CHECK(camera->get_image_ready());
+    CHECK(camera->get_image_array().data.front() == 1);
+    CHECK(sdk.call_count("get_data_after_exposure") == 1);
+}
+
 TEST_CASE("ZWO fake SDK - disconnect waits for the lazy download before close", "[zwo][camera][unit]") {
     FakeZWOSDK sdk;
     sdk.frame_bytes = make_raw16_frame(16, 8);
