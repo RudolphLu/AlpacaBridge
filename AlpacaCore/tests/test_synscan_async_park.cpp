@@ -111,6 +111,10 @@ alpacacore::test::FakeMountServer::Responder synscan_responder(std::shared_ptr<F
                 {
                     std::lock_guard<std::mutex> lock(st->mutex);
                     st->gotos.push_back(chunk);
+                    // A precise GOTO lands on its aim, so the landing check after it (#1105) sees an arrival.
+                    if (chunk[0] == 'r' && chunk.size() >= 18) {
+                        st->position = chunk.substr(1, 17) + "#";
+                    }
                 }
                 st->goto_started.store(st->now().time_since_epoch().count());
                 st->goto_seen.store(true);

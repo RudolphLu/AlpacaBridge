@@ -128,7 +128,7 @@
     "available": true,
     "buildOption": "ALPACACORE_ENABLE_PLAYERONE",
     "fields": [
-      {"key": "cameraIndex", "type": "int", "default": 0, "required": false, "secret": false, "role": "EnumerationIndex"}
+      {"key": "cameraIndex", "type": "int", "default": 0, "required": false, "secret": false, "role": "EnumerationIndex", "range": {"min": 0, "max": 2147483647}}
     ]
   },
   {
@@ -138,7 +138,7 @@
     "available": true,
     "buildOption": "ALPACACORE_ENABLE_PLAYERONE",
     "fields": [
-      {"key": "filterwheelIndex", "type": "int", "default": 0, "required": false, "secret": false, "role": "EnumerationIndex"},
+      {"key": "filterwheelIndex", "type": "int", "default": 0, "required": false, "secret": false, "role": "EnumerationIndex", "range": {"min": 0, "max": 2147483647}},
       {"key": "filterNames", "type": "stringList", "required": false, "secret": false, "role": "Plain"}
     ]
   },
@@ -149,7 +149,7 @@
     "available": true,
     "buildOption": "ALPACACORE_ENABLE_PLAYERONE",
     "fields": [
-      {"key": "cameraIndex", "type": "int", "default": 0, "required": false, "secret": false, "role": "EnumerationIndex"}
+      {"key": "cameraIndex", "type": "int", "default": 0, "required": false, "secret": false, "role": "EnumerationIndex", "range": {"min": 0, "max": 2147483647}}
     ]
   },
   {
