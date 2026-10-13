@@ -50,6 +50,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "route_table_stubs.h"
@@ -2472,6 +2473,190 @@ int main() {
         remove_device(router, "zwo", "camera", 9601);
     }
     {
+        // case: zwo device selectors are range-checked before narrowing
+        constexpr std::uint64_t kTwoTo32 = std::uint64_t{1} << 32;
+        struct SelectorCase {
+            const char* device_type;
+            const char* field;
+            const char* other_field;
+        };
+        constexpr SelectorCase selectors[]{{"camera", "cameraIndex", "cameraId"},
+                                           {"camera", "cameraId", "cameraIndex"},
+                                           {"filterwheel", "filterwheelIndex", "filterwheelId"},
+                                           {"filterwheel", "filterwheelId", "filterwheelIndex"},
+                                           {"focuser", "focuserIndex", "focuserId"},
+                                           {"focuser", "focuserId", "focuserIndex"},
+                                           {"rotator", "rotatorIndex", "rotatorId"},
+                                           {"rotator", "rotatorId", "rotatorIndex"},
+                                           {"switch", "cameraIndex", "cameraId"},
+                                           {"switch", "cameraId", "cameraIndex"}};
+        int device_number = 9620;
+        for (const auto& selector : selectors) {
+            nlohmann::json body = {{"vendor", "zwo"},
+                                   {"deviceType", selector.device_type},
+                                   {"deviceNumber", device_number++},
+                                   {selector.other_field, 0}};
+            body[selector.field] = kTwoTo32 + 1;
+            const auto result = nlohmann::json::parse(
+                route_request(router, "POST", "/management/v1/configuredevice", body.dump()).body());
+            EXPECT(result.value("ErrorNumber", 0) == 0x401);
+            EXPECT(result.value("ErrorMessage", std::string()).find(selector.field) != std::string::npos);
+        }
+        for (const char* field : {"cameraIndex", "cameraId"}) {
+            nlohmann::json body = {{"vendor", "zwo"},
+                                   {"deviceType", "camera"},
+                                   {"deviceNumber", 9620},
+                                   {"cameraIndex", 0},
+                                   {"cameraId", 7}};
+            body[field] = -2;
+            const auto result = nlohmann::json::parse(
+                route_request(router, "POST", "/management/v1/configuredevice", body.dump()).body());
+            EXPECT(result.value("ErrorNumber", 0) == 0x401);
+            EXPECT(result.value("ErrorMessage", std::string()).find(field) != std::string::npos);
+        }
+        for (const auto& [field, value, other_field] :
+             {std::tuple{"cameraIndex", 0.0, "cameraId"}, std::tuple{"cameraId", 7.0, "cameraIndex"}}) {
+            const int number = device_number++;
+            nlohmann::json body = {{"vendor", "zwo"},
+                                   {"deviceType", "camera"},
+                                   {"deviceNumber", number},
+                                   {field, value},
+                                   {other_field, -1}};
+            const auto result = nlohmann::json::parse(
+                route_request(router, "POST", "/management/v1/configuredevice", body.dump()).body());
+            EXPECT(result.value("ErrorNumber", -1) == 0);
+            const auto saved = listed_config(router, "Camera", number);
+            EXPECT(saved.contains(field));
+            EXPECT(saved.at(field).get<double>() == value);
+            remove_device(router, "zwo", "camera", number);
+        }
+
+        const nlohmann::json max_index_config = {{"vendor", "zwo"},
+                                                 {"deviceType", "camera"},
+                                                 {"deviceNumber", 9630},
+                                                 {"cameraIndex", std::numeric_limits<int>::max()}};
+        const auto max_index = nlohmann::json::parse(
+            route_request(router, "POST", "/management/v1/configuredevice", max_index_config.dump()).body());
+        EXPECT(max_index.value("ErrorNumber", -1) == 0);
+        remove_device(router, "zwo", "camera", 9630);
+
+        for (const auto& [camera_index, camera_id, number] : {std::tuple{-1, 7, 9631}, std::tuple{0, -1, 9632}}) {
+            const nlohmann::json sentinel_config = {{"vendor", "zwo"},
+                                                    {"deviceType", "camera"},
+                                                    {"deviceNumber", number},
+                                                    {"cameraIndex", camera_index},
+                                                    {"cameraId", camera_id}};
+            const auto result = nlohmann::json::parse(
+                route_request(router, "POST", "/management/v1/configuredevice", sentinel_config.dump()).body());
+            EXPECT(result.value("ErrorNumber", -1) == 0);
+            remove_device(router, "zwo", "camera", number);
+        }
+    }
+    {
+        // case: zwo persisted out-of-range selectors are dropped without loading a different unit
+        constexpr std::uint64_t kWrappedIndex = (std::uint64_t{1} << 32) + 1;
+        struct PersistedSelectorCase {
+            const char* device_type;
+            const char* listed_type;
+            const char* field;
+        };
+        constexpr PersistedSelectorCase selectors[]{{"camera", "Camera", "cameraIndex"},
+                                                    {"camera", "Camera", "cameraId"},
+                                                    {"filterwheel", "FilterWheel", "filterwheelIndex"},
+                                                    {"filterwheel", "FilterWheel", "filterwheelId"},
+                                                    {"focuser", "Focuser", "focuserIndex"},
+                                                    {"focuser", "Focuser", "focuserId"},
+                                                    {"rotator", "Rotator", "rotatorIndex"},
+                                                    {"rotator", "Rotator", "rotatorId"},
+                                                    {"switch", "Switch", "cameraIndex"},
+                                                    {"switch", "Switch", "cameraId"}};
+        int device_number = 9621;
+        for (const auto& selector : selectors) {
+            nlohmann::json entry = {
+                {"vendor", "zwo"}, {"deviceType", selector.device_type}, {"deviceNumber", device_number}};
+            entry[selector.field] = kWrappedIndex;
+            const auto persisted = persisted_attempt(entry, selector.listed_type);
+            if (!persisted.listed) {
+                std::cerr << "Persisted ZWO selector failed to register: " << selector.device_type << "/"
+                          << selector.field << " row=" << persisted.failed_entry.dump() << "\n";
+                for (const auto& warning : persisted.warnings) std::cerr << "  warning: " << warning << "\n";
+                for (const auto& error : persisted.errors) std::cerr << "  error: " << error << "\n";
+            }
+            EXPECT(persisted.listed);
+            EXPECT(!persisted.config.contains(selector.field));
+            EXPECT(any_warning_contains(persisted.warnings, selector.field));
+            ++device_number;
+        }
+        const auto integral_float = persisted_attempt(
+            {{"vendor", "zwo"}, {"deviceType", "camera"}, {"deviceNumber", device_number}, {"cameraIndex", 0.0}},
+            "Camera");
+        EXPECT(integral_float.listed);
+        EXPECT(integral_float.config.contains("cameraIndex"));
+        EXPECT(integral_float.config.at("cameraIndex").get<double>() == 0.0);
+
+        const ScopedCwd scratch;
+        const std::filesystem::path persisted_file = std::filesystem::path("config") / "registered_devices.json";
+        constexpr PersistedSelectorCase restart_cases[]{
+            PersistedSelectorCase{"camera", "Camera", "cameraIndex"},
+            PersistedSelectorCase{"filterwheel", "FilterWheel", "filterwheelIndex"},
+            PersistedSelectorCase{"focuser", "Focuser", "focuserIndex"},
+            PersistedSelectorCase{"rotator", "Rotator", "rotatorIndex"},
+            PersistedSelectorCase{"switch", "Switch", "cameraIndex"},
+        };
+        nlohmann::json initial_entries = nlohmann::json::array();
+        device_number = 9640;
+        for (const auto& selector : restart_cases) {
+            nlohmann::json entry = {{"vendor", "zwo"},
+                                    {"deviceType", selector.device_type},
+                                    {"deviceNumber", device_number++},
+                                    {selector.field, kWrappedIndex}};
+            initial_entries.push_back(entry);
+        }
+        std::filesystem::create_directories(persisted_file.parent_path());
+        const auto write_entries = [&](const nlohmann::json& entries) {
+            std::ofstream out(persisted_file, std::ios::trunc);
+            out << entries.dump();
+        };
+        write_entries(initial_entries);
+
+        nlohmann::json normalized_entries;
+        {
+            alpacahttp::Router first_startup;
+            device_number = 9640;
+            for (const auto& selector : restart_cases) {
+                const auto row = listed_entry(first_startup, selector.listed_type, device_number++);
+                EXPECT(!row.is_null());
+                EXPECT(!row.value("LoadError", false));
+            }
+            std::ifstream in(persisted_file);
+            in >> normalized_entries;
+            device_number = 9640;
+            for (const auto& selector : restart_cases) {
+                remove_device(first_startup, "zwo", selector.device_type, device_number++);
+            }
+        }
+        write_entries(normalized_entries);
+        {
+            alpacahttp::Router second_startup;
+            device_number = 9640;
+            for (const auto& selector : restart_cases) {
+                const auto row = listed_entry(second_startup, selector.listed_type, device_number++);
+                EXPECT(!row.is_null());
+                EXPECT(!row.value("LoadError", false));
+                EXPECT(!row.value("Config", nlohmann::json::object()).contains(selector.field));
+                if (std::string_view(selector.device_type) == "camera") {
+                    const auto connect = nlohmann::json::parse(
+                        route_request(second_startup, "PUT", "/api/v1/camera/9640/connected", "Connected=true").body());
+                    EXPECT(connect.value("ErrorNumber", 0) != 0);
+                }
+            }
+            device_number = 9640;
+            for (const auto& selector : restart_cases) {
+                remove_device(second_startup, "zwo", selector.device_type, device_number++);
+            }
+        }
+    }
+    {
         // case: zwo camera identity keys round trip and refuse control bytes (#914)
         // The form resends the learned identity after remove + add.
         const auto cfg = roundtrip_config(router,
@@ -2584,8 +2769,8 @@ int main() {
     }
     {
         // case: zwo camera stored entries with a bad or duplicate identity stay listed (#914)
-        // The API refuses these values; a file that already holds them must
-        // load the entry with the key dropped instead of skipping the device.
+        // The API refuses invalid identity fields; persisted invalid fields are dropped, and a
+        // selector-less camera remains registered until an operator reconfigures it.
         const ScopedCwd scratch;
         const std::filesystem::path file = std::filesystem::path("config") / "registered_devices.json";
         std::filesystem::create_directories(file.parent_path());
@@ -2640,8 +2825,8 @@ int main() {
             }
         }
         {
-            // A stored row that failed to load (no index or id) keeps its UniqueID
-            // when a configuredevice without uniqueId replaces it.
+            // A selector-less persisted entry stays listed; editing it removes the
+            // unresolved driver first, and the form resends its saved UniqueID.
             {
                 std::ofstream out(file, std::ios::trunc);
                 out << nlohmann::json::array({{{"vendor", "zwo"},
@@ -2650,15 +2835,24 @@ int main() {
                                                {"uniqueId", "ZWO_UID_0011223344556677"}}})
                            .dump();
             }
-            alpacahttp::Router failed;
-            nlohmann::json body = {
-                {"vendor", "zwo"}, {"deviceType", "camera"}, {"deviceNumber", 9715}, {"cameraIndex", 1}};
+            alpacahttp::Router unresolved;
+            const auto listed = listed_entry(unresolved, "Camera", 9715);
+            EXPECT(!listed.is_null());
+            const std::string saved_id =
+                listed.value("Config", nlohmann::json::object()).value("uniqueId", std::string());
+            EXPECT(saved_id == "ZWO_UID_0011223344556677");
+            remove_device(unresolved, "zwo", "camera", 9715);
+
+            const nlohmann::json body = {{"vendor", "zwo"},
+                                         {"deviceType", "camera"},
+                                         {"deviceNumber", 9715},
+                                         {"cameraIndex", 1},
+                                         {"uniqueId", saved_id}};
             const auto reply = nlohmann::json::parse(
-                route_request(failed, "POST", "/management/v1/configuredevice", body.dump()).body());
+                route_request(unresolved, "POST", "/management/v1/configuredevice", body.dump()).body());
             EXPECT(reply.value("ErrorNumber", -1) == 0);
-            EXPECT(listed_config(failed, "Camera", 9715).value("uniqueId", std::string()) ==
-                   "ZWO_UID_0011223344556677");
-            remove_device(failed, "zwo", "camera", 9715);
+            EXPECT(listed_config(unresolved, "Camera", 9715).value("uniqueId", std::string()) == saved_id);
+            remove_device(unresolved, "zwo", "camera", 9715);
         }
         // Falsified by: comparing the write-back against the UniqueID read back by device number
         // instead of the supplied one (the stored id is dropped by the entry replace).
