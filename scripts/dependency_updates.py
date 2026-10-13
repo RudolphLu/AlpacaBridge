@@ -49,6 +49,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from pathlib import Path
 from typing import Callable
 
@@ -120,7 +121,12 @@ def http_fetch(url: str) -> tuple[bytes, str]:
 
 
 def decode_body(body: bytes, encoding: str) -> bytes:
-    return gzip.decompress(body) if encoding.strip().lower() == "gzip" else body
+    if encoding.strip().lower() != "gzip":
+        return body
+    try:
+        return gzip.decompress(body)
+    except (OSError, EOFError, zlib.error) as e:  # a truncated or corrupt body: a broken source
+        raise FetchError(f"corrupt gzip body: {e}") from e
 
 
 def http_get(url: str) -> str:
@@ -351,6 +357,8 @@ def update_body(r: dict) -> str:
 
 def document_body(r: dict) -> str:
     local = f"| Local copy | `{r['path']}` |\n" if r.get("path") else ""
+    # Documents reuse kind "update"; their keys carry a "doc:" prefix (targets()), which is what
+    # keeps them apart from SDK and purl keys in reconcile().
     return (f"{marker({'kind': 'update', 'key': r['key'], 'version': r['latest'], 'current': r['current']})}\n"
             f"An upstream document a driver is built from has changed: `{r['name']}`.\n\n"
             f"| | |\n|---|---|\n| Recorded baseline | `{r['current']}` |\n| Upstream now | `{r['latest']}` |\n"
@@ -666,6 +674,14 @@ def self_test() -> int:
     assert "CVE-2026-4" not in f.issues[1]["body"], "only the new finding is listed"
     # --- SDK and document providers ---
     assert decode_body(gzip.compress(b"page"), "gzip") == b"page" and decode_body(b"page", "") == b"page"
+    # A truncated or corrupt gzip body is a broken source, not a crash of the whole run.
+    for bad in (gzip.compress(b"page")[:-6], b"not gzip at all"):
+        try:
+            decode_body(bad, "gzip")
+        except FetchError:
+            pass
+        else:
+            raise AssertionError(f"corrupt gzip {bad!r} must raise FetchError")
     assert parse_version("V1.41") == ((1, 41), False) and highest(["2.0.2.1", "2.1.0.1"]) == "2.1.0.1"
     zwo = "https://zwo.test/sdk"
     pages[zwo] = json.dumps([{"acf": {"software_downloads": [

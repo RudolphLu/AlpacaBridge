@@ -109,7 +109,7 @@ def parse_fetchcontent(text: str) -> list[tuple[str, str]]:
 
 def _step_block(text: str, step: str) -> str | None:
     """The body of the workflow step named ``step``, up to the next ``- name:``."""
-    m = re.search(rf"^\s*- name: {re.escape(step)}\s*$(.*?)(?=^\s*- name:|\Z)", text, re.M | re.S)
+    m = re.search(rf"^\s*- name: [\"']?{re.escape(step)}[\"']?\s*$(.*?)(?=^\s*- name:|\Z)", text, re.M | re.S)
     return m.group(1) if m else None
 
 
@@ -534,7 +534,7 @@ def check_coverage(root: Path, table: dict) -> list[str]:
         for line in wf.read_text(encoding="utf-8").splitlines():
             m = re.match(r"^\s*- name:\s*(.+?)\s*$", line)
             if m:
-                step = m.group(1)
+                step = m.group(1).strip("\"'")  # YAML quotes are not part of the name
             elif re.match(r"^\s*ver=", line) and step not in tracked_steps:
                 errors.append(f"{rel}: the step {step!r} pins a tool with ver= that the dependency snapshot does "
                               "not read: add it to CI_TOOL_STEPS (ci.yml) or WORKFLOW_TOOL_STEPS in "
@@ -665,6 +665,13 @@ def self_test() -> int:
             "jobs:\n  a:\n    steps:\n      - name: Install newtool\n        run: |\n          ver=1.2.3\n")
         errs = drift_with()
         assert len(errs) == 1 and "x.yml" in errs[0] and "Install newtool" in errs[0], errs
+        # A quoted step name is the same step: a tracked pin written `- name: "..."` still matches.
+        osv_step = WORKFLOW_TOOL_STEPS[".github/workflows/osv-scan.yml"][0][0]
+        (r / ".github/workflows/x.yml").unlink()
+        (r / ".github/workflows/osv-scan.yml").write_text(
+            f'jobs:\n  a:\n    steps:\n      - name: "{osv_step}"\n        run: |\n          ver=2.7.0\n')
+        assert drift_with() == [], drift_with()
+        (r / ".github/workflows/osv-scan.yml").rename(r / ".github/workflows/x.yml")
         (r / ".github/workflows/x.yml").unlink()
         (r / ".github/workflows").rmdir()
         (r / ".github").rmdir()
