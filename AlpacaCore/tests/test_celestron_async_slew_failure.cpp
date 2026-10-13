@@ -436,7 +436,8 @@ TEST_CASE("Celestron async - one bad HC or MC status poll recovers before the fa
     }
 }
 
-TEST_CASE("Celestron sync slew - a status-poll failure aborts the wait", "[celestron][telescope][async][slewfailure]") {
+TEST_CASE("Celestron sync slew - three status-poll failures abort the wait",
+          "[celestron][telescope][async][slewfailure]") {
     alpacacore::test::FakeTaskClock clock;
     auto st = std::make_shared<FakeCelestronState>();
     st->clock = &clock;
@@ -461,7 +462,8 @@ TEST_CASE("Celestron sync slew - a status-poll failure aborts the wait", "[celes
     st->malformed_slew_status.store(1);
     clock.advance(std::chrono::seconds(9));
     clock.wait_for_woken_settled(std::chrono::seconds(2));
-    const bool finished_after_bad_poll = wait_until([&] { return finished.load(); }, 5000);
+    const bool finished_after_bad_poll =
+        advance_until(clock, [&] { return finished.load(); }, std::chrono::milliseconds(250), 20);
     slew.join();
     REQUIRE(goto_dispatched);
     REQUIRE(waiting_for_poll);
@@ -473,6 +475,7 @@ TEST_CASE("Celestron sync slew - a status-poll failure aborts the wait", "[celes
         CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
         CHECK(std::string(ex.what()).find("invalid response") != std::string::npos);
     }
+    CHECK(st->slew_status_polls.load() == 3);
     driver->set_connected(false);
 }
 
