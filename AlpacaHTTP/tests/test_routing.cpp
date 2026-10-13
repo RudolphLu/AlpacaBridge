@@ -2560,6 +2560,12 @@ int main() {
                 {"vendor", "zwo"}, {"deviceType", selector.device_type}, {"deviceNumber", device_number}};
             entry[selector.field] = kWrappedIndex;
             const auto persisted = persisted_attempt(entry, selector.listed_type);
+            if (!persisted.listed) {
+                std::cerr << "Persisted ZWO selector failed to register: " << selector.device_type << "/"
+                          << selector.field << " row=" << persisted.failed_entry.dump() << "\n";
+                for (const auto& warning : persisted.warnings) std::cerr << "  warning: " << warning << "\n";
+                for (const auto& error : persisted.errors) std::cerr << "  error: " << error << "\n";
+            }
             EXPECT(persisted.listed);
             EXPECT(!persisted.config.contains(selector.field));
             EXPECT(any_warning_contains(persisted.warnings, selector.field));
