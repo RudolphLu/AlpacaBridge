@@ -24,6 +24,8 @@
 #include <chrono>
 #include <cmath>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -490,6 +492,24 @@ TEST_CASE("WeeWX ObservingConditions Driver - connect refuses malformed replies"
     driver->set_connected(true);
     CHECK(driver->get_connected());
     driver->set_connected(false);
+}
+
+TEST_CASE("WeeWX ObservingConditions Driver - connect refuses a non-HTTP feed URL", "[weewx]") {
+    // The feed URL is user-set, and libcurl accepts every protocol it was built with
+    // (file://, ldap://, ...). A file:// URL holding a valid payload is the observable
+    // case: it connects unless the fetch is limited to http and https.
+    const auto path = std::filesystem::temp_directory_path() / "alpacabridge-weewx-scheme-test.json";
+    {
+        std::ofstream out(path);
+        out << full_payload();
+    }
+    alpacacore::vendor::weewx::WeeWxHttpConfig config;
+    config.url = "file://" + path.string();
+    config.timeout = std::chrono::milliseconds(300);
+    auto driver = alpacacore::vendor::weewx::create_weewx_observingconditions(0, config);
+    CHECK(alpaca_error_of([&] { driver->set_connected(true); }) == alpacacore::AlpacaError::DriverException);
+    CHECK(driver->get_connected() == false);
+    std::filesystem::remove(path);
 }
 
 TEST_CASE("WeeWX ObservingConditions Driver - feed stalls after connect: values go stale, Connected holds", "[weewx]") {
