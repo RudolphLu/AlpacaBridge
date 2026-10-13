@@ -1327,7 +1327,9 @@ public:
         std::lock_guard<std::mutex> handoff_lock(slew_handoff_mutex_);
         // open-astro#768: fence the async slew dispatch first, so no :MS1#/:MS2#
         // can reach the mount after the stop below. Runs without mutex_ held
-        // (the dispatch thread takes it), like every other reap site.
+        // (the dispatch thread takes it), like every other reap site. Taking
+        // the handoff lock can wait for a concurrent initiator's in-flight
+        // dispatch transaction before the stop can be sent.
         reap_slew_dispatch();
         std::lock_guard<std::mutex> lock(mutex_);
         // open-astro#728: a latched fault must not stop a client stopping the

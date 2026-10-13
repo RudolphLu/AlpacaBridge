@@ -46,7 +46,8 @@ struct ParkSlewHooks {
     std::function<bool()> poll_slewing;
     /// Stops tracking at the park position. May throw.
     std::function<void()> stop_tracking;
-    /// A failed step: stop the hardware and drop the parking state.
+    /// A failed step: stop hardware and record failure while this body still
+    /// owns the park. If cancelled or superseded, the newer operation owns state.
     std::function<void(const std::string&)> fail;
     /// Publishes AtPark true and Slewing false in the same locked step.
     std::function<void()> complete;

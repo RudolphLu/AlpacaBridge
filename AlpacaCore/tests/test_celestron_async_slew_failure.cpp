@@ -359,6 +359,48 @@ TEST_CASE("Celestron sync slew - a status-poll failure aborts the wait", "[celes
     driver->set_connected(false);
 }
 
+TEST_CASE("Celestron sync slew - tracking restoration failure is propagated",
+          "[celestron][telescope][async][slewfailure]") {
+    alpacacore::test::FakeTaskClock clock;
+    auto st = std::make_shared<FakeCelestronState>();
+    st->clock = &clock;
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = make_driver(server.port(), clock);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    REQUIRE_NOTHROW(driver->set_tracking(true));
+
+    std::exception_ptr slew_error;
+    std::atomic<bool> finished{false};
+    std::thread slew([&] {
+        try {
+            driver->slew_to_coordinates(no_flip_ra_hours(), 20.0);
+        } catch (...) {
+            slew_error = std::current_exception();
+        }
+        finished.store(true);
+    });
+    const bool goto_dispatched = wait_until([&] { return st->goto_count.load() > 0; }, 5000);
+    const bool waiting_for_completion = clock.wait_for_waiters(1, std::chrono::seconds(2));
+    st->reject_next_tracking_write.store(true);
+    clock.advance(std::chrono::seconds(9));
+    clock.wait_for_woken_settled(std::chrono::seconds(2));
+    const bool finished_after_restore = wait_until([&] { return finished.load(); }, 5000);
+    slew.join();
+    REQUIRE(goto_dispatched);
+    REQUIRE(waiting_for_completion);
+    REQUIRE(finished_after_restore);
+    REQUIRE(slew_error);
+    CHECK_FALSE(st->reject_next_tracking_write.load());
+    try {
+        std::rethrow_exception(slew_error);
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+        CHECK(std::string(ex.what()).find("Celestron") != std::string::npos);
+    }
+    driver->set_connected(false);
+}
+
 TEST_CASE("Celestron async - motor-controller completion-poll failure persists through Slewing",
           "[celestron][telescope][async][slewfailure]") {
     auto st = std::make_shared<FakeCelestronState>();

@@ -2645,7 +2645,8 @@ private:
     // indistinguishable from a landed goto. Set (under mutex_) by the slew
     // task's catch block on a REAL failure (never on the task's own
     // cancellation -- a newer initiator or AbortSlew reaped it), cleared by
-    // the next slew initiator, AbortSlew, and connect/disconnect. Consulted by
+    // the next motion initiator, a successful AbortSlew, and connect/disconnect.
+    // A failed AbortSlew replaces it with the failed-stop reason. Consulted by
     // get_slewing() before the cached bool.
     mutable std::string last_slew_error_;
     mutable std::string last_home_error_;  // FindHome's completion error, not every motion error.
