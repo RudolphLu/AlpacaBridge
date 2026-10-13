@@ -58,8 +58,10 @@ struct FakeCelestronState {
     // tail has a tracking restore to perform; `t_count` counts every 'T' write.
     std::atomic<bool> tracking_on{false};
     std::atomic<bool> reject_level_start{false};
+    std::atomic<bool> invalid_next_home_status{false};
     std::atomic<bool> invalid_home_status{false};
     std::atomic<int> home_status_polls{0};
+    std::atomic<int> cancel_goto_count{0};
     std::atomic<int> t_count{0};
     static constexpr auto kGotoDuration = std::chrono::milliseconds(1500);
     bool goto_in_progress() const {
@@ -94,6 +96,7 @@ alpacacore::test::FakeMountServer::Responder celestron_responder(std::shared_ptr
             case 'L':
                 return st->goto_in_progress() ? "1#" : "0#";
             case 'M':  // cancel goto
+                st->cancel_goto_count.fetch_add(1);
                 st->goto_seen.store(false);
                 return "#";
             case 'J':  // alignment complete (the slew-safety gate requires it)
@@ -112,6 +115,7 @@ alpacacore::test::FakeMountServer::Responder celestron_responder(std::shared_ptr
                 }
                 if (op == 0x12) {
                     st->home_status_polls.fetch_add(1);
+                    if (st->invalid_next_home_status.exchange(false)) return std::string("\x01#", 2);
                     if (st->invalid_home_status.load()) return std::string("\x01#", 2);
                     return std::string("\xFF#", 2);
                 }
@@ -448,15 +452,36 @@ TEST_CASE("Celestron FindHome - invalid home-status replies persist through Slew
     REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
 
     REQUIRE_NOTHROW(driver->find_home());
+    CHECK_FALSE(driver->get_at_home());  // first failed reply is treated as a transient
+    CHECK(driver->get_slewing());        // the second consecutive failure still keeps homing in progress
     try {
         static_cast<void>(driver->get_at_home());
-        FAIL("AtHome returned false after its completion poll failed");
+        FAIL("AtHome returned normally after three consecutive completion polls failed");
     } catch (const alpacacore::AlpacaException& ex) {
         CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
         CHECK(std::string(ex.what()).find("FindHome completion polling failed") != std::string::npos);
     }
-    CHECK(st->home_status_polls.load() > 0);
+    CHECK(st->home_status_polls.load() == 3);
+    CHECK(st->cancel_goto_count.load() == 1);
     CHECK(read_slewing_error(*driver));
+    driver->set_connected(false);
+}
+
+TEST_CASE("Celestron FindHome - a transient home-status failure recovers", "[celestron][telescope][async][home]") {
+    auto st = std::make_shared<FakeCelestronState>();
+    st->invalid_next_home_status.store(true);
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    REQUIRE_NOTHROW(driver->find_home());
+    CHECK_FALSE(driver->get_at_home());
+    CHECK(st->cancel_goto_count.load() == 0);
+    CHECK(driver->get_at_home());  // a valid reply clears the consecutive failure count
+    CHECK(st->home_status_polls.load() == 3);
+    CHECK(st->cancel_goto_count.load() == 0);
+    CHECK_FALSE(driver->get_slewing());
     driver->set_connected(false);
 }
 

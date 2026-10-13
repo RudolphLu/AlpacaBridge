@@ -71,14 +71,19 @@ struct FakeCelestronState {
     std::atomic<bool> reject_next_position_reply{false};
     std::atomic<bool> reject_position_after_slew{false};
     std::atomic<bool> reject_next_tracking_write{false};
+    std::atomic<bool> malformed_next_slew_status{false};
     std::atomic<int> malformed_slew_status{0};
+    std::atomic<bool> invalid_next_mc_slew_status{false};
     std::atomic<bool> invalid_mc_slew_status{false};
     std::atomic<int> slew_status_polls{0};
+    std::atomic<int> mc_slew_status_polls{0};
+    std::atomic<bool> invalid_next_home_status{false};
     std::atomic<bool> mute{false};
     std::atomic<unsigned char> model_id{24};  // CGX-L
     std::atomic<unsigned char> firmware_major{5};
     std::atomic<unsigned char> firmware_minor{35};
     std::atomic<int> goto_count{0};
+    std::atomic<int> cancel_goto_count{0};
     std::atomic<Clock::rep> goto_started{0};
     std::mutex command_mutex;
     std::vector<std::string> commands;
@@ -148,6 +153,7 @@ alpacacore::test::FakeMountServer::Responder celestron_responder(const std::shar
                 return st->goto_reply();
             case 'L':
                 st->slew_status_polls.fetch_add(1);
+                if (st->malformed_next_slew_status.exchange(false)) return "01#";
                 if (const int malformed = st->malformed_slew_status.load(); malformed == 1) return "01#";
                 if (st->malformed_slew_status.load() == 2) return "0junk#";
                 if (st->goto_count.load() > 0 && !st->goto_in_progress() &&
@@ -157,6 +163,7 @@ alpacacore::test::FakeMountServer::Responder celestron_responder(const std::shar
                 }
                 return st->goto_in_progress() ? "1#" : "0#";
             case 'M':  // cancel goto
+                st->cancel_goto_count.fetch_add(1);
                 st->goto_cancelled.store(true);
                 return "#";
             case 'J':  // alignment complete (the slew-safety gate requires it)
@@ -182,6 +189,8 @@ alpacacore::test::FakeMountServer::Responder celestron_responder(const std::shar
                     return st->goto_reply();
                 }
                 if (op == 0x13) {  // MC_SLEW_DONE
+                    st->mc_slew_status_polls.fetch_add(1);
+                    if (st->invalid_next_mc_slew_status.exchange(false)) return std::string("\x01#", 2);
                     if (st->invalid_mc_slew_status.load()) return std::string("\x01#", 2);
                     return st->goto_in_progress() ? std::string("\x00#", 2) : std::string("\xFF#");
                 }
@@ -369,15 +378,62 @@ TEST_CASE("Celestron Slewing - a direct hardware status-poll failure is propagat
     auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
     REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
 
+    CHECK_FALSE(driver->get_slewing());
+    CHECK_FALSE(driver->get_slewing());
     try {
         static_cast<void>(driver->get_slewing());
-        FAIL("Slewing returned the cached state after its hardware poll failed");
+        FAIL("Slewing returned the cached state after three status polls failed");
     } catch (const alpacacore::AlpacaException& ex) {
         CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
         CHECK(std::string(ex.what()).find("invalid response") != std::string::npos);
     }
-    CHECK(st->slew_status_polls.load() > 0);
+    CHECK(st->slew_status_polls.load() == 3);
+    CHECK(st->cancel_goto_count.load() == 0);  // an idle status GET does not stop a mount
     driver->set_connected(false);
+}
+
+TEST_CASE("Celestron async - one bad HC or MC status poll recovers before the failure threshold",
+          "[celestron][telescope][async][slewfailure]") {
+    for (const bool motor_controller : {false, true}) {
+        alpacacore::test::FakeTaskClock clock;
+        auto st = std::make_shared<FakeCelestronState>();
+        st->clock = &clock;
+        st->hold_slew.store(true);
+        if (motor_controller) {
+            st->firmware_major.store(0);
+            st->firmware_minor.store(0);
+            st->invalid_next_mc_slew_status.store(true);
+        } else {
+            st->malformed_next_slew_status.store(true);
+        }
+        alpacacore::test::FakeMountServer server(celestron_responder(st));
+        REQUIRE(server.ok());
+        auto driver = make_driver(server.port(), clock);
+        REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+        REQUIRE_NOTHROW(driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0));
+        REQUIRE(wait_until([&] { return st->goto_count.load() > 0; }, 5000));
+        const auto poll_count = [&] {
+            return motor_controller ? st->mc_slew_status_polls.load() : st->slew_status_polls.load();
+        };
+        REQUIRE(advance_until(clock, [&] { return poll_count() >= 2; }, std::chrono::milliseconds(250), 20));
+        CHECK(st->cancel_goto_count.load() == 0);
+        CHECK(driver->get_slewing());
+
+        const int after_recovery = poll_count();
+        if (motor_controller) {
+            st->invalid_mc_slew_status.store(true);
+        } else {
+            st->malformed_slew_status.store(1);
+        }
+        REQUIRE(
+            advance_until(clock, [&] { return st->cancel_goto_count.load() > 0; }, std::chrono::milliseconds(250), 20));
+        CHECK(poll_count() - after_recovery == 3);
+        std::string message;
+        CHECK(read_slewing(*driver, &message) == SlewingRead::Threw);
+        CHECK(message.find("3 consecutive failures") != std::string::npos);
+        driver->set_connected(false);
+    }
 }
 
 TEST_CASE("Celestron sync slew - a status-poll failure aborts the wait", "[celestron][telescope][async][slewfailure]") {
