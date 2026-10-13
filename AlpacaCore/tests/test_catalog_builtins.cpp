@@ -2973,14 +2973,19 @@ TEST_CASE("Builtin catalog - register_builtin_factories makes the ZWO devices av
 #endif
     }
 #ifdef ALPACACORE_ENABLE_ZWO
-    // SDK-bound types: an index or an id binds; neither is refused with the arm's text.
+    // SDK-bound types: an index or an id binds. An unbound factory result is
+    // also allowed so persisted entries with a dropped selector stay listed.
     const std::tuple<DeviceKey, DeviceType, const char*, const char*> bound[] = {
         {kZwoWheelKey, DeviceType::FilterWheel, "filterwheelIndex", "filterwheelId"},
         {kZwoFocuserKey, DeviceType::Focuser, "focuserIndex", "focuserId"},
         {kZwoRotatorKey, DeviceType::Rotator, "rotatorIndex", "rotatorId"}};
     for (const auto& [key, type, index_key, id_key] : bound) {
         INFO(index_key);
-        CHECK_THROWS_AS(catalog.create(key, DeviceConfig{}, 1), AlpacaException);
+        auto unbound = catalog.create(key, DeviceConfig{}, 1);
+        REQUIRE(unbound != nullptr);
+        CHECK(unbound->get_device_type() == type);
+        CHECK(unbound->get_device_number() == 1);
+        CHECK_FALSE(unbound->get_connected());
         DeviceConfig by_index;
         by_index.set(index_key, std::int64_t{0});
         auto a = catalog.create(key, by_index, 2);
@@ -3008,7 +3013,10 @@ TEST_CASE("Builtin catalog - register_builtin_factories makes the ZWO devices av
     auto dew_switch = catalog.create(kZwoSwitchKey, dew, 6);
     REQUIRE(dew_switch != nullptr);
     CHECK(dew_switch->get_device_type() == DeviceType::Switch);
-    CHECK_THROWS_AS(catalog.create(kZwoSwitchKey, DeviceConfig{}, 7), AlpacaException);
+    auto unbound_dew = catalog.create(kZwoSwitchKey, DeviceConfig{}, 7);
+    REQUIRE(unbound_dew != nullptr);
+    CHECK(unbound_dew->get_device_type() == DeviceType::Switch);
+    CHECK_FALSE(unbound_dew->get_connected());
 
     DeviceConfig names;
     names.set("filterwheelIndex", std::int64_t{0});
