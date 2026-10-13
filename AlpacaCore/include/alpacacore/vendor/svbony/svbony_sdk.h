@@ -28,7 +28,7 @@ enum class SVBVideoDataResult : std::uint8_t { Frame, Timeout };
 
 enum class SVBGuideDirection : std::uint8_t { North, South, East, West };
 
-enum class SVBControlType {
+enum class SVBControlType : std::uint8_t {
     Gain,
     Exposure,
     Gamma,

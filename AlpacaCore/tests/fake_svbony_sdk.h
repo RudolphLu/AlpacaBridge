@@ -16,6 +16,7 @@
 #include <alpacacore/vendor/svbony/svbony_sdk_wrapper.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -24,6 +25,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -91,6 +93,9 @@ public:
         return true;
     }
     void open_camera(int camera_id) override {
+        // Outside the mutex, so the delay holds only the caller (the driver's connect), not other fake calls.
+        const auto delay = std::chrono::milliseconds(open_delay_ms_.load());
+        if (delay.count() > 0) std::this_thread::sleep_for(delay);
         std::lock_guard lock(mutex_);
         record_locked("open_camera");
         maybe_fail_locked("open_camera");
@@ -369,6 +374,10 @@ public:
         std::lock_guard lock(mutex_);
         auto_values_[control] = is_auto;
     }
+    // Holds each open_camera() for `delay` (bounded, never indefinite), so a test can observe Connecting.
+    void set_open_delay(std::chrono::milliseconds delay) {
+        open_delay_ms_.store(std::clamp<std::int64_t>(delay.count(), 0, 20000));
+    }
     void set_max_read_wait(std::chrono::milliseconds timeout) {
         std::lock_guard lock(mutex_);
         max_read_wait_ms_ = static_cast<int>(std::clamp<std::int64_t>(timeout.count(), 1, 20000));
@@ -468,6 +477,7 @@ private:
     std::size_t last_buffer_capacity_{0};
     int last_video_wait_ms_{0};
     int max_read_wait_ms_{250};
+    std::atomic<std::int64_t> open_delay_ms_{0};
     int timeout_reads_remaining_{0};
     int completed_video_data_reads_{0};
     int open_count_{0};

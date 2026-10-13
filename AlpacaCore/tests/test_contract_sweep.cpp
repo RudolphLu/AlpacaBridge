@@ -117,7 +117,6 @@
 #include <alpacacore/vendor/svbony/svbony_camera_driver.h>
 
 #include "fake_svbony_sdk.h"
-#include "locked_svbony_sdk.h"
 #endif
 #ifdef ALPACACORE_ENABLE_PLAYERONE
 #include <alpacacore/vendor/playerone/playerone_camera_driver.h>
@@ -1256,13 +1255,22 @@ Tier2Host tier2_host_playerone_camera() {
 
 #ifdef ALPACACORE_ENABLE_SVBONY
 Tier2Host tier2_host_svbony_camera() {
-    Tier2Host h{"svbony_camera", "svbony", "camera", "fake_svbony_sdk.h", DeviceType::Camera, "svbony_camera", {},
-                false,           {},       ""};
-    h.connectable = [](bool) {
-        return host_over(std::make_shared<alpacacore::test::FakeSVBSDK>(),
-                         [](alpacacore::test::FakeSVBSDK& sdk) -> std::unique_ptr<AlpacaDriver> {
-                             return alpacacore::vendor::svbony::create_svbony_camera(0, 0, sdk);
-                         });
+    Tier2Host h{"svbony_camera",
+                "svbony",
+                "camera",
+                "fake_svbony_sdk.h",
+                DeviceType::Camera,
+                "svbony_camera",
+                {},
+                true,
+                {},
+                ""};
+    h.connectable = [](bool hold) {
+        auto sdk = std::make_shared<alpacacore::test::FakeSVBSDK>();
+        if (hold) sdk->set_open_delay(kHold);
+        return host_over(sdk, [](alpacacore::test::FakeSVBSDK& fake) -> std::unique_ptr<AlpacaDriver> {
+            return alpacacore::vendor::svbony::create_svbony_camera(0, 0, fake);
+        });
     };
     h.failing = []() {
         auto sdk = std::make_shared<alpacacore::test::FakeSVBSDK>();
@@ -1271,9 +1279,6 @@ Tier2Host tier2_host_svbony_camera() {
             return alpacacore::vendor::svbony::create_svbony_camera(0, 0, fake);
         });
     };
-    h.connecting_unobservable =
-        "the fake's SDK calls complete immediately, so Connect may settle before the first "
-        "Connecting sample; the async lifecycle is still exercised";
     return h;
 }
 #endif

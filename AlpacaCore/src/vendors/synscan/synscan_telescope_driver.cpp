@@ -60,8 +60,10 @@ constexpr double kSiderealDegPerSec = 15.0411 / 3600.0;
 // HC 06.03.00: about +/-10" in Dec per GOTO, up to 20", open-astro#1027) is not something another pass can
 // remove, and failing the slew there turned a plate-solvable 15" landing into an error.
 // open-astro#1030: that handset's precise RA readback also ramps down 15.04" (one second of sidereal motion) and
-// jumps back once a second, so a single RA read can be off by up to one 15.04" step; a pass that has RA inside this
-// tolerance must not move the RA aim (see refine_goto_landing_locked), or the Dec-only passes drag RA along.
+// jumps back once a second, so a single RA read can be off by up to one 15.04" step; a re-GOTO round that has RA
+// inside this tolerance must not move the RA aim (see refine_goto_landing_locked), or Dec-only rounds drag RA along.
+// Equatorial mounts finish the landing with timed moves after at most one re-GOTO; the rule matters most for mounts
+// not known to be equatorial, whose every round is a re-GOTO.
 constexpr double kLandingToleranceArcsec = 3.0;
 // A readback this far from the target is not a landing error a fine re-GOTO corrects. The handset sometimes ends a
 // GOTO ~49' east of the aim (EQM-35 Pro, HC 06.03.00, open-astro#1105) and a repeat GOTO to the same target lands, so
@@ -2586,6 +2588,10 @@ private:
         const bool timed_finish = equatorial_geometry_locked();
         bool regoto_done = false;
         bool far_miss_repeated = false;
+        // The re-GOTO aim carries over between rounds (open-astro#1030): a residual cancels a systematic landing
+        // offset instead of repeating it, and RA inside the tolerance keeps its aim.
+        double aim_ra = ra;
+        double aim_dec = dec;
         for (int round = 0;; ++round) {
             if (motion_generation_ != owner_generation ||
                 (ctx != nullptr && ctx->stop_reason() != util::StopReason::None)) {
@@ -2648,8 +2654,12 @@ private:
                 // Too far for a timed move: one re-GOTO, aimed by the residual, brings it within reach. Without the
                 // timed finish (not known equatorial) every round is a re-GOTO.
                 regoto_done = true;
-                const double aim_ra = std::fmod(ra + ra_error_hours + 24.0, 24.0);
-                const double aim_dec = std::clamp(dec + dec_error_degrees, -90.0, 90.0);
+                // RA inside the tolerance keeps its aim, so a Dec-driven round does not chase the handset's
+                // one-second RA readback steps (open-astro#1030).
+                if (ra_error_arcsec > kLandingToleranceArcsec) {
+                    aim_ra = std::fmod(aim_ra + ra_error_hours + 24.0, 24.0);
+                }
+                aim_dec = std::clamp(aim_dec + dec_error_degrees, -90.0, 90.0);
                 slewing_cached_ = true;
                 slew_force_until_ = clock_.now() + kRefineStartForce;
                 protocol.goto_ra_dec_raw(encode_ra_raw(aim_ra, 24), encode_angle(aim_dec, 24), true);

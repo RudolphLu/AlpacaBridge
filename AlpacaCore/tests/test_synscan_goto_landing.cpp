@@ -372,6 +372,33 @@ TEST_CASE(
     driver->set_connected(false);
 }
 
+TEST_CASE("SynScan GOTO landing - a Dec-only refinement pass leaves the RA aim alone (#1030)",
+          "[synscan][telescope][goto-landing]") {
+    // An Alt-Az mount finishes every landing round with a re-GOTO (no timed moves), so the round's aim decides where
+    // RA ends up: RA inside the tolerance must keep its aim while Dec is corrected.
+    auto st = std::make_shared<LandingOffsetHandset>();
+    st->model_id.store(128);
+    st->ra_offset_counts.store(20);       // 1.5" RA, inside the 3" tolerance
+    st->dec_offset_script[0].store(124);  // a systematic 9.6" Dec offset, cancelled by the aim correction
+    st->dec_offset_script[1].store(124);
+    st->dec_scripted.store(true);
+    alpacacore::test::FakeMountServer server(responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
+        0, endpoint(server.port()), alpacacore::vendor::synscan::SynScanVersion::V4);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    REQUIRE(driver->get_alignment_mode() == alpacacore::AlignmentMode::AltAz);
+
+    REQUIRE_NOTHROW(driver->slew_to_coordinates(kTargetRa, kTargetDec));
+
+    CHECK(st->goto_count.load() == 2);
+    CHECK(st->nudge_starts.load() == 0);
+    // RA was inside its tolerance, so the second GOTO aims at the same RA as the first.
+    CHECK(st->commanded_ra[1].load() == st->commanded_ra[0].load());
+    CHECK(dec_error_arcsec(*driver, kTargetDec) < 3.0);
+    driver->set_connected(false);
+}
+
 TEST_CASE("SynScan GOTO landing - the settle time follows the last landing move once (#880)",
           "[synscan][telescope][goto-landing]") {
     struct Timing {
