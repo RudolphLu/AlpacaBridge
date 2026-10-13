@@ -54,7 +54,8 @@ BROKEN_LABELS = ("dependencies", "bug", "P4")
 OSV_LABELS = ("dependencies", "bug", "P2")
 TAG_PAGES = 10
 LIST_LIMIT = 5000  # issues read back for their markers; the OSV dedupe needs closed ones too
-OSV_THRESHOLD = 7.0  # CVSS: High is 7.0-8.9, Critical 9.0-10.0
+OSV_THRESHOLD = 7.0
+OSV_MAX_ROWS = 100  # rows per summary issue; keeps the body far below GitHub's 65536 characters  # CVSS: High is 7.0-8.9, Critical 9.0-10.0
 
 HttpGet = Callable[[str], str]
 
@@ -218,6 +219,9 @@ class GhIssues:
         self._gh("issue", "edit", str(number), "--title", title, "--body-file", "-", stdin=body)
         self._gh("issue", "comment", str(number), "--body-file", "-", stdin=comment)
 
+    def edit_body(self, number: int, body: str) -> None:
+        self._gh("issue", "edit", str(number), "--body-file", "-", stdin=body)
+
     def close(self, number: int, comment: str, body: str | None = None) -> None:
         if body is not None:
             self._gh("issue", "edit", str(number), "--body-file", "-", stdin=body)
@@ -250,57 +254,78 @@ def resolved_body(issue: dict, state: dict) -> str:
 
 
 def reconcile(results: list[dict], issues, all_issues: list[dict]) -> list[str]:
-    """Open, retitle and close issues so they match results. Returns one line per action.
+    """Open, retitle and close issues so they match results. Returns one line per action;
+    a line starting with ``FAILED`` is an issue call that failed (the others still run).
 
-    all_issues holds open and closed issues. A closed update issue whose marker is not
-    ``resolved`` was closed by a maintainer ("won't bump"), so that (current, latest) pair is
-    skipped until upstream releases a newer version or the repository moves (a "Closes #N" PR
-    that bumped only part of the way). An open issue for a dependency no longer in results closes.
+    all_issues holds open and closed issues. A closed issue whose marker is not ``resolved``
+    was closed by a maintainer. For an update issue that means "won't bump": its (current,
+    latest) pair is skipped until upstream releases a newer version or the repository moves
+    (a "Closes #N" PR that bumped only part of the way). For a broken-source issue it means
+    "known": no new copy opens while the source stays unreadable, and the hand-close is
+    cleared once the source reads again. An open issue for a dependency no longer in results
+    closes.
     """
-    by, declined = {}, set()
+    by, declined, declined_broken = {}, set(), {}
     for i in all_issues:
         st = read_marker(i.get("body", ""))
         if not (st and st.get("kind") in ("update", "broken") and "key" in st):
             continue
         if i.get("state", "OPEN").upper() == "OPEN":
             by[(st["kind"], st["key"])] = (i, st)
-        elif st["kind"] == "update" and not st.get("resolved"):
+        elif st.get("resolved"):
+            continue
+        elif st["kind"] == "update":
             declined.add((st["key"], st.get("version"), st.get("current")))
+        else:
+            declined_broken[st["key"]] = (i, st)
     log = []
     for r in results:
-        broken = by.get(("broken", r["key"]))
-        if r["error"]:
-            if not broken:
-                issues.create(f"Update check broken: {r['name']}", broken_body(r), BROKEN_LABELS)
-                log.append(f"opened broken-source issue for {r['name']}")
-            continue
-        if broken:
-            issues.close(broken[0]["number"], f"The source reads again (`{r['latest']}`).",
-                         resolved_body(*broken))
-            log.append(f"closed broken-source issue #{broken[0]['number']}")
-        upd = by.get(("update", r["key"]))
-        newer = is_newer(r["latest"], r["current"])
-        title = f"Update {r['name']} {r['current']} -> {r['latest']}"
-        if newer and not upd:
-            if (r["key"], r["latest"], r["current"]) in declined:
-                continue
-            issues.create(title, update_body(r), UPDATE_LABELS)
-            log.append(f"opened update issue for {r['name']} {r['latest']}")
-        elif newer and upd is not None and (upd[1].get("version"), upd[1].get("current")) != (r["latest"], r["current"]):
-            note = (f"Upstream is now at `{r['latest']}`." if upd[1].get("version") != r["latest"]
-                    else f"The repository is now at `{r['current']}`, still behind `{r['latest']}`.")
-            issues.update(upd[0]["number"], title, update_body(r), note)
-            log.append(f"retitled #{upd[0]['number']} to {r['current']} -> {r['latest']}")
-        elif not newer and upd is not None:
-            issues.close(upd[0]["number"], f"The repository is now at `{r['current']}`; "
-                                           f"upstream latest is `{r['latest']}`.", resolved_body(*upd))
-            log.append(f"closed update issue #{upd[0]['number']}")
+        try:
+            log += _reconcile_one(r, issues, by, declined, declined_broken)
+        except Exception as e:  # one failed gh call must not stop the other dependencies
+            log.append(f"FAILED {r['name']}: {getattr(e, 'stderr', None) or e}")
     tracked = {r["key"] for r in results}
     for (kind, key), (issue, st) in sorted(by.items(), key=lambda kv: kv[1][0]["number"]):
         if key not in tracked:
-            issues.close(issue["number"], f"`{key}` is no longer in the dependency inventory.",
-                         resolved_body(issue, st))
-            log.append(f"closed {kind} issue #{issue['number']} (no longer tracked)")
+            try:
+                issues.close(issue["number"], f"`{key}` is no longer in the dependency inventory.",
+                             resolved_body(issue, st))
+                log.append(f"closed {kind} issue #{issue['number']} (no longer tracked)")
+            except Exception as e:
+                log.append(f"FAILED closing #{issue['number']}: {getattr(e, 'stderr', None) or e}")
+    return log
+
+
+def _reconcile_one(r: dict, issues, by: dict, declined: set, declined_broken: dict) -> list[str]:
+    log = []
+    broken = by.get(("broken", r["key"]))
+    if r["error"]:
+        if not broken and r["key"] not in declined_broken:
+            issues.create(f"Update check broken: {r['name']}", broken_body(r), BROKEN_LABELS)
+            log.append(f"opened broken-source issue for {r['name']}")
+        return log
+    if broken:
+        issues.close(broken[0]["number"], f"The source reads again (`{r['latest']}`).", resolved_body(*broken))
+        log.append(f"closed broken-source issue #{broken[0]['number']}")
+    if r["key"] in declined_broken:
+        issues.edit_body(declined_broken[r["key"]][0]["number"], resolved_body(*declined_broken[r["key"]]))
+        log.append(f"cleared the hand-close of broken-source issue #{declined_broken[r['key']][0]['number']}")
+    upd = by.get(("update", r["key"]))
+    newer = is_newer(r["latest"], r["current"])
+    title = f"Update {r['name']} {r['current']} -> {r['latest']}"
+    if newer and not upd:
+        if (r["key"], r["latest"], r["current"]) not in declined:
+            issues.create(title, update_body(r), UPDATE_LABELS)
+            log.append(f"opened update issue for {r['name']} {r['latest']}")
+    elif newer and upd is not None and (upd[1].get("version"), upd[1].get("current")) != (r["latest"], r["current"]):
+        note = (f"Upstream is now at `{r['latest']}`." if upd[1].get("version") != r["latest"]
+                else f"The repository is now at `{r['current']}`, still behind `{r['latest']}`.")
+        issues.update(upd[0]["number"], title, update_body(r), note)
+        log.append(f"retitled #{upd[0]['number']} to {r['current']} -> {r['latest']}")
+    elif not newer and upd is not None:
+        issues.close(upd[0]["number"], f"The repository is now at `{r['current']}`; "
+                                       f"upstream latest is `{r['latest']}`.", resolved_body(*upd))
+        log.append(f"closed update issue #{upd[0]['number']}")
     return log
 
 
@@ -328,14 +353,19 @@ def osv_summary(report: dict, issues, all_issues: list[dict], repo: str) -> list
         st = read_marker(i.get("body", ""))
         if st and st.get("kind") == "osv":
             reported.update(st.get("ids", []))
-    new = [f for f in osv_findings(report) if not reported.intersection(f["ids"])]
-    if not new:
+    found = [f for f in osv_findings(report) if not reported.intersection(f["ids"])]
+    if not found:
         return []
+    # Keep the body under GitHub's 65536-character limit: list at most OSV_MAX_ROWS; the rest
+    # stay unreported and open the next run's issue.
+    new, rest = found[:OSV_MAX_ROWS], len(found) - OSV_MAX_ROWS
     rows = "\n".join(f"| {f['severity']:.1f} | `{f['package']}` {f['version']} | {', '.join(f['ids'])} |" for f in new)
     body = (f"{marker({'kind': 'osv', 'ids': sorted({i for f in new for i in f['ids']})})}\n"
             f"The OSV scan of the nightly `.deb`'s installed runtime packages (Debian trixie) found "
             f"{len(new)} new High or Critical finding(s):\n\n| CVSS | Package | Advisories |\n|---|---|---|\n"
-            f"{rows}\n\nAll findings, including lower and unscored ones, are under "
+            f"{rows}\n\n"
+            + (f"{rest} more are not listed here; the next scan opens an issue for them.\n\n" if rest > 0 else "")
+            + f"All findings, including lower and unscored ones, are under "
             f"https://github.com/{repo}/security/code-scanning (tool `osv-scanner`). These packages come "
             "from Debian, so a fix usually reaches users through `apt upgrade`; act here when AlpacaBridge "
             "pins, bundles or builds against an affected version.\n\nOpened by `.github/workflows/osv-scan.yml`.\n")
@@ -403,6 +433,10 @@ def self_test() -> int:
         def update(self, number, title, body, comment):
             self.issues[number - 1].update(title=title, body=body)
             self.calls.append(("update", number, title))
+
+        def edit_body(self, number, body):
+            self.issues[number - 1]["body"] = body
+            self.calls.append(("edit_body", number))
 
         def close(self, number, comment, body=None):
             self.issues[number - 1]["state"] = "CLOSED"
@@ -504,6 +538,48 @@ def self_test() -> int:
     report["results"][0]["packages"][1]["groups"].append({"ids": ["CVE-2026-5"], "max_severity": "8.1"})
     assert osv_summary(report, f, f.issues, "o/r") and "CVE-2026-5" in f.issues[1]["body"]
     assert "CVE-2026-4" not in f.issues[1]["body"], "only the new finding is listed"
+    # A large first scan: the issue body stays under GitHub's 65536-character limit, and the
+    # findings it could not list stay unreported for the next run instead of failing every day.
+    big = {"results": [{"packages": [{"package": {"name": f"lib{n}", "version": "1"},
+                                      "groups": [{"ids": [f"CVE-2026-{n:05d}"], "max_severity": "8.0"}]}
+                                     for n in range(5000)]}]}
+    f = Fake()
+    osv_summary(big, f, f.issues, "o/r")
+    assert len(f.issues) == 1 and len(f.issues[0]["body"]) < 65536, len(f.issues[0]["body"])
+    listed = read_marker(f.issues[0]["body"])["ids"]
+    assert 0 < len(listed) < 5000 and f"CVE-2026-{0:05d}" in listed, len(listed)
+    osv_summary(big, f, f.issues, "o/r")
+    assert len(f.issues) == 2 and not set(listed) & set(read_marker(f.issues[1]["body"])["ids"])
+
+    # A broken-source issue closed by hand stays closed while the source is still unreadable,
+    # and is cleared once the source reads again, so a later break is reported.
+    f = Fake()
+    bad = [{"key": "x/y", "name": "x/y", "current": "1.0", "where": "ci.yml", "source": "s",
+            "latest": None, "error": "HTTP 500"}]
+    good = [{**bad[0], "latest": "1.0", "error": None}]
+    reconcile(bad, f, f.issues)
+    f.issues[0]["state"] = "CLOSED"
+    f.calls.clear()
+    reconcile(bad, f, f.issues)
+    assert f.calls == [], "a hand-closed broken-source issue is not reopened"
+    reconcile(good, f, f.issues)
+    assert read_marker(f.issues[0]["body"]).get("resolved"), "a readable source clears the hand-close"
+    f.calls.clear()
+    reconcile(bad, f, f.issues)
+    assert ("create", "Update check broken: x/y") in f.calls, f.calls
+
+    # One failed issue call does not stop the others; the failure is returned.
+    class Flaky(Fake):
+        def create(self, title, body, labels):
+            if "first" in title:
+                raise subprocess.CalledProcessError(1, ["gh"], stderr="label not found")
+            super().create(title, body, labels)
+
+    f = Flaky()
+    two = [{**bad[0], "key": "first", "name": "first"}, {**bad[0], "key": "second", "name": "second"}]
+    log = reconcile(two, f, f.issues)
+    assert [i["title"] for i in f.issues] == ["Update check broken: second"], f.issues
+    assert any(line.startswith("FAILED") and "first" in line for line in log), log
     print("dependency_updates self-test: OK")
     return 0
 
@@ -536,7 +612,7 @@ def main() -> int:
         print(f"| {name} | - | - | manual check (no `updates` source) |")
     log = reconcile(results, issues, issues.list("all"))
     print("\n" + ("\n".join(f"- {line}" for line in log) or "- no issue changes"))
-    return 0
+    return 1 if any(line.startswith("FAILED") for line in log) else 0
 
 
 if __name__ == "__main__":
