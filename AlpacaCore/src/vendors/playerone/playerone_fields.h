@@ -21,6 +21,7 @@
 #include <alpacacore/catalog/device_catalog.h>
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -34,14 +35,21 @@
 namespace alpacacore::catalog {
 
 // 0-based Player One SDK camera enumeration index; the thermal switch binds to
-// a camera by it too. No declared range: the router arms this replaces passed
-// any value through, and the driver refuses an out-of-range index at connect.
-inline const Field<std::int64_t> kPlayerOneCameraIndex{
-    .key = "cameraIndex", .default_value = 0, .role = Role::EnumerationIndex};
+// a camera by it too. Range 0..INT_MAX so validation refuses a value the
+// static_cast<int> in playerone_catalog.cpp would wrap; the driver still refuses
+// an index past the attached cameras at connect.
+inline const Field<std::int64_t> kPlayerOneCameraIndex{.key = "cameraIndex",
+                                                       .default_value = 0,
+                                                       .role = Role::EnumerationIndex,
+                                                       .min = 0,
+                                                       .max = std::numeric_limits<int>::max()};
 
-// 0-based Phoenix wheel enumeration index, no declared range (as above).
-inline const Field<std::int64_t> kPlayerOneFilterwheelIndex{
-    .key = "filterwheelIndex", .default_value = 0, .role = Role::EnumerationIndex};
+// 0-based Phoenix wheel enumeration index, same range as above.
+inline const Field<std::int64_t> kPlayerOneFilterwheelIndex{.key = "filterwheelIndex",
+                                                            .default_value = 0,
+                                                            .role = Role::EnumerationIndex,
+                                                            .min = 0,
+                                                            .max = std::numeric_limits<int>::max()};
 
 // Slot names. Absent leaves the driver's own defaults ("Filter 1..N").
 inline const Field<std::vector<std::string>> kPlayerOneFilterNames{.key = "filterNames", .default_value = {}};

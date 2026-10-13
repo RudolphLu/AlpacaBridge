@@ -18,11 +18,13 @@
 
 namespace alpacacore::vendor::svbony {
 
-enum class SVBImageType : std::uint8_t { Raw8, Raw16, Y8, Y16, Rgb24, Rgb32 };
+enum class SVBImageType : std::uint8_t { Raw8, Raw16, Y8, Y16, Rgb24, Rgb32, Unknown };
 
 enum class SVBBayerPattern : std::uint8_t { None, RG, BG, GR, GB };
 
 enum class SVBExposureStatus : std::uint8_t { Idle, Working, Success, Failed };
+
+enum class SVBVideoDataResult : std::uint8_t { Frame, Timeout };
 
 enum class SVBGuideDirection : std::uint8_t { North, South, East, West };
 
@@ -87,37 +89,30 @@ struct SVBROIFormat {
  * Production passes the SVBSDKWrapper singleton; tests inject a scripted fake
  * through the factory overload in svbony_camera_driver.h, so the driver runs
  * without the vendor SDK. The destructor is protected and non-virtual: nothing
- * owns an SVBSDK*, the driver holds a reference.
+ * owns an SVBSDK*, the driver holds a reference. The seam must outlive every
+ * driver (and its joined exposure worker).
  */
 class SVBSDK {
 public:
     virtual std::vector<SVBCameraInfo> enumerate_cameras() = 0;
     virtual bool get_camera_info_by_index(int camera_index, SVBCameraInfo& info) = 0;
-
     virtual void open_camera(int camera_id) = 0;
     virtual void close_camera(int camera_id) = 0;
-
     virtual std::vector<SVBControlCaps> get_control_caps(int camera_id) = 0;
     virtual bool get_control_value(int camera_id, SVBControlType type, long& value, bool& is_auto) = 0;
     virtual void set_control_value(int camera_id, SVBControlType type, long value, bool is_auto) = 0;
-
     virtual SVBROIFormat get_roi_format(int camera_id) = 0;
     virtual void set_roi_format(int camera_id, int start_x, int start_y, int width, int height, int bin) = 0;
-
     virtual SVBImageType get_output_image_type(int camera_id) = 0;
     virtual void set_output_image_type(int camera_id, SVBImageType type) = 0;
-
     virtual void start_video_capture(int camera_id) = 0;
     virtual void stop_video_capture(int camera_id) = 0;
-    virtual void get_video_data(int camera_id, std::uint8_t* buffer, long buffer_size, int wait_ms) = 0;
-
+    virtual SVBVideoDataResult get_video_data(int camera_id, std::uint8_t* buffer, long buffer_size, int wait_ms) = 0;
     virtual void pulse_guide(int camera_id, SVBGuideDirection direction, int duration_ms) = 0;
-
     virtual float get_sensor_pixel_size(int camera_id) = 0;
     virtual std::string get_serial_number(int camera_id) = 0;
     virtual std::string get_sdk_version() = 0;
     virtual std::string get_firmware_version(int camera_id) = 0;
-
     virtual void set_camera_mode_normal(int camera_id) = 0;
     virtual void set_auto_save_param(int camera_id, bool enable) = 0;
     virtual void restore_default_param(int camera_id) = 0;

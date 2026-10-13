@@ -1841,6 +1841,7 @@ std::string SkyWatcherProtocolWrapper::send_command(char command, int axis, cons
     const int retransmit_attempts = stop ? kSerialIdempotentRetries : 1;
     const int expected_len = expected_reply_data_len(command);
     std::string reply;
+    bool resent = false;
     for (int attempt = 0;; ++attempt) {
         reply = pimpl_->exchange(frame, timeout, expected_len, retransmit_attempts);
         // TRACE-only wire log: every motor-controller frame and its reply,
@@ -1871,10 +1872,14 @@ std::string SkyWatcherProtocolWrapper::send_command(char command, int axis, cons
         // only a "!" reply or a "=" reply of the expected length and drops any other
         // datagram, so a malformed/mis-paired reply never reaches this branch on the
         // UDP (Wi-Fi) transport.
-        // TODO: a resend of a motion command whose FIRST frame was applied can draw
-        // a "!" rejection (e.g. ":J" -> "motor not stopped"), surfacing as
-        // MotorControllerRejected on a move that actually started. If that proves to
-        // matter on a bench, limit the malformed/mis-pair resend to inquiry commands.
+        // The one non-idempotent case is the start ":J": if the first frame started
+        // the axis and only its ack was garbled, the resend draws "!2" (motor not
+        // stopped). Reporting that as MotorControllerRejected would tell the client
+        // a move failed while the axis runs with no stop path, so a "!2" to the
+        // RESENT ":J" is taken as the start having landed (see below). Chosen over
+        // dropping the resend for set commands because a lost first frame is then
+        // still recovered, and the outcome is right whether or not the board
+        // rejects a repeated start. A first-frame "!" is never reinterpreted.
         const bool is_ok = !reply.empty() && reply[0] == kReplyOk;
         const bool is_error = !reply.empty() && reply[0] == kReplyError;
         const bool mispaired = is_ok && expected_len >= 0 && static_cast<int>(reply.size()) - 1 != expected_len;
@@ -1893,6 +1898,7 @@ std::string SkyWatcherProtocolWrapper::send_command(char command, int axis, cons
         // its next exchange answered by the straggler -- a same-shaped one passes
         // the shape check (PR #245 review).
         pimpl_->settle_after_mispair();
+        resent = true;
         if (attempt > 0) {
             throw AlpacaException(std::string(malformed ? "Malformed" : "Mis-paired") + " motor controller reply to '" +
                                   std::string(1, command) + std::to_string(axis) + "': '" + reply + "'");
@@ -1902,6 +1908,12 @@ std::string SkyWatcherProtocolWrapper::send_command(char command, int axis, cons
         return reply.substr(1);
     }
     if (!reply.empty() && reply[0] == kReplyError) {
+        if (resent && command == 'J' && reply == "!2") {
+            ALPACA_LOG_WARN("SkyWatcher", "Resent '" + frame.substr(0, frame.size() - 1) +
+                                              "' drew 'motor not stopped': the first frame started the axis; "
+                                              "treating the start as accepted");
+            return "";
+        }
         throw MotorControllerRejected("Motor controller rejected '" + std::string(1, command) + std::to_string(axis) +
                                           "': " + mc_error_message(reply.substr(1)),
                                       reply.substr(1));

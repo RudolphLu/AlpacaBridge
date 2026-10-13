@@ -765,7 +765,7 @@ public:
     bool get_is_pulse_guiding() const override {
         std::lock_guard<std::mutex> lock(mutex_);
         check_connected();
-        const auto now = std::chrono::steady_clock::now();
+        const auto now = clock_.now();
         for (int i = 0; i < 2; ++i) {
             if (pulse_axis_active_[i] && now >= pulse_guide_end_time_[i]) {
                 pulse_axis_active_[i] = false;
@@ -1523,7 +1523,7 @@ public:
                 throw AlpacaException("Invalid PulseGuide direction", AlpacaError::InvalidValue);
             }
 
-            const auto now = std::chrono::steady_clock::now();
+            const auto now = clock_.now();
 
             // Reads are live (dead-reckoned) during pulses — no frozen-target
             // accumulation, and pulses never rewrite the slew Target
