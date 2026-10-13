@@ -598,6 +598,9 @@ TEST_CASE("Celestron Telescope Driver - AbortSlew reports a stop it could not se
     alpacacore::test::FakeMountServer server([log, log_mutex](const std::string& command) {
         std::lock_guard<std::mutex> lock(*log_mutex);
         log->push_back(command);
+        if (command == "L") return std::string("0#");
+        if (command == "M") return std::string("#");
+        if (!command.empty() && command[0] == 'P') return std::string(8, '\0') + "#";
         return std::string("00000000,00000000#");
     });
     REQUIRE(server.ok());
@@ -627,7 +630,7 @@ TEST_CASE("Celestron Telescope Driver - AbortSlew reports a stop it could not se
         CHECK(axis_stops == 4);  // each axis gets both stop directions
     }
 
-    SECTION("a dropped link throws DriverException and leaves Slewing true") {
+    SECTION("a dropped link throws DriverException and keeps the slew error observable") {
         REQUIRE(server.drop_connections());
         try {
             driver->abort_slew();
@@ -636,7 +639,13 @@ TEST_CASE("Celestron Telescope Driver - AbortSlew reports a stop it could not se
             CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
             CHECK(std::string(ex.what()).rfind("AbortSlew stop failed: ", 0) == 0);
         }
-        CHECK(driver->get_slewing());
+        try {
+            (void)driver->get_slewing();
+            FAIL("Slewing returned a completion value after the stop failed");
+        } catch (const alpacacore::AlpacaException& ex) {
+            CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+            CHECK(std::string(ex.what()).rfind("AbortSlew stop failed: ", 0) == 0);
+        }
     }
 
     driver->set_connected(false);
