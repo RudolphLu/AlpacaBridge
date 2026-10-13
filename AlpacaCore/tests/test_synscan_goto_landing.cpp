@@ -76,6 +76,11 @@ struct LandingOffsetHandset {
     // the random per-GOTO Dec scatter a SynScan handset shows on a real mount (#1027).
     std::atomic<bool> dec_scripted{false};
     std::array<std::atomic<int32_t>, 4> dec_offset_script{};
+    // When set, GOTO n (1-based, up to the array size) lands ra_offset_script[n-1] further counts east: the ~49'
+    // miss the EQM-35 Pro's handset makes on some targets (#1105). commanded_ra records each GOTO's aim.
+    std::atomic<bool> ra_scripted{false};
+    std::array<std::atomic<uint32_t>, 4> ra_offset_script{};
+    std::array<std::atomic<uint32_t>, 4> commanded_ra{};
     // The once-a-second RA readback sawtooth (#1030), phased from `sawtooth_epoch`.
     std::atomic<bool> sawtooth{false};
     std::atomic<Clock::rep> sawtooth_epoch{0};
@@ -184,6 +189,12 @@ alpacacore::test::FakeMountServer::Responder responder(const std::shared_ptr<Lan
                 uint32_t offset = st->ra_offset_counts.load() * (st->growing.load() ? ordinal : 1U);
                 if (st->reroll.load() && ordinal % 2 == 0) {
                     offset += static_cast<uint32_t>(std::lround(kCountsPerSecondOfRa));
+                }
+                if (ordinal <= static_cast<int>(st->commanded_ra.size())) {
+                    st->commanded_ra[static_cast<std::size_t>(ordinal - 1)].store(ra);
+                }
+                if (st->ra_scripted.load() && ordinal <= static_cast<int>(st->ra_offset_script.size())) {
+                    offset += st->ra_offset_script[static_cast<std::size_t>(ordinal - 1)].load();
                 }
                 const int32_t requested_dec_move = static_cast<int32_t>(dec) - static_cast<int32_t>(st->dec_raw.load());
                 st->ra_raw.store((ra + offset) & kCountsMask);
@@ -705,6 +716,120 @@ TEST_CASE("SynScan GOTO landing - a residual beyond a timed move's reach gets on
     CHECK(st->goto_count.load() == 2);  // the GOTO and one re-GOTO, then timed moves
     CHECK(st->nudge_count.load() >= 1);
     CHECK(ra_error_arcsec(*driver, kTargetRa) < 3.0);
+    driver->set_connected(false);
+}
+
+namespace {
+
+// 38,100 counts (2,941"): the RA miss of the handset's first GOTO in the #1105 TRACE.
+constexpr uint32_t kFarMissCounts = 38100;
+
+// Waits for an async slew to end. Returns the DriverException message if a Slewing read throws, else "".
+std::string wait_async_slew(alpacacore::TelescopeDriver& driver) {
+    const auto deadline = Clock::now() + std::chrono::seconds(60);
+    try {
+        while (driver.get_slewing() && Clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    } catch (const alpacacore::AlpacaException& e) {
+        CHECK(e.error_code() == alpacacore::AlpacaError::DriverException);
+        return e.what();
+    }
+    return "";
+}
+
+}  // namespace
+
+TEST_CASE("SynScan GOTO landing - a GOTO the handset ends 49 arcmin off is repeated once to the same target (#1105)",
+          "[synscan][telescope][goto-landing]") {
+    auto st = std::make_shared<LandingOffsetHandset>();
+    st->ra_offset_script[0].store(kFarMissCounts);
+    st->ra_scripted.store(true);
+    alpacacore::test::FakeMountServer server(responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
+        0, endpoint(server.port()), alpacacore::vendor::synscan::SynScanVersion::V4);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    use_fast_guide_rate(*driver);
+
+    REQUIRE_NOTHROW(driver->slew_to_coordinates(kTargetRa, kTargetDec));
+
+    CHECK(st->goto_count.load() == 2);
+    // The repeat aims at the target itself: one aimed by the 49' residual would land 49' west.
+    CHECK(st->commanded_ra[1].load() == st->commanded_ra[0].load());
+    CHECK(ra_error_arcsec(*driver, kTargetRa) < 3.0);
+    CHECK(dec_error_arcsec(*driver, kTargetDec) < 3.0);
+    driver->set_connected(false);
+}
+
+TEST_CASE("SynScan GOTO landing - a GOTO that misses by 49 arcmin twice fails the slew (#1105)",
+          "[synscan][telescope][goto-landing]") {
+    auto st = std::make_shared<LandingOffsetHandset>();
+    st->ra_offset_script[0].store(kFarMissCounts);
+    st->ra_offset_script[1].store(kFarMissCounts);
+    st->ra_scripted.store(true);
+    alpacacore::test::FakeMountServer server(responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
+        0, endpoint(server.port()), alpacacore::vendor::synscan::SynScanVersion::V4);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    use_fast_guide_rate(*driver);
+
+    bool threw = false;
+    try {
+        driver->slew_to_coordinates(kTargetRa, kTargetDec);
+    } catch (const alpacacore::AlpacaException& e) {
+        threw = true;
+        CHECK(e.error_code() == alpacacore::AlpacaError::DriverException);
+        CHECK(std::string(e.what()).find("arcsec") != std::string::npos);
+    }
+    CHECK(threw);
+    CHECK(st->goto_count.load() == 2);  // one repeat, never a third GOTO
+    CHECK_FALSE(driver->get_slewing());
+    driver->set_connected(false);
+}
+
+TEST_CASE("SynScan GOTO landing - an async GOTO ending 49 arcmin off is repeated while Slewing stays true (#1105)",
+          "[synscan][telescope][goto-landing]") {
+    auto st = std::make_shared<LandingOffsetHandset>();
+    st->ra_offset_script[0].store(kFarMissCounts);
+    st->ra_scripted.store(true);
+    alpacacore::test::FakeMountServer server(responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
+        0, endpoint(server.port()), alpacacore::vendor::synscan::SynScanVersion::V4);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    use_fast_guide_rate(*driver);
+
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(kTargetRa, kTargetDec));
+    CHECK(wait_async_slew(*driver).empty());
+
+    // Slewing fell only after the repeat GOTO and its landing moves.
+    CHECK_FALSE(driver->get_slewing());
+    CHECK(st->goto_count.load() == 2);
+    CHECK(st->commanded_ra[1].load() == st->commanded_ra[0].load());
+    CHECK(ra_error_arcsec(*driver, kTargetRa) < 3.0);
+    driver->set_connected(false);
+}
+
+TEST_CASE("SynScan GOTO landing - an async GOTO that misses by 49 arcmin twice is reported through Slewing (#1105)",
+          "[synscan][telescope][goto-landing]") {
+    auto st = std::make_shared<LandingOffsetHandset>();
+    st->ra_offset_script[0].store(kFarMissCounts);
+    st->ra_offset_script[1].store(kFarMissCounts);
+    st->ra_scripted.store(true);
+    alpacacore::test::FakeMountServer server(responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
+        0, endpoint(server.port()), alpacacore::vendor::synscan::SynScanVersion::V4);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    use_fast_guide_rate(*driver);
+
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(kTargetRa, kTargetDec));
+    const std::string error = wait_async_slew(*driver);
+
+    CHECK(error.find("arcsec") != std::string::npos);
+    CHECK(st->goto_count.load() == 2);
     driver->set_connected(false);
 }
 
