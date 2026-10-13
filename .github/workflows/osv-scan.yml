@@ -93,7 +93,7 @@ jobs:
           sarif_file: osv.sarif
           category: osv-scanner-nightly-deb
 
-      - name: Open a summary issue for new High/Critical findings
+      - name: Open a summary issue for new fixable High/Critical findings
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

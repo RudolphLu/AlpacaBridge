@@ -388,7 +388,7 @@ def update_body(r: dict) -> str:
         return system_body(r)
     return (f"{marker({'kind': 'update', 'key': r['key'], 'version': r['latest'], 'current': r['current']})}\n"
             f"`{r['name']}` has a newer upstream version.\n\n"
-            f"| | |\n|---|---|\n| In this repository | `{r['current']}` |\n| Upstream | `{r['latest']}` |\n"
+            f"| Field | Value |\n|---|---|\n| In this repository | `{r['current']}` |\n| Upstream | `{r['latest']}` |\n"
             f"| Pinned in | `{r['where']}` |\n| Source | {r['source']} |\n\n"
             "Bump the pin where it is declared (for a vendored SDK, also its directory and the "
             "`--pin` digest, see docs/development.md \"Dependency graph\"), check the upstream "
@@ -399,7 +399,7 @@ def update_body(r: dict) -> str:
 def system_body(r: dict) -> str:
     return (f"{marker({'kind': 'update', 'key': r['key'], 'version': r['latest'], 'current': r['current']})}\n"
             f"Upstream `{r['name']}` is ahead of the version this project builds against.\n\n"
-            f"| | |\n|---|---|\n| Recorded baseline (Debian trixie `{r['debian']}`) | `{r['current']}` |\n"
+            f"| Field | Value |\n|---|---|\n| Recorded baseline (Debian trixie `{r['debian']}`) | `{r['current']}` |\n"
             f"| Upstream | `{r['latest']}` |\n| Source | {r['source']} |\n\n"
             "The build takes this library from Debian (`debian/control`), so there is no pin to bump. Review "
             "what the new release adds or fixes for the driver (for libgphoto2: new camera bodies), and set "
@@ -454,7 +454,7 @@ def document_body(r: dict) -> str:
     # keeps them apart from SDK and purl keys in reconcile().
     return (f"{marker({'kind': 'update', 'key': r['key'], 'version': r['latest'], 'current': r['current']})}\n"
             f"An upstream document a driver is built from has changed: `{r['name']}`.\n\n"
-            f"| | |\n|---|---|\n| Recorded baseline | `{r['current']}` |\n| Upstream now | `{r['latest']}` |\n"
+            f"| Field | Value |\n|---|---|\n| Recorded baseline | `{r['current']}` |\n| Upstream now | `{r['latest']}` |\n"
             f"{local}| Source | {r['source']} |\n\n"
             "Review what changed upstream against the driver (and refresh the local copy if there is one), "
             "then set this document's `baseline` in `scripts/dependency_sdk_versions.json` to the upstream "
@@ -995,6 +995,11 @@ def self_test() -> int:
     reconcile([lib], f, f.issues)
     assert f.issues[0]["title"] == "Update libgphoto2 2.5.31 -> v2.5.34" and f.issues[0]["labels"] == UPDATE_LABELS
     assert "Debian" in f.issues[0]["body"] and "baseline" in f.issues[0]["body"], "says it is Debian-provided"
+
+    # Issue tables have a real header row: an empty "| | |" header renders as a blank row (#1134).
+    for body in (update_body({**lib, "system": False, "where": "w"}), system_body(lib),
+                 document_body({**lib, "document": True, "path": "p"})):
+        assert "| | |" not in body and "| Field | Value |\n|---|---|\n" in body, body
 
     # --- Changelogs in issues ---
     pages["https://api.github.com/repos/gphoto/libgphoto2/releases/tags/v2.5.34"] = json.dumps(
