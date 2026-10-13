@@ -1,0 +1,39 @@
+# Opens one issue per dependency with a newer upstream version, and one per
+# update source that can no longer be read (scripts/dependency_updates.py; see
+# docs/development.md "Dependency update checks"). It checks the GitHub-hosted
+# pins in the dependency snapshot and the SDKs with an `updates` block in
+# scripts/dependency_sdk_versions.json. Issue state lives in each issue body,
+# so the workflow never commits. Dependabot keeps owning the action pins.
+
+name: Dependency updates
+
+on:
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: dependency-updates
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check upstream versions
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write   # open, retitle and close the dependency issues
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check and update issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 scripts/dependency_updates.py | tee -a "${GITHUB_STEP_SUMMARY}"

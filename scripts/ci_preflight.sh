@@ -367,7 +367,8 @@ if python3 scripts/check_docs_drift.py --self-test && python3 scripts/check_docs
    && python3 scripts/release_tag.py --self-test \
    && python3 scripts/merge_down.py --self-test \
    && python3 scripts/dependency_snapshot.py --self-test \
-   && python3 scripts/dependency_snapshot.py --check; then
+   && python3 scripts/dependency_snapshot.py --check \
+   && python3 scripts/dependency_updates.py --self-test; then
   record PASS "docs drift check"
 else
   record FAIL "docs drift check"

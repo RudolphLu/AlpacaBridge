@@ -48,6 +48,9 @@ CI = ".github/workflows/ci.yml"
 # (ci.yml step name, purl template): tools CI downloads at a pinned version.
 CI_TOOL_STEPS = (("Build cppcheck 2.17.x from source", "pkg:github/danmar/cppcheck@{ver}"),
                  ("Install zizmor", "pkg:github/zizmorcore/zizmor@v{ver}"))
+# The same ver= pins in other workflows: {workflow path: ((step name, purl template), ...)}.
+WORKFLOW_TOOL_STEPS = {".github/workflows/osv-scan.yml": (("Install OSV-Scanner",
+                                                          "pkg:github/google/osv-scanner@v{ver}"),)}
 # Unpinned tools ci.yml installs from the runner's apt (Ubuntu 24.04, not trixie).
 CI_APT_TOOLS = ("catch2", "clang-format", "clang-tidy", "gcovr", "nodejs", "shellcheck")
 CI_APT_QUALIFIERS = "arch=arm64&distro=ubuntu-24.04"
@@ -55,6 +58,7 @@ CI_APT_QUALIFIERS = "arch=arm64&distro=ubuntu-24.04"
 # maintainer's 4.5.1 beta (no GitHub release yet) and names the build it must match.
 CONFORMU_DOC = ".claude/commands/conformu.md"
 CONFORMU_BUILD_RE = re.compile(r"`(\d+\.\d+\.\d+)\.\d+, Build time:")
+CONFORMU_BETA_URL = "download.ascom-standards.org/beta/"
 DETECTOR = {"name": "alpacabridge-dependency-snapshot", "version": "1",
             "url": "https://github.com/open-astro/AlpacaBridge/blob/main/scripts/dependency_snapshot.py"}
 
@@ -108,6 +112,20 @@ def _step_block(text: str, step: str) -> str | None:
     return m.group(1) if m else None
 
 
+def parse_step_pins(text: str, path: str, steps) -> tuple[list[str], list[str]]:
+    """Return (purls, errors) for the ``ver=`` pin inside each named workflow step."""
+    purls, errors = [], []
+    for step, fmt in steps:
+        block = _step_block(text, step)
+        ver = re.search(r"^\s*ver=([0-9][0-9.]*)\s*$", block, re.M) if block is not None else None
+        if ver:
+            purls.append(fmt.format(ver=ver.group(1)))
+        else:
+            errors.append(f"{path}: no 'ver=' pin found in the step '{step}': update CI_TOOL_STEPS "
+                          "or WORKFLOW_TOOL_STEPS in scripts/dependency_snapshot.py to match the workflow")
+    return purls, errors
+
+
 def parse_ci_tools(text: str) -> tuple[list[str], list[str]]:
     """Return (purls, errors) for the tools ci.yml installs outside debian/control.
 
@@ -115,15 +133,7 @@ def parse_ci_tools(text: str) -> tuple[list[str], list[str]]:
     CI_APT_TOOLS come unpinned from the runner's apt (Ubuntu 24.04), so their purls
     carry no version.
     """
-    purls, errors = [], []
-    for step, fmt in CI_TOOL_STEPS:
-        block = _step_block(text, step)
-        ver = re.search(r"^\s*ver=([0-9][0-9.]*)\s*$", block, re.M) if block is not None else None
-        if ver:
-            purls.append(fmt.format(ver=ver.group(1)))
-        else:
-            errors.append(f"{CI}: no 'ver=' pin found in the step '{step}': update CI_TOOL_STEPS "
-                          "in scripts/dependency_snapshot.py to match the workflow")
+    purls, errors = parse_step_pins(text, CI, CI_TOOL_STEPS)
     installed = parse_apt_installs(text)
     for tool in CI_APT_TOOLS:
         if tool in installed:
@@ -146,32 +156,72 @@ def parse_apt_installs(text: str) -> set[str]:
             i += 1
             line = lines[i]
             words += line.split()
-        names.update(w for w in words if w != "\\" and not w.startswith("-"))
+        for w in words:
+            # The command ends at a shell separator: "install foo && echo bar" installs only foo,
+            # and so does "install foo; echo bar".
+            end = w in ("&&", "||", "|", ";") or w.endswith(";")
+            w = w.rstrip(";")
+            if w and w not in ("&&", "||", "|", "\\") and not w.startswith("-") \
+                    and not any(c in w for c in "<>$="):
+                names.add(w)
+            if end:
+                break
     return names
 
 
 def parse_conformu(text: str) -> tuple[list[str], list[str]]:
-    """Return (purls, errors) for the ConformU build /conformu pins (the 4.5.1 beta)."""
+    """Return (purls, errors) for the ConformU build /conformu pins.
+
+    The version carries ``-beta`` only while the doc installs from the ASCOM beta download
+    (``CONFORMU_BETA_URL``); a pin on a GitHub release reports the bare version.
+    """
     m = CONFORMU_BUILD_RE.search(text)
     if not m:
         return [], [f"{CONFORMU_DOC}: no pinned ConformU build ('`X.Y.Z.N, Build time:`') found: "
                     "if ConformU is now a GitHub release, update parse_conformu in scripts/dependency_snapshot.py"]
-    return [f"pkg:github/ASCOMInitiative/ConformU@{m.group(1)}-beta"], []
+    suffix = "-beta" if CONFORMU_BETA_URL in text else ""
+    return [f"pkg:github/ASCOMInitiative/ConformU@{m.group(1)}{suffix}"], []
 
 
 def parse_containers(text: str) -> list[str]:
-    """Return a docker purl per job ``container:`` image (string or ``image:`` form) in a workflow."""
-    images = re.findall(r"^\s*container:\s*([^\s#{][^\s#]*)\s*$", text, re.M)
-    images += re.findall(r"^\s*container:\s*$\n\s+image:\s*([^\s#]+)", text, re.M)
+    """Return a docker purl per job ``container:`` image (string or mapping form) in a workflow.
+
+    In the mapping form ``image:`` may follow other keys (``credentials:``, ``options:``). An
+    image on another registry keeps that registry in the ``repository_url`` qualifier, as the
+    purl spec requires; ``${{ ... }}`` expressions are skipped.
+    """
+    images = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*)container:\s*([^#]*?)\s*(?:#.*)?$", line)
+        if not m:
+            continue
+        if m.group(2):
+            images.append(m.group(2))
+            continue
+        indent = len(m.group(1))
+        for sub in lines[i + 1:]:
+            if sub.strip() and len(sub) - len(sub.lstrip()) <= indent:
+                break
+            im = re.match(r"^\s*image:\s*([^\s#]+)", sub)
+            if im:
+                images.append(im.group(1))
+                break
     out = []
     for image in images:
+        if image.startswith("${{"):
+            continue
         if "@" in image:
             name, ver = image.split("@", 1)
         elif ":" in image.rsplit("/", 1)[-1]:
             name, ver = image.rsplit(":", 1)
         else:
             name, ver = image, "latest"
-        purl = f"pkg:docker/{name}@{urllib.parse.quote(ver, safe='')}"
+        qualifier = ""
+        first, _, rest = name.partition("/")
+        if rest and ("." in first or ":" in first or first == "localhost"):
+            name, qualifier = rest, "?repository_url=" + urllib.parse.quote(first, safe="")
+        purl = f"pkg:docker/{name}@{urllib.parse.quote(ver, safe='')}{qualifier}"
         if purl not in out:
             out.append(purl)
     return out
@@ -207,6 +257,10 @@ def build_snapshot(root: Path, sha: str, ref: str, job_id: str, scanned: str) ->
     if (root / CI).is_file():
         tools, _ = parse_ci_tools((root / CI).read_text(encoding="utf-8"))
         manifests[CI] = manifest(CI, [(p, "development") for p in tools])
+    for path, steps in WORKFLOW_TOOL_STEPS.items():
+        if (root / path).is_file():
+            pins, _ = parse_step_pins((root / path).read_text(encoding="utf-8"), path, steps)
+            manifests[path] = manifest(path, [(p, "development") for p in pins])
     if (root / CONFORMU_DOC).is_file():
         cu, _ = parse_conformu((root / CONFORMU_DOC).read_text(encoding="utf-8"))
         manifests[CONFORMU_DOC] = manifest(CONFORMU_DOC, [(p, "development") for p in cu])
@@ -418,6 +472,9 @@ def check_drift(root: Path) -> list[str]:
         walk(EXTERNAL)
     if (root / CI).is_file():
         errors += parse_ci_tools((root / CI).read_text(encoding="utf-8"))[1]
+    for path, steps in WORKFLOW_TOOL_STEPS.items():
+        if (root / path).is_file():
+            errors += parse_step_pins((root / path).read_text(encoding="utf-8"), path, steps)[1]
     if (root / CONFORMU_DOC).is_file():
         errors += parse_conformu((root / CONFORMU_DOC).read_text(encoding="utf-8"))[1]
     return errors
@@ -455,6 +512,10 @@ def self_test() -> int:
                                     "pkg:github/zizmorcore/zizmor@v1.25.2", *apt], (tools, errs)
     assert "cmake" in parse_apt_installs(ci) and "-y" not in parse_apt_installs(ci)
     assert "echo" not in parse_apt_installs(ci), "a continuation ends at a line without a backslash"
+    # The install command ends at a shell separator: a name after && or ; is not installed.
+    for sep in (" && echo nodejs", "; echo nodejs", " | tee nodejs"):
+        line = f"sudo apt-get install -y gcovr{sep}\n"
+        assert parse_apt_installs(line) == {"gcovr"}, (sep, parse_apt_installs(line))
     # A reworded step or a dropped apt line is reported, never silently omitted.
     tools, errs = parse_ci_tools(ci.replace("Install zizmor", "Fetch zizmor").replace("catch2 ", ""))
     assert tools == ["pkg:github/danmar/cppcheck@2.17.1", *apt[1:]], tools
@@ -465,15 +526,27 @@ def self_test() -> int:
     # A step with no ver= pin does not borrow the next step's.
     _, errs = parse_ci_tools(ci.replace("          ver=2.17.1\n", ""))
     assert len(errs) == 1 and "cppcheck" in errs[0], errs
-    cu_doc = "line it prints against the build, `4.5.1.54507, Build time:\nThu 27 August 2026` -- ok\n"
+    cu_doc = ("curl -o cu.tar.xz 'https://download.ascom-standards.org/beta/conformu.linux-arm64.tar.xz'\n"
+              "line it prints against the build, `4.5.1.54507, Build time:\nThu 27 August 2026` -- ok\n")
     assert parse_conformu(cu_doc) == (["pkg:github/ASCOMInitiative/ConformU@4.5.1-beta"], [])
+    # Pinned to a GitHub release (no beta download URL): the bare version, no -beta.
+    released = cu_doc.replace("download.ascom-standards.org/beta/", "github.com/ASCOMInitiative/ConformU/")
+    assert parse_conformu(released) == (["pkg:github/ASCOMInitiative/ConformU@4.5.1"], [])
     cu, errs = parse_conformu("go back to the ordinary release asset\n")
     assert cu == [] and len(errs) == 1 and CONFORMU_DOC in errs[0], errs
     wf = ("jobs:\n  a:\n    container: debian:trixie\n  b:\n    container: debian:trixie  # dup\n"
-          "  c:\n    container:\n      image: ghcr.io/o/img@sha256:ab\n  d:\n    container: ${{ matrix.c }}\n"
-          "  e:\n    container: alpine\n")
-    assert parse_containers(wf) == ["pkg:docker/debian@trixie", "pkg:docker/alpine@latest",
-                                    "pkg:docker/ghcr.io/o/img@sha256%3Aab"], parse_containers(wf)
+          "  c:\n    container:\n      credentials:\n        username: u\n      options: --cpus 1\n"
+          "      image: ghcr.io/o/img@sha256:ab\n    steps: []\n"
+          "  d:\n    container: ${{ matrix.c }}\n"
+          "  e:\n    container: alpine\n"
+          "  f:\n    container:\n      options: --privileged\n    steps:\n      - image: not-mine\n")
+    # image: after credentials:/options: is found; a registry goes to repository_url; an image:
+    # outside the container mapping (job f) is not the container's.
+    assert parse_containers(wf) == ["pkg:docker/debian@trixie",
+                                    "pkg:docker/o/img@sha256%3Aab?repository_url=ghcr.io",
+                                    "pkg:docker/alpine@latest"], parse_containers(wf)
+    assert parse_containers("    container: localhost:5000/team/img:1\n") == [
+        "pkg:docker/team/img@1?repository_url=localhost%3A5000"], parse_containers("container: localhost:5000/team/img:1")
     with tempfile.TemporaryDirectory() as d:
         r = Path(d)
         (r / "debian").mkdir()
@@ -511,7 +584,20 @@ def self_test() -> int:
         snap = build_snapshot(r, "a" * 40, "refs/heads/main", "1", "2026-01-01T00:00:00Z")
         assert "pkg:docker/debian@trixie" in snap["manifests"][".github/workflows/rel.yml"]["resolved"]
         assert ".github/workflows/ci.yml" in snap["manifests"], "a workflow with no container still has its own"
+        # ci.yml with a container keeps its tool entries and gains the image (merge, not overwrite).
+        (r / CI).write_text(ci + "  z:\n    container: debian:trixie\n")
+        merged = build_snapshot(r, "a" * 40, "refs/heads/main", "1", "2026-01-01T00:00:00Z")["manifests"][CI]["resolved"]
+        assert "pkg:docker/debian@trixie" in merged and "pkg:github/danmar/cppcheck@2.17.1" in merged, merged
+        (r / CI).write_text(ci)
         (r / ".github/workflows/rel.yml").unlink()
+        osv = "jobs:\n  s:\n    steps:\n      - name: Install OSV-Scanner\n        run: |\n          ver=2.7.0\n"
+        osv_path = next(iter(WORKFLOW_TOOL_STEPS))
+        (r / osv_path).write_text(osv)
+        snap = build_snapshot(r, "a" * 40, "refs/heads/main", "1", "2026-01-01T00:00:00Z")
+        assert list(snap["manifests"][osv_path]["resolved"]) == ["pkg:github/google/osv-scanner@v2.7.0"]
+        (r / osv_path).write_text(osv.replace("ver=2.7.0", "ver=latest"))
+        assert any(osv_path in e and "Install OSV-Scanner" in e for e in check_drift(r)), check_drift(r)
+        (r / osv_path).unlink()
         (r / CI).write_text(ci.replace("ver=1.25.2", "ver=latest"))
         assert any("'Install zizmor'" in e for e in check_drift(r)), check_drift(r)
         (r / CI).unlink()
