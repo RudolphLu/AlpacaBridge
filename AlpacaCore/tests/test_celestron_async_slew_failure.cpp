@@ -304,7 +304,8 @@ TEST_CASE("Celestron MoveAxis - failed dispatch preserves a stored slew error",
     driver->set_connected(false);
 }
 
-TEST_CASE("Celestron MoveAxis - successful dispatch clears a stored slew error", "[celestron][telescope][async][slewfailure]") {
+TEST_CASE("Celestron MoveAxis - successful dispatch clears a stored slew error",
+          "[celestron][telescope][async][slewfailure]") {
     auto st = std::make_shared<FakeCelestronState>();
     alpacacore::test::FakeMountServer server(celestron_responder(st));
     REQUIRE(server.ok());

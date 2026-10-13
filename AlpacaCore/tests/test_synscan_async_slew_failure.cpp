@@ -264,7 +264,8 @@ TEST_CASE("SynScan MoveAxis - failed dispatch preserves a stored slew error",
     driver->set_connected(false);
 }
 
-TEST_CASE("SynScan MoveAxis - successful dispatch clears a stored slew error", "[synscan][telescope][async][slewfailure]") {
+TEST_CASE("SynScan MoveAxis - successful dispatch clears a stored slew error",
+          "[synscan][telescope][async][slewfailure]") {
     auto st = std::make_shared<FakeSynScanState>();
     alpacacore::test::FakeMountServer server(synscan_responder(st));
     REQUIRE(server.ok());
