@@ -74,6 +74,12 @@ TEST_CASE("ZWO fake SDK - lazy download preserves padded ROI pixels", "[zwo][cam
     camera->start_exposure(0.001, true);
 
     CHECK(camera->get_image_ready());
+    const int roi_reads = sdk.call_count("get_roi_format");
+    const int start_reads = sdk.call_count("get_start_pos");
+    CHECK(camera->get_image_ready());
+    static_cast<void>(camera->get_camera_state());
+    CHECK(sdk.call_count("get_roi_format") == roi_reads);
+    CHECK(sdk.call_count("get_start_pos") == start_reads);
     CHECK(sdk.call_count("get_data_after_exposure") == 0);  // readiness never starts the USB bulk transfer
     CHECK(error_code([&] { camera->set_num_x(8); }) == AlpacaError::InvalidOperation);
 
@@ -167,7 +173,7 @@ TEST_CASE("ZWO fake SDK - geometry changes preserve last-exposure metadata", "[z
     auto camera = create_zwo_camera(0, sdk.camera.camera_id, sdk);
     connect_camera(*camera);
     camera->start_exposure(0.001, true);
-    REQUIRE_NOTHROW(camera->get_image_array());
+    const auto last_image = camera->get_image_array();
     const auto last_start = camera->get_last_exposure_start_time();
     const double last_duration = camera->get_last_exposure_duration();
     const auto check_history = [&] {
@@ -175,6 +181,15 @@ TEST_CASE("ZWO fake SDK - geometry changes preserve last-exposure metadata", "[z
         CHECK(camera->get_last_exposure_duration() == last_duration);
     };
 
+    const int stop_calls = sdk.call_count("stop_exposure");
+    camera->abort_exposure();  // an idle abort leaves the downloaded image and metadata available
+    check_history();
+    CHECK(camera->get_image_array().data == last_image.data);
+    CHECK(sdk.call_count("stop_exposure") == stop_calls);
+    camera->stop_exposure();  // an idle stop is also a no-op
+    check_history();
+    CHECK(camera->get_image_array().data == last_image.data);
+    CHECK(sdk.call_count("stop_exposure") == stop_calls);
     camera->set_bin_x(2);
     check_history();
     camera->set_bin_y(2);
@@ -188,6 +203,10 @@ TEST_CASE("ZWO fake SDK - geometry changes preserve last-exposure metadata", "[z
     camera->set_start_x(1);
     check_history();
     camera->set_start_y(1);
+    check_history();
+    camera->abort_exposure();
+    check_history();
+    camera->stop_exposure();
     check_history();
     CHECK_FALSE(camera->get_image_ready());
     CHECK(error_code([&] { static_cast<void>(camera->get_image_array()); }) == AlpacaError::InvalidOperation);
@@ -208,6 +227,74 @@ TEST_CASE("ZWO fake SDK - overlapping start is rejected without replacing the ac
 
     sdk.set_exposure_status(FakeZWOSDK::ExposureStatus::Success);
     CHECK(camera->get_image_ready());
+
+    camera->start_exposure(0.001, true);
+    sdk.set_exposure_status(FakeZWOSDK::ExposureStatus::Success);
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    bool readback_entered = false;
+    bool release_readback = false;
+    bool start_entered = false;
+    bool release_start = false;
+    std::atomic<int> status_calls{0};
+    sdk.before_call = [&](const std::string& name) {
+        if (name == "get_exposure_status" && status_calls.fetch_add(1) == 0) {
+            std::unique_lock lock(gate_mutex);
+            readback_entered = true;
+            gate_cv.notify_all();
+            gate_cv.wait(lock, [&] { return release_readback; });
+        } else if (name == "start_exposure") {
+            std::unique_lock lock(gate_mutex);
+            start_entered = true;
+            gate_cv.notify_all();
+            gate_cv.wait(lock, [&] { return release_start; });
+        }
+    };
+
+    std::atomic<int> array_code{0};
+    std::atomic<bool> array_done{false};
+    std::thread reader([&] {
+        array_code.store(error_code([&] { static_cast<void>(camera->get_image_array()); }));
+        array_done.store(true);
+    });
+    bool poll_held = false;
+    {
+        std::unique_lock lock(gate_mutex);
+        poll_held = gate_cv.wait_for(lock, std::chrono::seconds(2), [&] { return readback_entered; });
+    }
+    std::atomic<int> start_code{0};
+    std::thread starter;
+    bool trigger_held = false;
+    if (poll_held) {
+        starter = std::thread([&] { start_code.store(error_code([&] { camera->start_exposure(0.002, true); })); });
+        std::unique_lock lock(gate_mutex);
+        trigger_held = gate_cv.wait_for(lock, std::chrono::seconds(2), [&] { return start_entered; });
+    }
+    {
+        std::lock_guard lock(gate_mutex);
+        release_readback = true;
+    }
+    gate_cv.notify_all();
+    const auto read_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (poll_held && trigger_held && !array_done.load() && std::chrono::steady_clock::now() < read_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool array_rejected_before_start_finished = array_done.load() && !release_start;
+    const int data_calls_before_release = sdk.call_count("get_data_after_exposure");
+    {
+        std::lock_guard lock(gate_mutex);
+        release_start = true;
+    }
+    gate_cv.notify_all();
+    reader.join();
+    if (starter.joinable()) starter.join();
+
+    CHECK(poll_held);
+    CHECK(trigger_held);
+    CHECK(array_rejected_before_start_finished);
+    CHECK(array_code.load() == AlpacaError::InvalidOperation);
+    CHECK(data_calls_before_release == 0);
+    CHECK(start_code.load() == -1);
 }
 
 TEST_CASE("ZWO fake SDK - RGB24 download converts BGR bytes to RGB channels", "[zwo][camera][unit]") {
@@ -546,13 +633,27 @@ TEST_CASE("ZWO fake SDK - disconnect waits for the lazy download before close", 
     }
     const bool stop_seen = sdk.call_count("stop_exposure") > 0;
     const bool close_waited = !disconnected.load() && sdk.open_count() == 1 && sdk.call_count("close_camera") == 0;
+    std::atomic<int> cached_bin{-1};
+    std::atomic<bool> cached_getter_done{false};
+    std::thread cached_getter([&] {
+        cached_bin.store(camera->get_bin_x());
+        cached_getter_done.store(true);
+    });
+    const auto getter_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    while (!cached_getter_done.load() && std::chrono::steady_clock::now() < getter_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool cached_getter_unblocked = cached_getter_done.load();
     sdk.release_download();
     download.join();
     disconnect.join();
+    cached_getter.join();
 
     CHECK(download_started);
     CHECK(stop_seen);
     CHECK(close_waited);
+    CHECK(cached_getter_unblocked);
+    CHECK(cached_bin.load() == 1);
     CHECK(download_code.load() == AlpacaError::InvalidOperation);
     CHECK_FALSE(sdk.closed_during_download());
     CHECK(sdk.open_count() == 0);

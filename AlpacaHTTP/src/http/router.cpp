@@ -8283,6 +8283,12 @@ bool Router::register_device_from_config(const nlohmann::json& config, std::stri
         } else if (it->is_number_integer()) {
             const auto raw = it->get<std::int64_t>();
             if (raw >= -1 && raw <= std::numeric_limits<int>::max()) parsed = static_cast<int>(raw);
+        } else if (it->is_number_float()) {
+            const double raw = it->get<double>();
+            if (std::isfinite(raw) && raw == std::trunc(raw) && raw >= -1.0 &&
+                raw <= static_cast<double>(std::numeric_limits<int>::max())) {
+                parsed = static_cast<int>(raw);
+            }
         }
         if (parsed) {
             value = *parsed;

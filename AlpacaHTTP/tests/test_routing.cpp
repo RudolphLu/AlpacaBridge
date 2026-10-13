@@ -2514,6 +2514,22 @@ int main() {
             EXPECT(result.value("ErrorNumber", 0) == 0x401);
             EXPECT(result.value("ErrorMessage", std::string()).find(field) != std::string::npos);
         }
+        for (const auto& [field, value, other_field] :
+             {std::tuple{"cameraIndex", 0.0, "cameraId"}, std::tuple{"cameraId", 7.0, "cameraIndex"}}) {
+            const int number = device_number++;
+            nlohmann::json body = {{"vendor", "zwo"},
+                                   {"deviceType", "camera"},
+                                   {"deviceNumber", number},
+                                   {field, value},
+                                   {other_field, -1}};
+            const auto result = nlohmann::json::parse(
+                route_request(router, "POST", "/management/v1/configuredevice", body.dump()).body());
+            EXPECT(result.value("ErrorNumber", -1) == 0);
+            const auto saved = listed_config(router, "Camera", number);
+            EXPECT(saved.contains(field));
+            EXPECT(saved.at(field).get<double>() == value);
+            remove_device(router, "zwo", "camera", number);
+        }
 
         const nlohmann::json max_index_config = {{"vendor", "zwo"},
                                                  {"deviceType", "camera"},
@@ -2571,6 +2587,12 @@ int main() {
             EXPECT(any_warning_contains(persisted.warnings, selector.field));
             ++device_number;
         }
+        const auto integral_float = persisted_attempt(
+            {{"vendor", "zwo"}, {"deviceType", "camera"}, {"deviceNumber", device_number}, {"cameraIndex", 0.0}},
+            "Camera");
+        EXPECT(integral_float.listed);
+        EXPECT(integral_float.config.contains("cameraIndex"));
+        EXPECT(integral_float.config.at("cameraIndex").get<double>() == 0.0);
 
         const ScopedCwd scratch;
         const std::filesystem::path persisted_file = std::filesystem::path("config") / "registered_devices.json";

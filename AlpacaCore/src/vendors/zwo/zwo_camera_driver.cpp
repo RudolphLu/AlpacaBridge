@@ -167,7 +167,7 @@ public:
         // Serialize lifecycle teardown with Start/Stop and the transient-failure
         // retry burst before taking mutex_, so no trigger can race a camera close.
         std::lock_guard<std::mutex> trigger_lock(exposure_trigger_mutex_);
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         // Base gates BEFORE the idempotency check: a sync disconnect during an
         // in-flight connect looks idempotent (both sides see disconnected) and
         // would be silently dropped without the record; a connect must honor a
@@ -249,8 +249,13 @@ public:
         // siblings, per the AGENTS.md disconnect rule (issue #116).
         const std::optional<int> close_id = camera_id_;
         serial_number_.clear();
+        camera_id_.reset();
         reset_exposure_state_locked();
         connected_.store(false);
+        // Publish the disconnected state before waiting for a bulk read to
+        // finish. SDK-backed getters will now fail on the empty camera_id_,
+        // while local cached getters can still take mutex_.
+        lock.unlock();
         if (close_id.has_value()) {
             try {
                 sdk.stop_exposure(close_id.value());
@@ -259,7 +264,8 @@ public:
             }
             // The lazy GetDataAfterExp call uses a bare camera-id snapshot and
             // does not hold the SDK-wide mutex. Stop first so it can unwind,
-            // then keep ASICloseCamera from invalidating the id mid-transfer.
+            // then wait without holding mutex_ so cached getters stay
+            // responsive while the transfer finishes.
             std::lock_guard<std::mutex> image_lock(image_operation_mutex_);
             sdk.close_camera(close_id.value());
         }
@@ -328,8 +334,8 @@ public:
             case ZWOExposureStatus::Failed:
                 // Failed included deliberately: a failed (retries-exhausted)
                 // exposure leaves the camera fully ready for the next one — the
-                // failure surfaces through ImageReady staying false and
-                // ImageArray throwing. Reporting a sticky Error here poisoned
+                // failure surfaces as DriverException from ImageReady and
+                // ImageArray. Reporting a sticky Error here poisoned
                 // every subsequent operation: one transient ASI_EXP_FAILED
                 // cascaded into 18 ConformU issues.
                 return CameraState::Idle;
@@ -562,9 +568,12 @@ public:
             if (!last_exposure_valid_ || exposure_seq_ != download_seq || !exposure_frame_.has_value()) {
                 throw AlpacaException("Exposure stopped during image download", AlpacaError::InvalidOperation);
             }
-            // Lock order is mutex_ -> image_operation_mutex_. Disconnect takes
-            // the same pair before closing the camera. Release mutex_ while
-            // retaining the operation lock across the blocking USB transfer.
+            if (exposure_starting_) {
+                throw AlpacaException("Exposure start is in progress", AlpacaError::InvalidOperation);
+            }
+            // Lock order is mutex_ -> image_operation_mutex_. Disconnect
+            // publishes the disconnected state, releases mutex_, then waits
+            // for this operation lock before closing the camera.
             image_lock.lock();
         }
         try {
@@ -853,7 +862,7 @@ public:
         throw AlpacaException("Sub-exposure duration not supported", AlpacaError::NotImplemented);
     }
 
-    void abort_exposure() override { stop_exposure(); }
+    void abort_exposure() override { stop_exposure_impl(); }
 
     void pulse_guide(int direction, int duration) override {
         ensure_connected();
@@ -1016,7 +1025,10 @@ public:
         exposure_starting_ = false;
     }
 
-    void stop_exposure() override {
+    void stop_exposure() override { stop_exposure_impl(); }
+
+private:
+    void stop_exposure_impl() {
         ensure_connected();
         // Serialize against start_exposure and an in-flight retry burst, so
         // a stop can never land between a retry's decide and its re-trigger
@@ -1033,6 +1045,10 @@ public:
             if (!camera_id_.has_value()) {
                 throw AlpacaException("Camera ID not set", AlpacaError::NotConnected);
             }
+            if (image_failure_.empty() &&
+                (image_cached_ || image_ready_ || !last_exposure_valid_ || !exposure_frame_.has_value())) {
+                return;
+            }
             stop_id = camera_id_.value();
             // The stop is authoritative for this exposure regardless of how
             // the SDK call below fares: retries are cancelled and pending
@@ -1040,7 +1056,7 @@ public:
             // cannot re-trigger the exposure while the stop is in flight,
             // and an in-flight unlocked download is invalidated by the
             // sequence bump.
-            invalidate_exposure_image_locked(true);
+            invalidate_exposure_image_locked();
             stop_seq = exposure_seq_;
         }
         // The SDK stop runs on a bare id snapshot OUTSIDE mutex_: it is a
@@ -1055,7 +1071,6 @@ public:
         }
     }
 
-private:
     struct ExposureFrame {
         int width;
         int height;
@@ -1158,12 +1173,11 @@ private:
         }
     }
 
-    void invalidate_exposure_image_locked(bool clear_last_exposure = false) {
+    void invalidate_exposure_image_locked() {
         image_ready_ = false;
         image_cached_ = false;
         exposure_starting_ = false;
         last_image_ = {};
-        if (clear_last_exposure) last_exposure_valid_ = false;
         exposure_frame_.reset();
         exposure_retries_left_ = 0;
         exposure_failed_ = false;
