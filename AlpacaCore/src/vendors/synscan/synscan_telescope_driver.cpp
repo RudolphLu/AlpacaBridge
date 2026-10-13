@@ -57,12 +57,36 @@ constexpr double kSiderealDegPerSec = 15.0411 / 3600.0;
 // +/-10" in Dec per GOTO, up to 20", open-astro#1027) is not something another pass can remove, and failing the
 // slew there turned a plate-solvable 15" landing into an error.
 constexpr double kLandingToleranceArcsec = 3.0;
-constexpr int kMaxLandingRefinePasses = 3;
 // A readback this far from the target is not a landing error a fine re-GOTO corrects (a refused or limit-stopped
 // GOTO, a mount that never moved): it is left as it was before refinement existed and logged, not chased.
 constexpr double kLandingRefineLimitArcsec = 600.0;
 // How long a refinement GOTO forces Slewing true while the handset starts moving (the first GOTO uses 8 s).
 constexpr auto kRefineStartForce = std::chrono::seconds(2);
+// open-astro#1030: the handset computes RA from a local sidereal time it advances once a second, so after a GOTO
+// its RA readback is a sawtooth: exact right after the handset's tick, one second of RA (15") low just before the
+// next (EQM-35 Pro on HC 06.03.00, raw capture 2026-10-13: 194 counts, 1.00 s period, steady for the 125 s
+// observed). A single read is therefore 0-15" low, and a landing check that reads at one phase and a client that
+// reads at another disagree by up to that. After every GOTO the driver hunts for the jump, anchors the tick, and
+// corrects each RA read by the fraction of the second elapsed since it.
+// The hunt gives up after this long without a first jump (a handset without the sawtooth), and once it has one it
+// keeps reading for up to this many jumps: the reads fall at a different phase of each second (0.277 s apart
+// against a 1.000 s period), so intersecting the intervals that bracket each jump pins the tick to about 30 ms.
+constexpr auto kReadbackTickFirstJumpBudget = std::chrono::milliseconds(1300);
+constexpr auto kReadbackTickHuntBudget = std::chrono::milliseconds(3400);
+constexpr int kReadbackTickHuntJumps = 3;
+constexpr auto kReadbackTickHuntInterval = std::chrono::milliseconds(50);
+// A rise of at least half a second of RA between consecutive reads is the tick; tracking only lowers RA between.
+constexpr double kReadbackTickJumpHours = 0.5 / 3600.0;
+constexpr auto kReadbackTickValidity = std::chrono::seconds(120);
+// A corrected read can be one second of RA off when it falls inside the tick's uncertainty; the last known RA
+// (landing, sync or pulse end) picks the side. Half a second of RA is the decision margin.
+constexpr double kReadbackDisambiguationHours = 0.5 / 3600.0;
+// The handset also re-rolls each GOTO landing by a whole second of RA (passes with an identical aim landed 194
+// counts apart), so the landing is finished with timed guide-rate moves, which it executes to a fraction of an
+// arcsecond in Dec and within the readback's resolution in RA, not with more GOTOs. A residual beyond what a move
+// of kNudgeMaxSeconds covers gets one re-GOTO first.
+constexpr double kNudgeMaxSeconds = 8.0;
+constexpr int kMaxLandingRounds = 3;
 constexpr auto kPulseGuideCompletionDelay = std::chrono::milliseconds(1000);
 constexpr auto kPulseGuidePositionGrace = std::chrono::milliseconds(3000);
 
@@ -398,6 +422,7 @@ public:
             last_slew_error_.clear();
             slew_force_until_ = std::chrono::steady_clock::time_point::min();
             position_override_until_ = std::chrono::steady_clock::time_point::min();
+            invalidate_readback_tick_locked();
             guide_position_valid_ = false;
             last_utc_valid_ = false;
             client_disagreement_warned_ = false;
@@ -488,6 +513,7 @@ public:
             last_slew_error_.clear();
             slew_force_until_ = std::chrono::steady_clock::time_point::min();
             position_override_until_ = std::chrono::steady_clock::time_point::min();
+            invalidate_readback_tick_locked();
             guide_position_valid_ = false;
             manual_axis_slewing_[0] = false;
             manual_axis_slewing_[1] = false;
@@ -714,7 +740,9 @@ public:
             if (alignment != AlignmentMode::AltAz && !site_info_valid_) {
                 throw AlpacaException("Set SiteLatitude before enabling equatorial tracking", AlpacaError::ValueNotSet);
             }
-            const int mode = alignment == AlignmentMode::AltAz ? 1 : (site_latitude_cached_ < 0.0 ? 3 : 2);
+            // SynScan "T" modes (protocol v3.3): 1 = Alt/Az, 2 = equatorial in either hemisphere, 3 = PEC. The
+            // handset applies its own site; 3 is not "EQ south" as it is on a Celestron.
+            const int mode = alignment == AlignmentMode::AltAz ? 1 : 2;
             protocol.set_tracking_mode(mode);
             tracking_mode_cached_ = mode;
         } else {
@@ -722,6 +750,7 @@ public:
             tracking_mode_cached_ = 0;
         }
         tracking_mode_valid_ = true;
+        invalidate_readback_tick_locked();
     }
 
     double get_focal_length() const override {
@@ -1021,6 +1050,7 @@ private:
 
         const auto client_minus_host = utc - std::chrono::system_clock::now();  // before the write (#409)
         SynScanProtocolWrapper::instance().set_time(info);
+        invalidate_readback_tick_locked();
         timezone_offset_minutes_ = tz_info.offset_minutes;
         timezone_offset_valid_ = true;
         dst_observed_ = tz_info.dst;
@@ -1190,6 +1220,7 @@ public:
                 SynScanProtocolWrapper::instance().set_tracking_mode(0);
                 tracking_mode_cached_ = 0;
                 tracking_mode_valid_ = true;
+                invalidate_readback_tick_locked();
             } catch (const std::exception& ex) {
                 fail_park_locked(std::string("Park: stopping tracking failed: ") + ex.what());
                 return;
@@ -1298,7 +1329,9 @@ public:
             check_not_parked_locked("PulseGuide");
             auto& protocol = SynScanProtocolWrapper::instance();
             const double guide_rate = axis == 1 ? guide_rate_.dec : guide_rate_.ra;
-            double slew_rate_deg_per_sec = direction_sign * guide_rate;
+            // RA: West (direction_sign +1) lowers RA, East raises it.
+            double slew_rate_deg_per_sec =
+                axis == 0 ? ra_motor_rate_locked(-direction_sign * guide_rate * 3600.0) : direction_sign * guide_rate;
             if (axis == 1) {
                 char pier = protocol.get_pointing_state();
                 if (pier == 'W') {
@@ -1354,6 +1387,7 @@ public:
                 // Cancelled by replacement, AbortSlew, disconnect or
                 // destruction. Still make a best-effort attempt to stop the
                 // axis before exiting — the mount would otherwise keep slewing.
+                // AbortSlew restores tracking itself; teardown must not.
                 try {
                     SynScanProtocolWrapper::instance().move_axis_variable_rate(axis, 0.0);
                 } catch (...) {  // NOLINT(bugprone-empty-catch)
@@ -1370,9 +1404,27 @@ public:
             bool stopped = false;
             std::string last_error;
             auto& proto = SynScanProtocolWrapper::instance();
+            // An RA pulse ran the motor at an absolute rate in place of tracking; while tracking, the tracking
+            // command alone ends it (see ra_motor_rate_locked). Read now: tracking may have changed mid-pulse.
+            // Without the equatorial model the pulse ran the guide rate alone, so it stops and then restores
+            // tracking as before.
+            int end_tracking_mode = 0;
+            bool end_with_tracking = false;
+            if (axis == 0) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                end_tracking_mode = connected_ ? tracking_mode_cached_ : 0;
+                end_with_tracking = end_tracking_mode > 0 && equatorial_geometry_locked();
+            }
             for (int attempt = 0; attempt < kStopAttempts && !stopped; ++attempt) {
                 try {
-                    proto.move_axis_variable_rate(axis, 0.0);
+                    if (end_with_tracking) {
+                        proto.set_tracking_mode(end_tracking_mode);
+                    } else {
+                        proto.move_axis_variable_rate(axis, 0.0);
+                        if (end_tracking_mode > 0) {
+                            proto.set_tracking_mode(end_tracking_mode);
+                        }
+                    }
                     stopped = true;
                 } catch (const std::exception& e) {
                     last_error = e.what();
@@ -1389,16 +1441,15 @@ public:
                     if (!connected_) {
                         return;
                     }
-                    const int tracking_mode = tracking_mode_cached_;
-                    if (tracking_mode <= 0) {
+                    if (end_tracking_mode <= 0) {
                         return;
                     }
-                    try {
-                        proto.set_tracking_mode(tracking_mode);
-                    } catch (const std::exception& e) {
-                        ALPACA_LOG_WARN("SynScan", std::string("PulseGuide: failed to restore tracking: ") + e.what());
-                    } catch (...) {
-                        ALPACA_LOG_WARN("SynScan", "PulseGuide: failed to restore tracking");
+                    // A same-mode T leaves the handset's readback regime as it is (measured); the pulse moved RA
+                    // by the estimate the override already reports.
+                    if (guide_position_valid_) {
+                        readback_top_hours_ = guide_position_ra_hours_;
+                    } else {
+                        invalidate_readback_top_locked();
                     }
                 }
             } else {
@@ -1609,6 +1660,9 @@ public:
         uint32_t ra_raw = encode_ra_raw(ra, bits);
         uint32_t dec_raw = encode_angle(dec, bits);
         protocol.sync_ra_dec_raw(ra_raw, dec_raw, use_precise_commands_);
+        if (readback_top_valid_) {
+            readback_top_hours_ = ra;
+        }
         target_ra_hours_ = ra;
         target_dec_degrees_ = dec;
         target_ra_set_ = true;
@@ -1705,7 +1759,16 @@ public:
         // goto failed.
         last_slew_error_.clear();
 
-        SynScanProtocolWrapper::instance().move_axis_variable_rate(axis, moving ? rate : 0.0);
+        if (axis == 0) {
+            invalidate_readback_top_locked();  // the jog moves RA by an unknown amount
+        }
+        auto& protocol = SynScanProtocolWrapper::instance();
+        protocol.move_axis_variable_rate(axis, moving ? rate : 0.0);
+        if (!moving && axis == 0 && tracking_mode_cached_ > 0) {
+            // A variable-rate P slew replaces tracking on the handset, so the stop leaves the RA motor stopped;
+            // ASCOM resumes the tracking rate when MoveAxis stops (see ra_motor_rate_locked).
+            protocol.set_tracking_mode(tracking_mode_cached_);
+        }
         slewing_cached_ = false;
         slew_force_until_ = std::chrono::steady_clock::time_point::min();
         position_override_until_ = std::chrono::steady_clock::time_point::min();
@@ -1790,6 +1853,7 @@ public:
                     // state is already clear, so a throwing write cannot leave
                     // Slewing true over stopped axes (#830).
                     protocol.set_tracking_mode(tracking_mode_cached_);
+                    invalidate_readback_top_locked();
                 }
             }
         } catch (...) {
@@ -1937,6 +2001,213 @@ private:
         }
     }
 
+    void invalidate_readback_tick_locked() const {
+        readback_tick_valid_until_ = std::chrono::steady_clock::time_point::min();
+        readback_top_valid_ = false;
+    }
+
+    void invalidate_readback_top_locked() const { readback_top_valid_ = false; }
+
+    bool readback_tick_valid_at(std::chrono::steady_clock::time_point at) const {
+        return at < readback_tick_valid_until_ && at >= readback_tick_;
+    }
+
+    // The precise RA read `raw_hours` taken at `at`, corrected for the handset's once-a-second readback
+    // (open-astro#1030): a read is low by the fraction of the handset's second since its tick. A read inside the
+    // tick's uncertainty can land on either side of it, one second of RA apart; the last known RA picks the side.
+    double corrected_ra_hours_locked(double raw_hours, std::chrono::steady_clock::time_point at) const {
+        if (!readback_tick_valid_at(at)) {
+            return raw_hours;
+        }
+        const double since = std::chrono::duration<double>(at - readback_tick_).count();
+        double corrected = std::fmod(raw_hours + (since - std::floor(since)) / 3600.0 + 24.0, 24.0);
+        if (readback_top_valid_ &&
+            std::abs(shortest_ra_delta_hours(corrected, readback_top_hours_)) > kReadbackDisambiguationHours) {
+            // An anchor a little late puts a post-tick read one second high; a little early, a pre-tick read one
+            // second low. Whichever neighbour sits by the last known RA is the read.
+            for (const double side : {-1.0, 1.0}) {
+                const double alternative = std::fmod(corrected + side / 3600.0 + 24.0, 24.0);
+                if (std::abs(shortest_ra_delta_hours(alternative, readback_top_hours_)) <=
+                    kReadbackDisambiguationHours) {
+                    return alternative;
+                }
+            }
+        }
+        return corrected;
+    }
+
+    struct TickHunt {
+        bool found = false;
+        std::chrono::steady_clock::time_point tick;
+        std::chrono::steady_clock::time_point read_at;
+        std::pair<uint32_t, uint32_t> raw{};
+        double top_hours = 0.0;  // the true RA when found: the post-tick read plus the fraction since the tick
+    };
+
+    // Reads the position until the RA readback has risen by at least half a second of RA (the handset's tick)
+    // kReadbackTickHuntJumps times, or the budget runs out. Each jump brackets the tick between two reads; the
+    // brackets, shifted by whole seconds, are intersected. Without any jump the last read comes back uncorrected.
+    TickHunt hunt_readback_tick_locked(std::unique_lock<std::mutex>& lock, uint64_t owner_generation,
+                                       std::atomic<bool>* cancel) const {
+        using clock = std::chrono::steady_clock;
+        auto& protocol = SynScanProtocolWrapper::instance();
+        const auto start = clock::now();
+        TickHunt hunt;
+        bool have_previous = false;
+        double previous_hours = 0.0;
+        auto previous_at = start;
+        int jumps = 0;
+        clock::time_point low;
+        clock::time_point high;
+        while (true) {
+            if (motion_generation_ != owner_generation || (cancel != nullptr && cancel->load())) {
+                return hunt;
+            }
+            check_connected();
+            const auto raw = protocol.get_ra_dec_raw(true);
+            const auto read_at = clock::now();
+            const double hours = decode_ra_hours(raw.first, 24);
+            if (have_previous && shortest_ra_delta_hours(hours, previous_hours) >= kReadbackTickJumpHours) {
+                // Bracket (previous_at, read_at], expressed in the first jump's second.
+                const auto shift = std::chrono::duration_cast<clock::duration>(std::chrono::seconds(jumps));
+                const auto bracket_low = previous_at - shift;
+                const auto bracket_high = read_at - shift;
+                if (jumps == 0) {
+                    low = bracket_low;
+                    high = bracket_high;
+                } else {
+                    low = std::max(low, bracket_low);
+                    high = std::min(high, bracket_high);
+                    if (high < low) {  // the period drifted off one second; keep the newest bracket alone
+                        low = bracket_low;
+                        high = bracket_high;
+                    }
+                }
+                ++jumps;
+                hunt.found = true;
+                hunt.raw = raw;
+                hunt.read_at = read_at;
+                hunt.tick = low + (high - low) / 2;
+                if (jumps >= kReadbackTickHuntJumps) {
+                    break;
+                }
+            }
+            if (!hunt.found) {
+                hunt.raw = raw;
+                hunt.read_at = read_at;
+                if (read_at - start >= kReadbackTickFirstJumpBudget) {
+                    return hunt;
+                }
+            } else if (read_at - start >= kReadbackTickHuntBudget) {
+                break;
+            }
+            have_previous = true;
+            previous_hours = hours;
+            previous_at = read_at;
+            lock.unlock();
+            if (cancel != nullptr) {
+                task_wait_for(kReadbackTickHuntInterval, *cancel);
+            } else {
+                std::this_thread::sleep_for(kReadbackTickHuntInterval);
+            }
+            lock.lock();
+        }
+        // The last jump's tick, in its own second, is the anchor; the top is that read plus the fraction since.
+        const auto shift = std::chrono::duration_cast<clock::duration>(std::chrono::seconds(jumps - 1));
+        hunt.tick += shift;
+        const double since = std::chrono::duration<double>(hunt.read_at - hunt.tick).count();
+        hunt.top_hours = std::fmod(decode_ra_hours(hunt.raw.first, 24) + since / 3600.0 + 24.0, 24.0);
+        return hunt;
+    }
+
+    // The signed variable rate (deg/s, positive = code 6) that moves RA east at `east_arcsec_per_s`. On the handset
+    // a variable-rate P slew is the RA motor's own speed and replaces tracking (EQM-35 Pro on HC 06.03.00,
+    // 2026-10-13: a 2 s "west" pulse sent as code 6 at 7.5"/s moved RA 50.6" east, the "east" one as code 7 19.3"
+    // east). So the motor runs westward at the base rate (sidereal while tracking, else 0) less the eastward rate,
+    // and the tracking command alone ends the move: sent mid-slew it resumes sidereal at once, with no stop
+    // between (measured: a 15" move landed within the readback's resolution). The westward code is 7 at that
+    // southern site; INDI's SynScan driver sends 6 for west at sidereal + guide rate, so 6 is taken as westward
+    // north of the equator (not measured on a northern mount).
+    double ra_motor_rate_locked(double east_arcsec_per_s) const {
+        if (!equatorial_geometry_locked()) {
+            // Axis 0 is azimuth on an Alt-Az mount: no sidereal base, and the move is the guide rate as before.
+            return -east_arcsec_per_s / 3600.0;
+        }
+        const double base_arcsec_per_s = tracking_mode_cached_ > 0 ? kSiderealDegPerSec * 3600.0 : 0.0;
+        const double westward_arcsec_per_s = base_arcsec_per_s - east_arcsec_per_s;
+        const double westward_sign = site_latitude_cached_ < 0.0 ? -1.0 : 1.0;
+        return westward_sign * westward_arcsec_per_s / 3600.0;
+    }
+
+    // True only when the mount is known to be equatorial. The absolute RA motor model and the timed landing moves
+    // assume the motor axes are RA and Dec; an Alt-Az mount, or an AZ-EQ mount whose geometry is not configured,
+    // keeps the relative pulse rate and the residual-aimed re-GOTO.
+    bool equatorial_geometry_locked() const {
+        try {
+            return alignment_mode_locked() != AlignmentMode::AltAz;
+        } catch (const AlpacaException&) {
+            return false;
+        }
+    }
+
+    // Moves one axis by `delta_arcsec` (RA: east positive; Dec: north positive) at the guide rate and stops,
+    // restoring tracking after an RA move as a pulse does. Returns false when superseded or cancelled.
+    bool nudge_axis_locked(std::unique_lock<std::mutex>& lock, int axis, double delta_arcsec, uint64_t owner_generation,
+                           std::atomic<bool>* cancel) {
+        auto& protocol = SynScanProtocolWrapper::instance();
+        const double rate_deg_per_sec = axis == 0 ? guide_rate_.ra : guide_rate_.dec;
+        const double rate_arcsec_per_sec = rate_deg_per_sec * 3600.0;
+        if (rate_arcsec_per_sec <= 0.0) {
+            return true;
+        }
+        const double move_arcsec = delta_arcsec;
+        // A residual just over the tolerance can call for a move shorter than the handset resolves; a 50 ms
+        // minimum keeps it from being skipped round after round.
+        const double seconds = std::clamp(std::abs(move_arcsec) / rate_arcsec_per_sec, 0.05, kNudgeMaxSeconds);
+        // RA goes through the absolute motor rate (ra_motor_rate_locked); Dec north is positive unless the mount
+        // is on the west side of the pier, where the Dec motor runs the other way.
+        double signed_rate = axis == 0
+                                 ? ra_motor_rate_locked(move_arcsec > 0.0 ? rate_arcsec_per_sec : -rate_arcsec_per_sec)
+                                 : (move_arcsec > 0.0 ? rate_deg_per_sec : -rate_deg_per_sec);
+        if (axis == 1 && protocol.get_pointing_state() == 'W') {
+            signed_rate = -signed_rate;
+        }
+        protocol.move_axis_variable_rate(axis, signed_rate);
+        lock.unlock();
+        bool keep = true;
+        if (cancel != nullptr) {
+            keep = task_wait_for(std::chrono::milliseconds(static_cast<int>(seconds * 1000.0)), *cancel);
+        } else {
+            std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+        }
+        lock.lock();
+        if (motion_generation_ != owner_generation) {
+            // A newer initiator (AbortSlew, MoveAxis, a slew, park, disconnect) has commanded the axes itself and
+            // owns them now; ending this move would end its motion.
+            check_connected();
+            return false;
+        }
+        std::string stop_error;
+        bool stopped = false;
+        for (int attempt = 0; attempt < 3 && !stopped; ++attempt) {
+            try {
+                if (axis == 0 && tracking_mode_cached_ > 0) {
+                    protocol.set_tracking_mode(tracking_mode_cached_);  // ends the RA move, see ra_motor_rate_locked
+                } else {
+                    protocol.move_axis_variable_rate(axis, 0.0);
+                }
+                stopped = true;
+            } catch (const std::exception& e) {
+                stop_error = e.what();
+            }
+        }
+        if (!stopped) {
+            throw AlpacaException("Landing move stop failed on axis " + std::to_string(axis) + ": " + stop_error);
+        }
+        check_connected();
+        return keep && motion_generation_ == owner_generation;
+    }
+
     void refresh_equatorial_cache_locked() const {
         auto now = std::chrono::steady_clock::now();
         if (!position_link_health_.faulted() && equatorial_cache_valid_ &&
@@ -1947,7 +2218,11 @@ private:
         int bits = use_precise_commands_ ? 24 : 16;
         try {
             auto raw = protocol.get_ra_dec_raw(use_precise_commands_);
+            const auto read_at = std::chrono::steady_clock::now();
             cached_ra_hours_ = decode_ra_hours(raw.first, bits);
+            if (use_precise_commands_) {
+                cached_ra_hours_ = corrected_ra_hours_locked(cached_ra_hours_, read_at);
+            }
             cached_dec_degrees_ = decode_angle(raw.second, bits);
             equatorial_cache_valid_ = true;
             last_equatorial_update_ = now;
@@ -2311,30 +2586,42 @@ private:
         uint64_t generation_;
     };
 
-    // After a GOTO completes, read the handset's own position and re-issue the GOTO while RA or Dec is off by
-    // more than kLandingToleranceArcsec, at most kMaxLandingRefinePasses times (open-astro#880). Each pass aims at
-    // the target corrected by the residual just read, so a systematic landing offset is cancelled rather than
-    // repeated. 16-bit handsets (V3) step ~19.8" in RA, so they are not refined. `lock` is held on entry and on
-    // return. Returns false when the slew was superseded, aborted or cancelled; throws when a pass fails. A
-    // residual left after the last pass is logged as a WARN, not thrown (open-astro#1027).
+    // After a GOTO completes, read the handset's own position at its tick (open-astro#1030) and, while RA or Dec is
+    // off by more than kLandingToleranceArcsec, finish the landing with timed guide-rate moves, at most
+    // kMaxLandingRounds rounds (open-astro#880). The handset re-rolls every GOTO landing by a whole second of RA,
+    // so a residual is never chased with another GOTO; only one beyond a timed move's reach gets a single re-GOTO
+    // first. 16-bit handsets (V3) step ~19.8" in RA, so they are not refined. `lock` is held on entry and on
+    // return. Returns false when the slew was superseded, aborted or cancelled; throws when a move fails. A
+    // residual left after the last round is logged as a WARN, not thrown (open-astro#1027).
     bool refine_goto_landing_locked(std::unique_lock<std::mutex>& lock, double ra, double dec,
                                     uint64_t owner_generation, bool async_task) {
         if (!use_precise_commands_) {
             return true;
         }
         auto& protocol = SynScanProtocolWrapper::instance();
-        double aim_ra = ra;
-        double aim_dec = dec;
-        for (int pass = 0;; ++pass) {
-            if (motion_generation_ != owner_generation || (async_task && slew_task_cancel_.load())) {
+        std::atomic<bool>* cancel = async_task ? &slew_task_cancel_ : nullptr;
+        const double nudge_reach_arcsec = kNudgeMaxSeconds * std::min(guide_rate_.ra, guide_rate_.dec) * 3600.0;
+        const bool timed_finish = equatorial_geometry_locked();
+        bool regoto_done = false;
+        for (int round = 0;; ++round) {
+            if (motion_generation_ != owner_generation || (cancel != nullptr && cancel->load())) {
                 return false;
             }
             check_connected();
-            const auto raw = protocol.get_ra_dec_raw(true);
-            double ra_error_hours = ra - decode_ra_hours(raw.first, 24);
-            if (ra_error_hours > 12.0) ra_error_hours -= 24.0;
-            if (ra_error_hours < -12.0) ra_error_hours += 24.0;
-            const double dec_error_degrees = dec - decode_angle(raw.second, 24);
+            const TickHunt hunt = hunt_readback_tick_locked(lock, owner_generation, cancel);
+            if (motion_generation_ != owner_generation || (cancel != nullptr && cancel->load())) {
+                return false;
+            }
+            double landed_ra_hours = decode_ra_hours(hunt.raw.first, 24);
+            if (hunt.found) {
+                readback_tick_ = hunt.tick;
+                readback_tick_valid_until_ = hunt.read_at + kReadbackTickValidity;
+                readback_top_hours_ = hunt.top_hours;
+                readback_top_valid_ = true;
+                landed_ra_hours = hunt.top_hours;
+            }
+            double ra_error_hours = shortest_ra_delta_hours(ra, landed_ra_hours);
+            const double dec_error_degrees = dec - decode_angle(hunt.raw.second, 24);
             const double ra_error_arcsec = std::abs(ra_error_hours) * kHoursToDegrees * 3600.0;
             const double dec_error_arcsec = std::abs(dec_error_degrees) * 3600.0;
             if (ra_error_arcsec <= kLandingToleranceArcsec && dec_error_arcsec <= kLandingToleranceArcsec) {
@@ -2346,22 +2633,37 @@ private:
                                                " arcsec (Dec) from the target; too far for a landing refinement");
                 return true;
             }
-            if (pass == kMaxLandingRefinePasses) {
+            if (round >= kMaxLandingRounds) {
                 ALPACA_LOG_WARN("SynScan", "SynScan GOTO landed " + std::to_string(ra_error_arcsec) +
                                                " arcsec (RA) and " + std::to_string(dec_error_arcsec) +
-                                               " arcsec (Dec) off target after " +
-                                               std::to_string(kMaxLandingRefinePasses) + " refinement passes");
+                                               " arcsec (Dec) off target after " + std::to_string(kMaxLandingRounds) +
+                                               " refinement passes");
                 return true;
             }
-            aim_ra = std::fmod(aim_ra + ra_error_hours + 24.0, 24.0);
-            aim_dec = std::clamp(aim_dec + dec_error_degrees, -90.0, 90.0);
             equatorial_cache_valid_ = false;
             altaz_cache_valid_ = false;
-            slewing_cached_ = true;
-            slew_force_until_ = std::chrono::steady_clock::now() + kRefineStartForce;
             guide_position_valid_ = false;
-            protocol.goto_ra_dec_raw(encode_ra_raw(aim_ra, 24), encode_angle(aim_dec, 24), true);
-            if (!wait_for_slew_complete(lock, owner_generation, false, async_task ? &slew_task_cancel_ : nullptr)) {
+            if (!timed_finish ||
+                (!regoto_done && (ra_error_arcsec > nudge_reach_arcsec || dec_error_arcsec > nudge_reach_arcsec))) {
+                // Too far for a timed move: one re-GOTO, aimed by the residual, brings it within reach. Without the
+                // timed finish (not known equatorial) every round is a re-GOTO.
+                regoto_done = true;
+                const double aim_ra = std::fmod(ra + ra_error_hours + 24.0, 24.0);
+                const double aim_dec = std::clamp(dec + dec_error_degrees, -90.0, 90.0);
+                slewing_cached_ = true;
+                slew_force_until_ = std::chrono::steady_clock::now() + kRefineStartForce;
+                protocol.goto_ra_dec_raw(encode_ra_raw(aim_ra, 24), encode_angle(aim_dec, 24), true);
+                if (!wait_for_slew_complete(lock, owner_generation, false, cancel)) {
+                    return false;
+                }
+                continue;
+            }
+            if (ra_error_arcsec > kLandingToleranceArcsec &&
+                !nudge_axis_locked(lock, 0, ra_error_hours * kHoursToDegrees * 3600.0, owner_generation, cancel)) {
+                return false;
+            }
+            if (dec_error_arcsec > kLandingToleranceArcsec &&
+                !nudge_axis_locked(lock, 1, dec_error_degrees * 3600.0, owner_generation, cancel)) {
                 return false;
             }
         }
@@ -2451,6 +2753,15 @@ private:
     mutable std::string link_fault_text_;
     mutable std::chrono::steady_clock::time_point last_equatorial_update_;
     mutable std::chrono::steady_clock::time_point last_altaz_update_;
+    // open-astro#1030: the handset's once-a-second RA readback tick, anchored after the last GOTO. Valid until the
+    // deadline; a tracking-mode or time write and connect/disconnect invalidate it.
+    mutable std::chrono::steady_clock::time_point readback_tick_;
+    mutable std::chrono::steady_clock::time_point readback_tick_valid_until_ =
+        std::chrono::steady_clock::time_point::min();
+    // The last RA the driver knows to be true (a landing read at the tick, a sync, a pulse end), used to pick the
+    // side of the tick for a read inside its uncertainty. Dropped by motion of unknown size (AbortSlew, MoveAxis).
+    mutable double readback_top_hours_ = 0.0;
+    mutable bool readback_top_valid_ = false;
 
     mutable double site_latitude_cached_;
     mutable double site_longitude_cached_;
