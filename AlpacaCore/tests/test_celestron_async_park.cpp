@@ -57,6 +57,11 @@ struct FakeCelestronState {
     // #832: `tracking_on` makes the 't' query answer EQ-North so the completion
     // tail has a tracking restore to perform; `t_count` counts every 'T' write.
     std::atomic<bool> tracking_on{false};
+    std::atomic<bool> reject_level_start{false};
+    std::atomic<bool> invalid_next_home_status{false};
+    std::atomic<bool> invalid_home_status{false};
+    std::atomic<int> home_status_polls{0};
+    std::atomic<int> cancel_goto_count{0};
     std::atomic<int> t_count{0};
     static constexpr auto kGotoDuration = std::chrono::milliseconds(1500);
     bool goto_in_progress() const {
@@ -91,6 +96,7 @@ alpacacore::test::FakeMountServer::Responder celestron_responder(std::shared_ptr
             case 'L':
                 return st->goto_in_progress() ? "1#" : "0#";
             case 'M':  // cancel goto
+                st->cancel_goto_count.fetch_add(1);
                 st->goto_seen.store(false);
                 return "#";
             case 'J':  // alignment complete (the slew-safety gate requires it)
@@ -104,7 +110,14 @@ alpacacore::test::FakeMountServer::Responder celestron_responder(std::shared_ptr
                 const unsigned char op = chunk.size() > 3 ? static_cast<unsigned char>(chunk[3]) : 0;
                 if (op == 0x0B) {
                     st->level_start_count.fetch_add(1);
+                    if (st->reject_level_start.load()) return "";
                     return "#";
+                }
+                if (op == 0x12) {
+                    st->home_status_polls.fetch_add(1);
+                    if (st->invalid_next_home_status.exchange(false)) return std::string("\x01#", 2);
+                    if (st->invalid_home_status.load()) return std::string("\x01#", 2);
+                    return std::string("\xFF#", 2);
                 }
                 if (op == 0x02 || op == 0x17) {  // MC_GOTO_FAST / MC_GOTO_SLOW
                     if (st->silent_from_goto.load()) {
@@ -144,6 +157,16 @@ bool wait_until(const std::function<bool()>& pred, int timeout_ms) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     return pred();
+}
+
+bool read_slewing_error(alpacacore::TelescopeDriver& driver, std::string* message = nullptr) {
+    try {
+        (void)driver.get_slewing();
+        return false;
+    } catch (const alpacacore::AlpacaException& ex) {
+        if (message) *message = ex.what();
+        return ex.error_code() == alpacacore::AlpacaError::DriverException;
+    }
 }
 
 // The driver on a caller-owned task clock, so a case steps its waits with
@@ -278,6 +301,38 @@ TEST_CASE("Celestron FindHome - refuses during Park without replacing the park t
     driver->set_connected(false);
 }
 
+TEST_CASE("Celestron FindHome - dispatch failure persists through Slewing and AtHome",
+          "[celestron][telescope][async][homefailure]") {
+    auto st = std::make_shared<FakeCelestronState>();
+    st->reject_level_start.store(true);
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    try {
+        driver->find_home();
+        FAIL("FindHome returned normally although MC_LEVEL_START was unanswered");
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+        CHECK(std::string(ex.what()).find("FindHome dispatch failed") != std::string::npos);
+    }
+    CHECK(st->level_start_count.load() == 1);
+    CHECK(read_slewing_error(*driver));
+    try {
+        static_cast<void>(driver->get_at_home());
+        FAIL("AtHome returned normally after its FindHome dispatch failed");
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+        CHECK(std::string(ex.what()).find("FindHome dispatch failed") != std::string::npos);
+    }
+
+    REQUIRE_NOTHROW(driver->abort_slew());
+    CHECK_FALSE(driver->get_at_home());
+    CHECK_FALSE(driver->get_slewing());
+    driver->set_connected(false);
+}
+
 // #742: the three stops Unpark sends to cancel a park in flight (cancel GOTO,
 // then both axes to rate 0) sat in one empty catch, and Unpark then set
 // Slewing false and returned success. With a handset that answers nothing,
@@ -305,7 +360,14 @@ TEST_CASE("Celestron async - Unpark reports stops a silent handset never answere
         CHECK(std::string(ex.what()).rfind("Unpark could not stop the park slew: ", 0) == 0);
     }
     CHECK_FALSE(driver->get_at_park());
-    CHECK(driver->get_slewing());  // the hardware poll fails too, so the cached state stands
+    CHECK_FALSE(driver->get_at_home());
+    try {
+        static_cast<void>(driver->get_slewing());
+        FAIL("Slewing must surface the failed Unpark stop");
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+        CHECK(std::string(ex.what()).find("Unpark could not stop") != std::string::npos);
+    }
 
     driver->set_connected(false);
 }
@@ -345,8 +407,81 @@ TEST_CASE("Celestron async - a failed park logs the stops a silent handset never
     CHECK(stop_errors.load() == 1);
     CHECK(st->silent.load());  // the handset is still silent
     CHECK_FALSE(driver->get_at_park());
-    CHECK(driver->get_slewing());
+    CHECK_FALSE(driver->get_at_home());
+    try {
+        static_cast<void>(driver->get_slewing());
+        FAIL("Slewing must surface the failed Park");
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+        CHECK(std::string(ex.what()).find("Park slew dispatch failed") != std::string::npos);
+        CHECK(std::string(ex.what()).find("stopping after failure failed") != std::string::npos);
+    }
 
+    driver->set_connected(false);
+}
+
+TEST_CASE("Celestron async - Park completion poll failure persists through Slewing",
+          "[celestron][telescope][async][parkfailure]") {
+    alpacacore::test::FakeTaskClock clock;
+    auto st = std::make_shared<FakeCelestronState>();
+    st->clock = &clock;
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = make_driver(server.port(), clock);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    driver->park();
+    REQUIRE(wait_until([&] { return st->goto_seen.load(); }, 5000));
+    st->silent.store(true);
+    std::string message;
+    REQUIRE(advance_until(
+        clock, [&] { return read_slewing_error(*driver, &message); }, std::chrono::milliseconds(250), 48));
+    CHECK(message.find("Park slew status polling failed") != std::string::npos);
+    CHECK(read_slewing_error(*driver));
+    CHECK_FALSE(driver->get_at_park());
+    driver->set_connected(false);
+}
+
+TEST_CASE("Celestron FindHome - invalid home-status replies persist through Slewing and AtHome",
+          "[celestron][telescope][async][home]") {
+    auto st = std::make_shared<FakeCelestronState>();
+    st->invalid_home_status.store(true);
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    REQUIRE_NOTHROW(driver->find_home());
+    CHECK_FALSE(driver->get_at_home());  // first failed reply is treated as a transient
+    CHECK(driver->get_slewing());        // the second consecutive failure still keeps homing in progress
+    try {
+        static_cast<void>(driver->get_at_home());
+        FAIL("AtHome returned normally after three consecutive completion polls failed");
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+        CHECK(std::string(ex.what()).find("FindHome completion polling failed") != std::string::npos);
+    }
+    CHECK(st->home_status_polls.load() == 3);
+    CHECK(st->cancel_goto_count.load() == 1);
+    CHECK(read_slewing_error(*driver));
+    driver->set_connected(false);
+}
+
+TEST_CASE("Celestron FindHome - a transient home-status failure recovers", "[celestron][telescope][async][home]") {
+    auto st = std::make_shared<FakeCelestronState>();
+    st->invalid_next_home_status.store(true);
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    REQUIRE_NOTHROW(driver->find_home());
+    CHECK_FALSE(driver->get_at_home());
+    CHECK(st->cancel_goto_count.load() == 0);
+    CHECK(driver->get_at_home());  // a valid reply clears the consecutive failure count
+    CHECK(st->home_status_polls.load() == 3);
+    CHECK(st->cancel_goto_count.load() == 0);
+    CHECK_FALSE(driver->get_slewing());
     driver->set_connected(false);
 }
 

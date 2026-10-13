@@ -1181,14 +1181,14 @@ public:
                         do_slew_to_coordinates_locked(park_target_first, park_target_second);
                     }
                 };
-                hooks.poll_slewing = [this] { return poll_hardware_slewing_locked(); };
+                hooks.poll_slewing = [this] { return poll_hardware_slewing_locked(true); };
                 hooks.stop_tracking = [this] {
                     SynScanProtocolWrapper::instance().set_tracking_mode(0);
                     tracking_mode_cached_ = 0;
                     tracking_mode_valid_ = true;
                     invalidate_readback_tick_locked();
                 };
-                hooks.fail = [this](const std::string& message) { fail_park_locked(message); };
+                hooks.fail = [this, &ctx](const std::string& message) { fail_park_locked(message, ctx); };
                 hooks.complete = [this] {
                     slewing_cached_ = false;
                     slew_force_until_ = util::TaskClock::clock::time_point::min();
@@ -1220,16 +1220,21 @@ public:
     // answered (#742). mutex_ must be held.
     std::string stop_park_slew_locked() { return util::stop_goto_and_axes(SynScanProtocolWrapper::instance()); }
 
-    // Park task failure path: stop the hardware so the reported idle state
-    // (Slewing false, AtPark false) matches reality, then drop the parking
-    // state so the caller can retry. When a stop fails the mount may still
-    // be moving, so Slewing keeps its cached value. mutex_ must be held.
-    void fail_park_locked(const std::string& message) {
+    // Park task failure path: stop the hardware, then drop the parking state so
+    // the caller can retry. A successful stop publishes Slewing=false; a failed
+    // stop leaves a persistent Slewing error because the mount may still move.
+    // mutex_ must be held.
+    void fail_park_locked(const std::string& message, util::OperationContext& ctx) {
         const std::string stop_error = stop_park_slew_locked();
+        if (!connected_ || ctx.stop_reason() != util::StopReason::None) {
+            return;
+        }
         parking_ = false;
+        last_slew_error_ = message;
         if (stop_error.empty()) {
             slewing_cached_ = false;
         } else {
+            last_slew_error_ += "; stopping after failure failed: " + stop_error + "; the mount may still be moving";
             ALPACA_LOG_ERROR("SynScan",
                              "stop after park failure failed: " + stop_error + "; the mount may still be moving");
         }
@@ -1699,6 +1704,11 @@ public:
                 slew_force_until_ = util::TaskClock::clock::time_point::min();
                 position_override_until_ = util::TaskClock::clock::time_point::min();
             }
+            if (stop_error.empty()) {
+                last_slew_error_.clear();
+            } else {
+                last_slew_error_ = "Unpark could not stop the park slew: " + stop_error;
+            }
         }
         if (was_parking) {
             slew_.cancel_all_and_join();  // without mutex_ held
@@ -1748,8 +1758,6 @@ public:
         // open-astro#575: a fresh initiator is a clean start -- a client
         // that jogs an axis after a failed GOTO must not be told the OLD
         // goto failed.
-        last_slew_error_.clear();
-
         if (axis == 0) {
             invalidate_readback_top_locked();  // the jog moves RA by an unknown amount
         }
@@ -1760,6 +1768,7 @@ public:
             // ASCOM resumes the tracking rate when MoveAxis stops (see ra_motor_rate_locked).
             protocol.set_tracking_mode(tracking_mode_cached_);
         }
+        last_slew_error_.clear();
         slewing_cached_ = false;
         slew_force_until_ = util::TaskClock::clock::time_point::min();
         position_override_until_ = util::TaskClock::clock::time_point::min();
@@ -1822,6 +1831,7 @@ public:
                 try_stop([&protocol]() { protocol.move_axis_fixed_rate(0, 0); });
                 try_stop([&protocol]() { protocol.move_axis_fixed_rate(1, 0); });
                 if (!stop_error.empty()) {
+                    last_slew_error_ = "AbortSlew stop failed: " + stop_error;
                     // The mount may still be moving: leave Slewing and the slew state as they were.
                     throw AlpacaException("AbortSlew stop failed: " + stop_error, AlpacaError::DriverException);
                 }
@@ -2286,7 +2296,7 @@ private:
         return poll_hardware_slewing_locked();
     }
 
-    bool poll_hardware_slewing_locked() const {
+    bool poll_hardware_slewing_locked(bool propagate_error = false) const {
         if (manual_axis_slewing_[0] || manual_axis_slewing_[1]) {
             return true;
         }
@@ -2297,6 +2307,9 @@ private:
         try {
             slewing_cached_ = SynScanProtocolWrapper::instance().is_goto_in_progress();
         } catch (...) {
+            if (propagate_error) {
+                throw;
+            }
             // Keep last known state if polling times out.
         }
         if (was_slewing && !slewing_cached_) {

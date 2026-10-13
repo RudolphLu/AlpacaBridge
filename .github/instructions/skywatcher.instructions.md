@@ -341,8 +341,9 @@ datagrams before each send so replies cannot get off-by-one.
     (`body_sleep()`, `body_stopped()`), so the helpers shared with the synchronous
     `SlewToCoordinates` (which has no body) behave the same on both.
   - `last_slew_error_` stays a driver member, not the slot's `last_failure()`:
-    AbortSlew, MoveAxis and a reconnect must clear it without starting a body. A
-    Park or FindHome failure is only logged (open-astro#631).
+    AbortSlew, MoveAxis and a reconnect must clear it without starting a body.
+    Park and FindHome failures persist through `Slewing` (open-astro#631; see
+    [decision 0006](../../docs/decisions/0006-async-operation-ownership.md)).
   - No body calls `start()` or `cancel_all_and_join()` on its own slot (a park
     tail that "restarts tracking" through a slot call would join itself or wait out
     `kStaleReapTimeout`); use `cancel()` or `ctx.stop_reason()`. `start()` and
