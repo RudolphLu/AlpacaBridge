@@ -50,7 +50,7 @@ namespace {
 
 constexpr double kHoursToDegrees = 15.0;
 constexpr auto kPositionCacheTtl = std::chrono::seconds(2);
-constexpr int kPositionLinkFailureThreshold = 3;
+constexpr int kLinkFailureThreshold = 3;
 constexpr auto kSiteInfoRetryDelay = std::chrono::seconds(2);
 constexpr double kMaxMoveAxisRateDegPerSec = 4.0;
 constexpr double kDefaultGuideRateDegPerSec = 7.5 / 3600.0;
@@ -327,7 +327,7 @@ public:
             position_link_health_.reset();
             publish_link_fault_locked();
             last_site_info_attempt_ = util::TaskClock::clock::time_point::min();
-            last_slew_error_.clear();
+            clear_motion_errors_locked();
 
             try {
                 mount_firmware_version_ = protocol.get_handset_firmware_version();
@@ -473,7 +473,7 @@ public:
             sync_completed_this_session_ = false;
             skip_next_ra_learn_ = false;
             flip_in_progress_ = false;
-            last_slew_error_.clear();
+            clear_motion_errors_locked();
             position_link_health_.reset();
             publish_link_fault_locked();
         }
@@ -564,8 +564,17 @@ public:
     bool get_at_home() const override {
         std::lock_guard<std::mutex> lock(mutex_);
         check_connected();
+        // AtHome is affected only by FindHome failures. A failed goto or Park
+        // still surfaces through Slewing without making this independent flag
+        // unreadable.
+        if (!last_home_error_.empty()) {
+            throw AlpacaException(last_home_error_);
+        }
         if (homing_ && connected_) {
             check_homing_complete_locked();
+        }
+        if (!last_home_error_.empty()) {
+            throw AlpacaException(last_home_error_);
         }
         return at_home_;
     }
@@ -1065,8 +1074,16 @@ public:
 
         // MC_LEVEL_START (0x0B) — moves each axis to its hardware home switch.
         // Asynchronous: returns immediately, client polls Slewing/AtHome.
-        protocol.level_start(0);
-        protocol.level_start(1);
+        try {
+            protocol.level_start(0);
+            protocol.level_start(1);
+        } catch (const std::exception& ex) {
+            fail_home_locked(std::string("FindHome dispatch failed: ") + ex.what());
+            throw AlpacaException(last_slew_error_);
+        } catch (...) {
+            fail_home_locked("FindHome dispatch failed: unknown exception");
+            throw AlpacaException(last_slew_error_);
+        }
 
         homing_ = true;
         at_home_ = false;
@@ -1074,7 +1091,7 @@ public:
         // open-astro#575: a fresh initiator is a clean start -- a client
         // that calls FindHome after a failed GOTO must not be told the OLD
         // goto failed while it's homing.
-        last_slew_error_.clear();
+        clear_motion_errors_locked();
     }
 
     // Park is an asynchronous initiator (ITelescopeV4; ConformU 4.5 times it
@@ -1149,7 +1166,7 @@ public:
             // open-astro#575: a fresh initiator is a clean start -- a client
             // that calls Park after a failed GOTO must not be told the OLD
             // goto failed while it's parking.
-            last_slew_error_.clear();
+            clear_motion_errors_locked();
             parking_ = true;
             ++motion_generation_;
         }
@@ -1167,7 +1184,7 @@ public:
                     tracking_mode_cached_ = 0;
                     tracking_mode_valid_ = true;
                 };
-                hooks.fail = [this](const std::string& message) { fail_park_locked(message); };
+                hooks.fail = [this, &ctx](const std::string& message) { fail_park_locked(message, ctx); };
                 hooks.complete = [this] {
                     slewing_cached_ = false;
                     slew_force_until_ = util::TaskClock::clock::time_point::min();
@@ -1197,24 +1214,97 @@ public:
     // is tried on its own so one failure does not skip the others. Returns
     // the first failure's message, or an empty string when every stop was
     // answered (#742). mutex_ must be held.
-    std::string stop_park_slew_locked() { return util::stop_goto_and_axes(CelestronProtocolWrapper::instance()); }
+    std::string stop_park_slew_locked() const { return util::stop_goto_and_axes(CelestronProtocolWrapper::instance()); }
 
-    // Park task failure path: stop the hardware so the reported idle state
-    // (Slewing false, AtPark false) matches reality, then drop the parking
-    // state so the caller can retry. When a stop fails the mount may still
-    // be moving, so Slewing keeps its cached value. mutex_ must be held.
-    void fail_park_locked(const std::string& message) {
+    void clear_motion_errors_locked() {
+        last_slew_error_.clear();
+        last_home_error_.clear();
+        slew_status_poll_failures_ = 0;
+        home_status_poll_failures_ = 0;
+    }
+
+    // Park task failure path: stop the hardware, then drop the parking state so
+    // the caller can retry. A successful stop publishes Slewing=false; a failed
+    // stop leaves a persistent Slewing error because the mount may still move.
+    // mutex_ must be held.
+    void fail_park_locked(const std::string& message, util::OperationContext& ctx) {
         const std::string stop_error = stop_park_slew_locked();
+        if (!connected_ || ctx.stop_reason() != util::StopReason::None) {
+            return;
+        }
         parking_ = false;
+        last_home_error_.clear();
+        last_slew_error_ = message;
         if (stop_error.empty()) {
             slewing_cached_ = false;
         } else {
+            last_slew_error_ += "; stopping after failure failed: " + stop_error + "; the mount may still be moving";
             ALPACA_LOG_ERROR("Celestron",
                              "stop after park failure failed: " + stop_error + "; the mount may still be moving");
         }
         slew_force_until_ = util::TaskClock::clock::time_point::min();
         position_override_until_ = util::TaskClock::clock::time_point::min();
         flip_in_progress_ = false;
+        ALPACA_LOG_WARN("Celestron", message);
+    }
+
+    void fail_slew_locked(const std::string& message, util::OperationContext& ctx) {
+        const std::string stop_error = stop_park_slew_locked();
+        if (!connected_ || ctx.stop_reason() != util::StopReason::None) {
+            return;
+        }
+        last_home_error_.clear();
+        last_slew_error_ = message;
+        if (stop_error.empty()) {
+            slewing_cached_ = false;
+        } else {
+            last_slew_error_ += "; stopping after failure failed: " + stop_error + "; the mount may still be moving";
+            ALPACA_LOG_ERROR("Celestron",
+                             "stop after slew failure failed: " + stop_error + "; the mount may still be moving");
+        }
+        slew_force_until_ = util::TaskClock::clock::time_point::min();
+        position_override_until_ = util::TaskClock::clock::time_point::min();
+        equatorial_cache_valid_ = false;
+        altaz_cache_valid_ = false;
+        flip_in_progress_ = false;
+        ALPACA_LOG_WARN("Celestron", message);
+    }
+
+    void fail_slew_poll_locked(const std::string& message) const {
+        const std::string stop_error = stop_park_slew_locked();
+        if (!connected_) {
+            return;
+        }
+        last_home_error_.clear();
+        last_slew_error_ = message;
+        if (stop_error.empty()) {
+            slewing_cached_ = false;
+        } else {
+            last_slew_error_ += "; stopping after failure failed: " + stop_error + "; the mount may still be moving";
+            ALPACA_LOG_ERROR("Celestron", "stop after Slewing poll failure failed: " + stop_error +
+                                              "; the mount may still be moving");
+        }
+        slew_force_until_ = util::TaskClock::clock::time_point::min();
+        position_override_until_ = util::TaskClock::clock::time_point::min();
+        equatorial_cache_valid_ = false;
+        altaz_cache_valid_ = false;
+        flip_in_progress_ = false;
+        ALPACA_LOG_WARN("Celestron", message);
+    }
+
+    void fail_home_locked(const std::string& message) const {
+        const std::string stop_error = stop_park_slew_locked();
+        homing_ = false;
+        at_home_ = false;
+        last_slew_error_ = message;
+        if (stop_error.empty()) {
+            slewing_cached_ = false;
+        } else {
+            last_slew_error_ += "; stopping after failure failed: " + stop_error + "; the mount may still be moving";
+            ALPACA_LOG_ERROR("Celestron",
+                             "stop after FindHome failure failed: " + stop_error + "; the mount may still be moving");
+        }
+        last_home_error_ = last_slew_error_;
         ALPACA_LOG_WARN("Celestron", message);
     }
 
@@ -1456,7 +1546,7 @@ public:
             // open-astro#575: a fresh initiator is a clean start -- a client
             // that retries a rejected goto must not be told the OLD goto
             // failed.
-            last_slew_error_.clear();
+            clear_motion_errors_locked();
             slew_force_until_ = clock_.now() + std::chrono::seconds(8);
             position_override_until_ = util::TaskClock::clock::time_point::min();
             flip_in_progress_ = do_flip;
@@ -1491,16 +1581,16 @@ public:
                             protocol.goto_ra_dec_raw(ra_raw, dec_raw, precise);
                         }
                     } catch (const std::exception& ex) {
-                        slewing_cached_ = false;
-                        slew_force_until_ = util::TaskClock::clock::time_point::min();
-                        position_override_until_ = util::TaskClock::clock::time_point::min();
-                        flip_in_progress_ = false;
                         // open-astro#575: a reap by a newer initiator or AbortSlew is not a
                         // failure -- that operation owns clearing/replacing last_slew_error_.
                         if (ctx.stop_reason() == util::StopReason::None) {
-                            last_slew_error_ = std::string("SlewToCoordinatesAsync failed: ") + ex.what();
+                            fail_slew_locked(std::string("SlewToCoordinatesAsync dispatch failed: ") + ex.what(), ctx);
                         }
-                        ALPACA_LOG_WARN("Celestron", std::string("Async slew dispatch failed: ") + ex.what());
+                        return;
+                    } catch (...) {
+                        if (ctx.stop_reason() == util::StopReason::None) {
+                            fail_slew_locked("SlewToCoordinatesAsync dispatch failed: unknown exception", ctx);
+                        }
                         return;
                     }
                 }
@@ -1510,6 +1600,7 @@ public:
                 auto start = clock_.now();
                 auto start_grace = std::chrono::seconds(2);
                 bool saw_slewing = false;
+                int completion_poll_failures = 0;
                 bool use_axis_poll = do_flip || use_passthrough;
                 auto& protocol = CelestronProtocolWrapper::instance();
                 while (true) {
@@ -1525,9 +1616,43 @@ public:
                         } else {
                             still_slewing = !protocol.is_slew_done(0) || !protocol.is_slew_done(1);
                         }
+                    } catch (const std::exception& ex) {
+                        if (ctx.stop_reason() == util::StopReason::None) {
+                            const int failures = ++completion_poll_failures;
+                            if (failures < kLinkFailureThreshold) {
+                                ALPACA_LOG_WARN("Celestron",
+                                                "Slew completion poll failed (" + std::to_string(failures) + "/" +
+                                                    std::to_string(kLinkFailureThreshold) + "): " + ex.what());
+                                continue;
+                            }
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            if (connected_ && ctx.stop_reason() == util::StopReason::None) {
+                                fail_slew_locked("Slew completion polling failed after " + std::to_string(failures) +
+                                                     " consecutive failures: " + ex.what(),
+                                                 ctx);
+                            }
+                        }
+                        return;
                     } catch (...) {
-                        still_slewing = false;
+                        if (ctx.stop_reason() == util::StopReason::None) {
+                            const int failures = ++completion_poll_failures;
+                            if (failures < kLinkFailureThreshold) {
+                                ALPACA_LOG_WARN("Celestron", "Slew completion poll failed (" +
+                                                                 std::to_string(failures) + "/" +
+                                                                 std::to_string(kLinkFailureThreshold) +
+                                                                 "): " + "unknown exception");
+                                continue;
+                            }
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            if (connected_ && ctx.stop_reason() == util::StopReason::None) {
+                                fail_slew_locked("Slew completion polling failed after " + std::to_string(failures) +
+                                                     " consecutive failures: unknown exception",
+                                                 ctx);
+                            }
+                        }
+                        return;
                     }
+                    completion_poll_failures = 0;
                     if (still_slewing) {
                         saw_slewing = true;
                     }
@@ -1538,8 +1663,11 @@ public:
                         break;
                     }
                     if (clock_.now() - start > timeout) {
-                        ALPACA_LOG_WARN("Celestron", "Async slew timed out after 120s");
-                        break;
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        if (connected_ && ctx.stop_reason() == util::StopReason::None) {
+                            fail_slew_locked("Slew timed out after 120s", ctx);
+                        }
+                        return;
                     }
                 }
                 if (slew_settle_time_seconds_ > 0) {
@@ -1555,20 +1683,26 @@ public:
                 // is std::terminate.
                 try {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    slewing_cached_ = false;
-                    slew_force_until_ = util::TaskClock::clock::time_point::min();
-                    equatorial_cache_valid_ = false;
-                    altaz_cache_valid_ = false;
-                    flip_in_progress_ = false;
                     if (!connected_ || ctx.stop_reason() != util::StopReason::None) {
                         return;
                     }
                     restore_tracking_after_slew_locked();
                     learn_ra_offset_locked(slew_target_ra);
+                    slewing_cached_ = false;
+                    slew_force_until_ = util::TaskClock::clock::time_point::min();
+                    equatorial_cache_valid_ = false;
+                    altaz_cache_valid_ = false;
+                    flip_in_progress_ = false;
                 } catch (const std::exception& ex) {
-                    ALPACA_LOG_WARN("Celestron", std::string("Async slew completion handling failed: ") + ex.what());
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (connected_ && ctx.stop_reason() == util::StopReason::None) {
+                        fail_slew_locked(std::string("Slew completion handling failed: ") + ex.what(), ctx);
+                    }
                 } catch (...) {
-                    ALPACA_LOG_WARN("Celestron", "Async slew completion handling failed");
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (connected_ && ctx.stop_reason() == util::StopReason::None) {
+                        fail_slew_locked("Slew completion handling failed: unknown exception", ctx);
+                    }
                 }
             },
             displaced,
@@ -1669,8 +1803,8 @@ public:
             if (was_parking) {
                 // Unpark during a park wins the race: stop the park slew and
                 // drop the parking state; the task below is then joined. A
-                // failed stop leaves Slewing at its cached value, since the
-                // park slew may still be running.
+                // failed stop leaves Slewing to report the stored error, since
+                // the park slew may still be running.
                 parking_ = false;
                 stop_error = stop_park_slew_locked();
                 if (stop_error.empty()) {
@@ -1679,6 +1813,12 @@ public:
                 slew_force_until_ = util::TaskClock::clock::time_point::min();
                 position_override_until_ = util::TaskClock::clock::time_point::min();
                 flip_in_progress_ = false;
+            }
+            if (stop_error.empty()) {
+                clear_motion_errors_locked();
+            } else {
+                last_home_error_.clear();
+                last_slew_error_ = "Unpark could not stop the park slew: " + stop_error;
             }
         }
         if (was_parking) {
@@ -1732,12 +1872,8 @@ public:
             parked_ = false;
             at_home_ = false;
         }
-        // open-astro#575: a fresh initiator is a clean start -- a client
-        // that jogs an axis after a failed GOTO must not be told the OLD
-        // goto failed.
-        last_slew_error_.clear();
-
         CelestronProtocolWrapper::instance().move_axis_variable_rate(axis, moving ? rate : 0.0);
+        clear_motion_errors_locked();
     }
 
     std::pair<double, double> get_axis_rate_range(int axis) const override {
@@ -1777,10 +1913,6 @@ public:
                 // The slew cancellation above prevents delayed dispatches. The
                 // wrapper serializes transactions, so a GOTO already in flight
                 // must finish (or time out) before these stops can reach the mount.
-                // open-astro#575: AbortSlew is a valid clearing command for a stored
-                // slew failure -- the client acted on the error, so the next Slewing
-                // read must answer normally again.
-                last_slew_error_.clear();
                 auto& protocol = CelestronProtocolWrapper::instance();
                 // Try every stop on its own, so one lost command cannot skip the others (#781).
                 std::string stop_error;
@@ -1801,9 +1933,14 @@ public:
                 try_stop([&protocol]() { protocol.move_axis_fixed_rate(0, 0); });
                 try_stop([&protocol]() { protocol.move_axis_fixed_rate(1, 0); });
                 if (!stop_error.empty()) {
+                    last_home_error_.clear();
+                    last_slew_error_ = "AbortSlew stop failed: " + stop_error;
                     // The mount may still be moving: leave Slewing and the slew state as they were.
                     throw AlpacaException("AbortSlew stop failed: " + stop_error, AlpacaError::DriverException);
                 }
+                // AbortSlew clears a stored motion error only after all stop
+                // commands are acknowledged.
+                clear_motion_errors_locked();
                 pulse_guide_active_.fill(false);
                 pulse_guide_end_time_.fill(util::TaskClock::clock::time_point::min());
                 homing_ = false;
@@ -2007,7 +2144,7 @@ private:
     }
 
     void note_position_failure_locked(const std::exception& e) const {
-        if (auto fault = position_link_health_.note_failure(e.what(), kPositionLinkFailureThreshold)) {
+        if (auto fault = position_link_health_.note_failure(e.what(), kLinkFailureThreshold)) {
             ALPACA_LOG_ERROR("Celestron", "Position link faulted: " + *fault);
         } else {
             ALPACA_LOG_WARN("Celestron", "Position read failed (" +
@@ -2023,10 +2160,18 @@ private:
     }
 
     bool get_slewing_locked() const {
+        if (!last_slew_error_.empty()) {
+            throw AlpacaException(last_slew_error_);
+        }
         // A park in flight reports Slewing until the park task flips AtPark
         // (same locked step) — never Slewing false with AtPark false.
         if (parking_) {
             return true;
+        }
+        // The async body owns its completion polling; a getter serves its
+        // published state instead of competing for a second wire read.
+        if (slew_.running()) {
+            return slewing_cached_;
         }
         return poll_hardware_slewing_locked();
     }
@@ -2040,6 +2185,9 @@ private:
         }
         if (homing_) {
             check_homing_complete_locked();
+            if (!last_slew_error_.empty()) {
+                throw AlpacaException(last_slew_error_);
+            }
             return homing_; // still homing = still slewing
         }
         bool was_slewing = slewing_cached_;
@@ -2052,7 +2200,31 @@ private:
                 bool dec_done = protocol.is_slew_done(1);
                 slewing_cached_ = !ra_done || !dec_done;
             }
+            slew_status_poll_failures_ = 0;
+        } catch (const std::exception& ex) {
+            const int failures = ++slew_status_poll_failures_;
+            if (failures < kLinkFailureThreshold) {
+                ALPACA_LOG_WARN("Celestron", "Slew status poll failed (" + std::to_string(failures) + "/" +
+                                                 std::to_string(kLinkFailureThreshold) + "): " + ex.what());
+                return slewing_cached_;
+            }
+            const std::string message = "Slew completion polling failed after " + std::to_string(failures) +
+                                        " consecutive failures: " + ex.what();
+            if (parking_) throw AlpacaException(message, AlpacaError::DriverException);
+            if (slewing_cached_) fail_slew_poll_locked(message);
+            throw AlpacaException(last_slew_error_.empty() ? message : last_slew_error_, AlpacaError::DriverException);
         } catch (...) {
+            const int failures = ++slew_status_poll_failures_;
+            if (failures < kLinkFailureThreshold) {
+                ALPACA_LOG_WARN("Celestron", "Slew status poll failed (" + std::to_string(failures) + "/" +
+                                                 std::to_string(kLinkFailureThreshold) + "): unknown exception");
+                return slewing_cached_;
+            }
+            const std::string message = "Slew completion polling failed after " + std::to_string(failures) +
+                                        " consecutive failures: unknown exception";
+            if (parking_) throw AlpacaException(message, AlpacaError::DriverException);
+            if (slewing_cached_) fail_slew_poll_locked(message);
+            throw AlpacaException(last_slew_error_.empty() ? message : last_slew_error_, AlpacaError::DriverException);
         }
         if (was_slewing && !slewing_cached_) {
             equatorial_cache_valid_ = false;
@@ -2067,6 +2239,7 @@ private:
             auto& protocol = CelestronProtocolWrapper::instance();
             bool ra_done = protocol.is_level_done(0);
             bool dec_done = protocol.is_level_done(1);
+            home_status_poll_failures_ = 0;
             if (ra_done && dec_done) {
                 homing_ = false;
                 at_home_ = true;
@@ -2074,7 +2247,24 @@ private:
                 equatorial_cache_valid_ = false;
                 altaz_cache_valid_ = false;
             }
+        } catch (const std::exception& ex) {
+            const int failures = ++home_status_poll_failures_;
+            if (failures < kLinkFailureThreshold) {
+                ALPACA_LOG_WARN("Celestron", "FindHome status poll failed (" + std::to_string(failures) + "/" +
+                                                 std::to_string(kLinkFailureThreshold) + "): " + ex.what());
+                return;
+            }
+            fail_home_locked("FindHome completion polling failed after " + std::to_string(failures) +
+                             " consecutive failures: " + ex.what());
         } catch (...) {
+            const int failures = ++home_status_poll_failures_;
+            if (failures < kLinkFailureThreshold) {
+                ALPACA_LOG_WARN("Celestron", "FindHome status poll failed (" + std::to_string(failures) + "/" +
+                                                 std::to_string(kLinkFailureThreshold) + "): unknown exception");
+                return;
+            }
+            fail_home_locked("FindHome completion polling failed after " + std::to_string(failures) +
+                             " consecutive failures: unknown exception");
         }
     }
 
@@ -2229,18 +2419,13 @@ private:
             return;
         }
         auto& protocol = CelestronProtocolWrapper::instance();
-        try {
-            int mode = tracking_mode_cached_;
-            if (mode <= 0) {
-                mode = 2; // EQ-North default
-            }
-            protocol.set_tracking_mode(mode);
-            tracking_mode_cached_ = mode;
-            tracking_mode_valid_ = true;
-        } catch (const std::exception& e) {
-            ALPACA_LOG_WARN("Celestron",
-                            std::string("restore_tracking_after_slew: ") + e.what());
+        int mode = tracking_mode_cached_;
+        if (mode <= 0) {
+            mode = 2;  // EQ-North default
         }
+        protocol.set_tracking_mode(mode);
+        tracking_mode_cached_ = mode;
+        tracking_mode_valid_ = true;
     }
 
     void learn_ra_offset_locked(double target_ra) {
@@ -2356,7 +2541,7 @@ private:
         // open-astro#575: a fresh initiator is a clean start -- a client
         // that retries a rejected goto (even via the blocking SlewToCoordinates)
         // must not be told the OLD goto failed.
-        last_slew_error_.clear();
+        clear_motion_errors_locked();
         slew_force_until_ = clock_.now() + std::chrono::seconds(8);
         position_override_until_ = util::TaskClock::clock::time_point::min();
 
@@ -2549,9 +2734,13 @@ private:
     // indistinguishable from a landed goto. Set (under mutex_) by the slew
     // task's catch block on a REAL failure (never on the task's own
     // cancellation -- a newer initiator or AbortSlew reaped it), cleared by
-    // the next slew initiator, AbortSlew, and connect/disconnect. Consulted by
+    // the next motion initiator, a successful AbortSlew, and connect/disconnect.
+    // A failed AbortSlew replaces it with the failed-stop reason. Consulted by
     // get_slewing() before the cached bool.
     mutable std::string last_slew_error_;
+    mutable std::string last_home_error_;  // FindHome's completion error, not every motion error.
+    mutable int slew_status_poll_failures_ = 0;
+    mutable int home_status_poll_failures_ = 0;
     mutable util::TaskClock::clock::time_point slew_force_until_;
     mutable util::TaskClock::clock::time_point position_override_until_;
     mutable bool manual_axis_slewing_[2] = {false, false};

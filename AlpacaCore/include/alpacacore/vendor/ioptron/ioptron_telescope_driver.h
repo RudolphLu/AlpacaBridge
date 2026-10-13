@@ -16,6 +16,7 @@
 #include <alpacacore/util/connection_resolver.h>
 #include <alpacacore/vendor/ioptron/ioptron_protocol_wrapper.h>
 
+#include <functional>
 #include <memory>
 #include <optional>
 
@@ -31,6 +32,12 @@ namespace alpacacore::vendor::ioptron {
 std::unique_ptr<TelescopeDriver> create_ioptron_telescope(
     int device_number,
     const ConnectionInfo& connection_info);
+
+/// Instance-scoped worker seam for deterministic async-slew lifecycle tests.
+std::unique_ptr<TelescopeDriver> create_ioptron_telescope_with_slew_worker_hook(
+    int device_number, const ConnectionInfo& connection_info, std::function<void()> before_worker_lock,
+    std::optional<double> site_latitude_deg = std::nullopt, std::optional<double> site_longitude_deg = std::nullopt,
+    std::function<void()> before_slew_reap = {}, std::function<void()> before_handoff_lock = {});
 
 /**
  * @brief Factory function to create iOptron telescope driver with site defaults.

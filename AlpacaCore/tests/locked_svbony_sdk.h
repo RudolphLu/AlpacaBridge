@@ -25,14 +25,17 @@ namespace alpacacore::test {
  * Thread-safe decorator over any SVBSDK: every call forwards to the inner
  * implementation under one mutex.
  *
- * Exists for the concurrency stress harness: FakeSVBSDK is deliberately not
- * thread-hardened, but the stress tests hammer one driver from many threads, so
- * unguarded fake state would report races in test code and hide the driver
- * races the harness exists to catch. The real wrapper serialises internally,
- * so production drivers never need this. All 22 entry points are wrapped, since
- * the driver's exposure and pulse-guide workers call the SDK from their own
- * threads. The mutex is a leaf: the inner SDK never calls back into this
- * interface, and no FakeSVBSDK method blocks.
+ * FakeSVBSDK locks its own state, so the decorator is not needed to keep the
+ * fake race-free; it serialises the SDK the way a single-threaded vendor
+ * library would, for tests that want that shape. All 22 entry points are
+ * wrapped. The mutex is a leaf: the inner SDK never calls back into this
+ * interface.
+ *
+ * Do not use it over a FakeSVBSDK configured to block: get_video_data() holds
+ * in block_video_data() mode (up to its read-wait bound) and waits wait_ms in
+ * timeout_video_data() mode, and behind this mutex the abort's
+ * stop_video_capture() would then queue behind the very read it is meant to
+ * wake.
  */
 class LockedSVBSDK : public vendor::svbony::SVBSDK {
 public:
@@ -42,6 +45,7 @@ public:
     using SVBImageType = vendor::svbony::SVBImageType;
     using SVBROIFormat = vendor::svbony::SVBROIFormat;
     using SVBGuideDirection = vendor::svbony::SVBGuideDirection;
+    using SVBVideoDataResult = vendor::svbony::SVBVideoDataResult;
 
     explicit LockedSVBSDK(SVBSDK& inner) : inner_(inner) {}
 
@@ -89,8 +93,8 @@ public:
     void stop_video_capture(int camera_id) override {
         locked([&] { inner_.stop_video_capture(camera_id); });
     }
-    void get_video_data(int camera_id, std::uint8_t* buffer, long buffer_size, int wait_ms) override {
-        locked([&] { inner_.get_video_data(camera_id, buffer, buffer_size, wait_ms); });
+    SVBVideoDataResult get_video_data(int camera_id, std::uint8_t* buffer, long buffer_size, int wait_ms) override {
+        return locked([&] { return inner_.get_video_data(camera_id, buffer, buffer_size, wait_ms); });
     }
 
     void pulse_guide(int camera_id, SVBGuideDirection direction, int duration_ms) override {

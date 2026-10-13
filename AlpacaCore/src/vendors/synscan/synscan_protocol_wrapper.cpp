@@ -506,10 +506,17 @@ public:
         }
         // Some firmware responds to binary motion commands while others do not.
         // Drain any immediate bytes so they don't corrupt the next request/response cycle.
+        std::string drained;
         try {
-            (void)read_response(false, 40);
+            drained = read_response(false, 40);
         } catch (...) {
             // Ignore optional response drain errors for fire-and-forget commands.
+        }
+        // Same TRACE-only wire log as send_command(): moves, pulse guides and
+        // landing nudges are all blind P commands, and without this line a rig
+        // TRACE cannot show which direction byte a move sent.
+        if (alpacacore::logging::get_log_level() == alpacacore::logging::LogLevel::Trace) {
+            ALPACA_LOG_TRACE("SynScan", "HC " + printable(command) + " (blind) -> " + printable(drained));
         }
     }
 
@@ -613,8 +620,8 @@ public:
 
     bool is_goto_in_progress() {
         std::string response = send_command("L", true, 0);
-        if (response.empty()) {
-            return false;
+        if (response.size() != 1 || (response[0] != '0' && response[0] != '1')) {
+            throw AlpacaException("Invalid response to SynScan slew-status query", AlpacaError::DriverException);
         }
         return response[0] == '1';
     }

@@ -93,23 +93,37 @@ NormalizeResult normalize_telescope(const DeviceConfig& in, Source source) {
 void register_zwo_schema(DeviceCatalog& catalog) {
     add_schema(catalog, DeviceType::Telescope, "ZWO AM Mount", zwo_telescope_fields(), normalize_telescope);
     add_schema(catalog, DeviceType::FilterWheel, "ZWO EFW Filter Wheel", zwo_filterwheel_fields(),
-               [](const DeviceConfig& in, Source) {
-                   return refusal_only(in, zwo_bound_refusal(in, kZwoFilterwheelId, kZwoFilterwheelIndex,
-                                                             "ZWO filter wheel requires filterwheelIndex or "
-                                                             "filterwheelId"));
+               [](const DeviceConfig& in, Source source) {
+                   return refusal_only(
+                       in, source == Source::Api
+                               ? zwo_bound_refusal(in, kZwoFilterwheelId, kZwoFilterwheelIndex,
+                                                   "ZWO filter wheel requires filterwheelIndex or filterwheelId")
+                               : std::nullopt);
                });
     add_schema(catalog, DeviceType::Focuser, "ZWO EAF Focuser", zwo_focuser_fields(),
-               [](const DeviceConfig& in, Source) {
-                   return refusal_only(in, zwo_bound_refusal(in, kZwoFocuserId, kZwoFocuserIndex,
-                                                             "ZWO EAF focuser requires focuserIndex or focuserId"));
+               [](const DeviceConfig& in, Source source) {
+                   return refusal_only(in, source == Source::Api
+                                               ? zwo_bound_refusal(in, kZwoFocuserId, kZwoFocuserIndex,
+                                                                   "ZWO EAF focuser requires focuserIndex or focuserId")
+                                               : std::nullopt);
                });
     add_schema(catalog, DeviceType::Rotator, "ZWO CAA Rotator", zwo_rotator_fields(),
-               [](const DeviceConfig& in, Source) {
-                   return refusal_only(in, zwo_bound_refusal(in, kZwoRotatorId, kZwoRotatorIndex,
-                                                             "ZWO rotator requires rotatorIndex or rotatorId"));
+               [](const DeviceConfig& in, Source source) {
+                   return refusal_only(in, source == Source::Api
+                                               ? zwo_bound_refusal(in, kZwoRotatorId, kZwoRotatorIndex,
+                                                                   "ZWO rotator requires rotatorIndex or rotatorId")
+                                               : std::nullopt);
                });
     add_schema(catalog, DeviceType::Switch, "ZWO Switch", zwo_switch_fields(),
-               [](const DeviceConfig& in, Source) { return refusal_only(in, zwo_switch_refusal(in)); });
+               [](const DeviceConfig& in, Source source) {
+                   if (auto refusal = zwo_switch_refusal(in)) return refusal_only(in, std::move(refusal));
+                   if (source == Source::Api && zwo_switch_type(in) == "dewheater") {
+                       return refusal_only(in, zwo_bound_refusal(in, kZwoCameraId, kZwoCameraIndex,
+                                                                 "ZWO dew heater switch requires cameraIndex or "
+                                                                 "cameraId"));
+                   }
+                   return refusal_only(in, std::nullopt);
+               });
 }
 
 }  // namespace alpacacore::catalog

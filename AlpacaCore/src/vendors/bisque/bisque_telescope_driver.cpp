@@ -1033,17 +1033,14 @@ private:
         if (!slewing_cached_) {
             return false;
         }
-        // Poll TheSkyX.
-        try {
-            auto& protocol = BisqueProtocolWrapper::instance();
-            bool complete = protocol.is_slew_complete();
-            if (complete) {
-                slewing_cached_ = false;
-            }
-            return !complete;
-        } catch (...) {
-            return false;
+        // A failed completion poll is not evidence that the slew completed.
+        // Preserve the cached in-progress state and surface the protocol error.
+        auto& protocol = BisqueProtocolWrapper::instance();
+        bool complete = protocol.is_slew_complete();
+        if (complete) {
+            slewing_cached_ = false;
         }
+        return !complete;
     }
 
     bool get_tracking_locked() const {

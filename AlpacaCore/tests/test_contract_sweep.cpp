@@ -56,6 +56,8 @@
 
 #ifdef ALPACACORE_ENABLE_ZWO
 #include <alpacacore/vendor/zwo/zwo_telescope_driver.h>
+
+#include "fake_zwo_sdk.h"
 #endif
 #ifdef ALPACACORE_ENABLE_CELESTRON
 #include <alpacacore/vendor/celestron/celestron_protocol_wrapper.h>
@@ -118,7 +120,6 @@
 #include <alpacacore/vendor/svbony/svbony_camera_driver.h>
 
 #include "fake_svbony_sdk.h"
-#include "locked_svbony_sdk.h"
 #endif
 #ifdef ALPACACORE_ENABLE_PLAYERONE
 #include <alpacacore/vendor/playerone/playerone_camera_driver.h>
@@ -804,6 +805,29 @@ Tier2Host tier2_host_zwo_telescope() {
             return zwo::create_zwo_telescope(0, info);
         });
 }
+
+Tier2Host tier2_host_zwo_camera() {
+    Tier2Host h{"zwo_camera", "zwo", "camera", "fake_zwo_sdk.h", DeviceType::Camera, "zwo_camera", {}, true, {}, ""};
+    h.connectable = [](bool hold) {
+        auto sdk = std::make_shared<alpacacore::test::FakeZWOSDK>();
+        if (hold) {
+            sdk->before_call = [](const std::string& name) {
+                if (name == "open_camera") std::this_thread::sleep_for(kHold);
+            };
+        }
+        return host_over(sdk, [](alpacacore::test::FakeZWOSDK& fake) -> std::unique_ptr<AlpacaDriver> {
+            return alpacacore::vendor::zwo::create_zwo_camera(0, fake.camera.camera_id, fake);
+        });
+    };
+    h.failing = []() {
+        auto sdk = std::make_shared<alpacacore::test::FakeZWOSDK>();
+        sdk->fail_open = true;
+        return host_over(sdk, [](alpacacore::test::FakeZWOSDK& fake) -> std::unique_ptr<AlpacaDriver> {
+            return alpacacore::vendor::zwo::create_zwo_camera(0, fake.camera.camera_id, fake);
+        });
+    };
+    return h;
+}
 #endif
 
 #ifdef ALPACACORE_ENABLE_CELESTRON
@@ -1238,46 +1262,6 @@ Tier2Host tier2_host_altair_camera() {
 }
 #endif
 
-#ifdef ALPACACORE_ENABLE_SVBONY
-struct SvbonySdkHold {
-    alpacacore::test::FakeSVBSDK fake;
-    alpacacore::test::LockedSVBSDK sdk{fake};
-};
-
-// Recipe of test_svbony_concurrency_stress.cpp.
-Tier2Host tier2_host_svbony_camera() {
-    Tier2Host h{"svbony_camera",
-                "svbony",
-                "camera",
-                "fake_svbony_sdk.h",
-                DeviceType::Camera,
-                "svbony_camera",
-                {},
-                true,
-                {},
-                ""};
-    h.connectable = [](bool hold) {
-        auto sdk_hold = std::make_shared<SvbonySdkHold>();
-        if (hold) {
-            sdk_hold->fake.before_call = [](const std::string& name) {
-                if (name == "open_camera") std::this_thread::sleep_for(kHold);
-            };
-        }
-        return host_over(sdk_hold, [](SvbonySdkHold& s) -> std::unique_ptr<AlpacaDriver> {
-            return alpacacore::vendor::svbony::create_svbony_camera(0, 0, s.sdk);
-        });
-    };
-    h.failing = []() {
-        auto hold = std::make_shared<SvbonySdkHold>();
-        hold->fake.throw_from.insert("open_camera");  // fake_svbony_sdk.h fault injection
-        return host_over(hold, [](SvbonySdkHold& s) -> std::unique_ptr<AlpacaDriver> {
-            return alpacacore::vendor::svbony::create_svbony_camera(0, 0, s.sdk);
-        });
-    };
-    return h;
-}
-#endif
-
 #ifdef ALPACACORE_ENABLE_PLAYERONE
 Tier2Host tier2_host_playerone_camera() {
     Tier2Host h{"playerone_camera",
@@ -1302,6 +1286,36 @@ Tier2Host tier2_host_playerone_camera() {
         sdk->set_no_cameras(true);
         return host_over(sdk, [](alpacacore::test::FakePlayerOneSDK& fake) -> std::unique_ptr<AlpacaDriver> {
             return alpacacore::vendor::playerone::create_playerone_camera(0, 0, fake);
+        });
+    };
+    return h;
+}
+#endif
+
+#ifdef ALPACACORE_ENABLE_SVBONY
+Tier2Host tier2_host_svbony_camera() {
+    Tier2Host h{"svbony_camera",
+                "svbony",
+                "camera",
+                "fake_svbony_sdk.h",
+                DeviceType::Camera,
+                "svbony_camera",
+                {},
+                true,
+                {},
+                ""};
+    h.connectable = [](bool hold) {
+        auto sdk = std::make_shared<alpacacore::test::FakeSVBSDK>();
+        if (hold) sdk->set_open_delay(kHold);
+        return host_over(sdk, [](alpacacore::test::FakeSVBSDK& fake) -> std::unique_ptr<AlpacaDriver> {
+            return alpacacore::vendor::svbony::create_svbony_camera(0, 0, fake);
+        });
+    };
+    h.failing = []() {
+        auto sdk = std::make_shared<alpacacore::test::FakeSVBSDK>();
+        sdk->set_camera_present(false);
+        return host_over(sdk, [](alpacacore::test::FakeSVBSDK& fake) -> std::unique_ptr<AlpacaDriver> {
+            return alpacacore::vendor::svbony::create_svbony_camera(0, 0, fake);
         });
     };
     return h;
@@ -1453,7 +1467,7 @@ Tier2Host tier2_host_wandererastro_switch() {
 // with no such probe (invalid_probe_reason_for() in contract_sweep.h states why; the guard case pins it).
 // clang-format off
 #ifdef ALPACACORE_ENABLE_ZWO
-#define CS2_ZWO(X) X(zwo_telescope, TEL)
+#define CS2_ZWO(X) X(zwo_telescope, TEL) X(zwo_camera, NPR)
 #else
 #define CS2_ZWO(X)
 #endif

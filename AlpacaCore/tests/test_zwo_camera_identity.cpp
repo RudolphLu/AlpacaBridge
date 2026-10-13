@@ -238,3 +238,23 @@ TEST_CASE("ZWO camera slots - the refusal names the slot, the SDK error and the 
           "The SDK could not read ZWO camera slot 0 (ASI_ERROR_CAMERA_REMOVED); "
           "power-cycle the camera (and any hub it powers)");
 }
+
+TEST_CASE("ZWO camera slots - an explicit camera id resolves while another slot is unreadable",
+          "[zwo][camera][identity][unit]") {
+    using alpacacore::vendor::zwo::read_zwo_camera_slots;
+
+    // Slot 0 is the unreadable camera; the entry is bound to the healthy camera in slot 1 by id.
+    const auto slots = read_zwo_camera_slots<FakeSlotInfo>(2, slot0_removed);
+    std::vector<ZwoEnumeratedCamera> found;
+    for (const auto& slot : slots) {
+        found.push_back({slot.slot, 100 + slot.slot, slot.info.name, ""});
+    }
+    ZwoConfiguredIdentity by_id;
+    by_id.camera_id = 101;
+
+    const auto result = resolve_zwo_camera(by_id, found, {});
+
+    REQUIRE(result.camera.has_value());
+    CHECK(result.camera->index == 1);
+    CHECK(result.camera->camera_id == 101);
+}

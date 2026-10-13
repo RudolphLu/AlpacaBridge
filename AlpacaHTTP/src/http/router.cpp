@@ -2449,8 +2449,11 @@ Response Router::handle_configured_devices(const Request& request, std::uint32_t
             if (auto driver = registry.get_device(cap.type, cap.device_number)) {
                 // Connected feeds the web UI status dot (green/yellow). Omitted
                 // when the call throws, so the UI shows "unknown" (red).
+                // get_connecting() is lock-free; a driver mid-connect can hold its
+                // coarse mutex across get_connected() for the whole connect, so
+                // report false without asking (as the Connected endpoint does).
                 try {
-                    device["Connected"] = driver->get_connected();
+                    device["Connected"] = !driver->get_connecting() && driver->get_connected();
                 } catch (const std::exception& e) {
                     util::log_warning("Connected query failed for " + cap.name + ": " + e.what());
                 }
@@ -8269,6 +8272,44 @@ bool Router::register_device_from_config(const nlohmann::json& config, std::stri
     std::string vendor = config_get(config, "vendor", "");
     int device_number = config_get(config, "deviceNumber", -1);
 
+#ifdef ALPACACORE_ENABLE_ZWO
+    const auto read_zwo_selector = [&](const char* field, int& value) {
+        const auto it = config.find(field);
+        if (it == config.end() || it->is_null()) {
+            value = -1;
+            return true;
+        }
+        std::optional<int> parsed;
+        if (it->is_number_unsigned()) {
+            const auto raw = it->get<std::uint64_t>();
+            if (raw <= static_cast<std::uint64_t>(std::numeric_limits<int>::max())) parsed = static_cast<int>(raw);
+        } else if (it->is_number_integer()) {
+            const auto raw = it->get<std::int64_t>();
+            if (raw >= -1 && raw <= std::numeric_limits<int>::max()) parsed = static_cast<int>(raw);
+        } else if (it->is_number_float()) {
+            const double raw = it->get<double>();
+            if (std::isfinite(raw) && raw == std::trunc(raw) && raw >= -1.0 &&
+                raw <= static_cast<double>(std::numeric_limits<int>::max())) {
+                parsed = static_cast<int>(raw);
+            }
+        }
+        if (parsed) {
+            value = *parsed;
+            return true;
+        }
+        if (source == ConfigSource::Api) {
+            error_message = std::string("Invalid value for ") + field + ": expected an integer from -1 to " +
+                            std::to_string(std::numeric_limits<int>::max());
+            return false;
+        }
+        util::log_warning(persisted_device_subject(vendor, device_type_str, device_number) + " has invalid '" + field +
+                          "' (expected an integer from -1 to INT_MAX); dropping it");
+        if (learned_config != nullptr) (*learned_config)[field] = nullptr;
+        value = -1;
+        return true;
+    };
+#endif
+
     if (device_type_str.empty() || vendor.empty() || device_number < 0) {
         error_message = "Missing required fields: deviceType, vendor, and deviceNumber";
         return false;
@@ -8317,6 +8358,20 @@ bool Router::register_device_from_config(const nlohmann::json& config, std::stri
                                       ". The saved value is not used: the field falls back to its default, or "
                                       "stays unset if it has none. Registered so it stays listed and editable in "
                                       "the web UI.");
+                }
+                if (key.vendor.compare("zwo") == 0 && learned_config != nullptr) {
+                    const auto normalized = catalog_json::json_from_config(result.config);
+                    for (const auto& field : view->fields) {
+                        if (field.role != alpacacore::catalog::Role::EnumerationIndex &&
+                            field.role != alpacacore::catalog::Role::DeviceId) {
+                            continue;
+                        }
+                        const auto original = config.find(field.key);
+                        if (original != config.end() && !original->is_null() &&
+                            normalized.find(field.key) == normalized.end()) {
+                            (*learned_config)[field.key] = nullptr;
+                        }
+                    }
                 }
             }
             if (!view->available) {
@@ -8602,8 +8657,11 @@ bool Router::register_device_from_config(const nlohmann::json& config, std::stri
 
     if (vendor == "zwo" && device_type_str == "camera") {
 #ifdef ALPACACORE_ENABLE_ZWO
-        const int camera_id = config_get(config, "cameraId", -1);
-        const int camera_index = config_get(config, "cameraIndex", -1);
+        int camera_id = -1;
+        int camera_index = -1;
+        if (!read_zwo_selector("cameraId", camera_id) || !read_zwo_selector("cameraIndex", camera_index)) {
+            return false;
+        }
         std::string configured_serial = config_get(config, "serialNumber", "");
         std::string configured_name = config_get(config, "cameraName", "");
         std::string unique_id = config_get(config, "uniqueId", "");
@@ -8642,7 +8700,8 @@ bool Router::register_device_from_config(const nlohmann::json& config, std::stri
         const std::string supplied_unique_id = unique_id;
         const bool unique_id_supplied = !unique_id.empty();
 
-        if (camera_id < 0 && camera_index < 0 && configured_serial.empty() && configured_name.empty()) {
+        if (camera_id < 0 && camera_index < 0 && configured_serial.empty() && configured_name.empty() &&
+            source == ConfigSource::Api) {
             error_message = "ZWO camera requires cameraIndex or cameraId";
             return false;
         }
@@ -9162,7 +9221,13 @@ void Router::load_persisted_devices() {
                         const PersistedKey& have = *key;
                         if (have.vendor == wanted.vendor && have.device_type == wanted.device_type &&
                             have.device_number == wanted.device_number) {
-                            saved.update(learned_config);
+                            for (const auto& [field, value] : learned_config.items()) {
+                                if (value.is_null()) {
+                                    saved.erase(field);
+                                } else {
+                                    saved[field] = value;
+                                }
+                            }
                             stored = true;
                             break;
                         }

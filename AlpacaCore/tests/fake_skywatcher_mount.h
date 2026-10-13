@@ -417,6 +417,13 @@ public:
         ax(axis).reject_starts = n;
     }
 
+    /// Refuse the next @p n instant-stop command on an axis. Used to verify
+    /// that async-operation cleanup preserves stop failures.
+    void reject_instant_stop(int axis, int n) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ax(axis).reject_instant_stops = n;
+    }
+
     /// The T1 step period the axis is actually running with (last APPLIED ":I").
     uint32_t step_period(int axis) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -471,6 +478,7 @@ private:
         int stall_live_rate_writes = 0;     // ":I" writes on a running axis to store but not apply (test knob)
         int ignore_start_relatches = 0;     // ":J" kicks on a running axis that must NOT re-latch T1 (test knob)
         int reject_starts = 0;              // ":J" to refuse with "!2" (test knob)
+        int reject_instant_stops = 0;       // ":L" to refuse with "!2" (test knob)
         int64_t home_index_counts = kHome;
         // Set from the injected clock in the constructor.
         std::chrono::steady_clock::time_point last{};
@@ -730,6 +738,10 @@ private:
                 }
                 return "=";
             case 'L':  // instant stop
+                if (a.reject_instant_stops > 0) {
+                    --a.reject_instant_stops;
+                    return "!2";
+                }
                 ++a.stop_count;
                 a.coasting = false;  // an explicit stop ends the landing coast
                 a.running = false;

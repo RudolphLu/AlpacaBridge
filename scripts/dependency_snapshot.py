@@ -4,10 +4,15 @@
 GitHub's dependency graph only parses manifests it knows (here: the workflow
 action pins). This script reports what actually ships: the Debian packages in
 debian/control, the CMake FetchContent libraries and the vendored SDKs in
-AlpacaCore/external/ (versions from scripts/dependency_sdk_versions.json).
+AlpacaCore/external/ (versions from scripts/dependency_sdk_versions.json), plus
+the tools .github/workflows/ci.yml installs outside debian/control (cppcheck,
+zizmor, and the CI_APT_TOOLS such as Catch2), the ConformU beta build .claude/commands/conformu.md pins,
+and every workflow job's container image (pkg:docker), as development dependencies.
 
   dependency_snapshot.py [--sha S] [--ref R] [--output FILE]   write the snapshot
   dependency_snapshot.py --check                               drift check
+  dependency_snapshot.py --spdx DEB [--output FILE]            SPDX SBOM for a built .deb
+  dependency_snapshot.py --pin                                 rewrite the SDK sha256 pins
   dependency_snapshot.py --self-test
 
 Rules: Build-Depends become scope "development", Depends become "runtime".
@@ -22,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -34,8 +40,26 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TABLE = "scripts/dependency_sdk_versions.json"
 EXTERNAL = "AlpacaCore/external"
+VENDORS = "AlpacaCore/src/vendors"
 DEB_QUALIFIERS = "arch=arm64&distro=trixie"
+# Package directories holding vendor binaries and firmware copied from AlpacaCore/external/.
+SHIPPED_VENDOR_DIRS = ("usr/lib/alpacabridge", "usr/lib/firmware")
 SKIP = {"debhelper-compat"}
+CI = ".github/workflows/ci.yml"
+# (ci.yml step name, purl template): tools CI downloads at a pinned version.
+CI_TOOL_STEPS = (("Build cppcheck 2.17.x from source", "pkg:github/danmar/cppcheck@{ver}"),
+                 ("Install zizmor", "pkg:github/zizmorcore/zizmor@v{ver}"))
+# The same ver= pins in other workflows: {workflow path: ((step name, purl template), ...)}.
+WORKFLOW_TOOL_STEPS = {".github/workflows/osv-scan.yml": (("Install OSV-Scanner",
+                                                          "pkg:github/google/osv-scanner@v{ver}"),)}
+# Unpinned tools ci.yml installs from the runner's apt (Ubuntu 24.04, not trixie).
+CI_APT_TOOLS = ("catch2", "clang-format", "clang-tidy", "gcovr", "nodejs", "shellcheck")
+CI_APT_QUALIFIERS = "arch=arm64&distro=ubuntu-24.04"
+# ConformU validates every driver on the rig; no workflow installs it. /conformu installs the
+# maintainer's 4.5.1 beta (no GitHub release yet) and names the build it must match.
+CONFORMU_DOC = ".claude/commands/conformu.md"
+CONFORMU_BUILD_RE = re.compile(r"`(\d+\.\d+\.\d+)\.\d+, Build time:")
+CONFORMU_BETA_URL = "download.ascom-standards.org/beta/"
 DETECTOR = {"name": "alpacabridge-dependency-snapshot", "version": "1",
             "url": "https://github.com/open-astro/AlpacaBridge/blob/main/scripts/dependency_snapshot.py"}
 
@@ -83,6 +107,127 @@ def parse_fetchcontent(text: str) -> list[tuple[str, str]]:
     return out
 
 
+def _step_block(text: str, step: str) -> str | None:
+    """The body of the workflow step named ``step``, up to the next ``- name:``."""
+    m = re.search(rf"^\s*- name: [\"']?{re.escape(step)}[\"']?\s*$(.*?)(?=^\s*- name:|\Z)", text, re.M | re.S)
+    return m.group(1) if m else None
+
+
+def parse_step_pins(text: str, path: str, steps) -> tuple[list[str], list[str]]:
+    """Return (purls, errors) for the ``ver=`` pin inside each named workflow step."""
+    purls, errors = [], []
+    for step, fmt in steps:
+        block = _step_block(text, step)
+        ver = re.search(r"^\s*ver=([0-9][0-9.]*)\s*$", block, re.M) if block is not None else None
+        if ver:
+            purls.append(fmt.format(ver=ver.group(1)))
+        else:
+            errors.append(f"{path}: no 'ver=' pin found in the step '{step}': update CI_TOOL_STEPS "
+                          "or WORKFLOW_TOOL_STEPS in scripts/dependency_snapshot.py to match the workflow")
+    return purls, errors
+
+
+def parse_ci_tools(text: str) -> tuple[list[str], list[str]]:
+    """Return (purls, errors) for the tools ci.yml installs outside debian/control.
+
+    cppcheck and zizmor are pinned by a ``ver=`` line in their install step; the
+    CI_APT_TOOLS come unpinned from the runner's apt (Ubuntu 24.04), so their purls
+    carry no version.
+    """
+    purls, errors = parse_step_pins(text, CI, CI_TOOL_STEPS)
+    installed = parse_apt_installs(text)
+    for tool in CI_APT_TOOLS:
+        if tool in installed:
+            purls.append(f"pkg:deb/ubuntu/{tool}?{CI_APT_QUALIFIERS}")
+        else:
+            errors.append(f"{CI}: no apt-get install of {tool} found: update CI_APT_TOOLS "
+                          "in scripts/dependency_snapshot.py to match the workflow")
+    return purls, errors
+
+
+def parse_apt_installs(text: str) -> set[str]:
+    """Package names on every ``apt-get install`` line and its ``\\`` continuation lines."""
+    names: set[str] = set()
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if "apt-get install" not in line or line.lstrip().startswith("#"):
+            continue
+        words = line.split("apt-get install", 1)[1].split()
+        while line.rstrip().endswith("\\") and i + 1 < len(lines):
+            i += 1
+            line = lines[i]
+            words += line.split()
+        for w in words:
+            # The command ends at a shell separator: "install foo && echo bar" installs only foo,
+            # and so does "install foo; echo bar".
+            end = w in ("&&", "||", "|", ";") or w.endswith(";")
+            w = w.rstrip(";")
+            if w and w not in ("&&", "||", "|", "\\") and not w.startswith("-") \
+                    and not any(c in w for c in "<>$="):
+                names.add(w)
+            if end:
+                break
+    return names
+
+
+def parse_conformu(text: str) -> tuple[list[str], list[str]]:
+    """Return (purls, errors) for the ConformU build /conformu pins.
+
+    The version carries ``-beta`` only while the doc installs from the ASCOM beta download
+    (``CONFORMU_BETA_URL``); a pin on a GitHub release reports the bare version.
+    """
+    m = CONFORMU_BUILD_RE.search(text)
+    if not m:
+        return [], [f"{CONFORMU_DOC}: no pinned ConformU build ('`X.Y.Z.N, Build time:`') found: "
+                    "if ConformU is now a GitHub release, update parse_conformu in scripts/dependency_snapshot.py"]
+    suffix = "-beta" if CONFORMU_BETA_URL in text else ""
+    return [f"pkg:github/ASCOMInitiative/ConformU@{m.group(1)}{suffix}"], []
+
+
+def parse_containers(text: str) -> list[str]:
+    """Return a docker purl per job ``container:`` image (string or mapping form) in a workflow.
+
+    In the mapping form ``image:`` may follow other keys (``credentials:``, ``options:``). An
+    image on another registry keeps that registry in the ``repository_url`` qualifier, as the
+    purl spec requires; ``${{ ... }}`` expressions are skipped.
+    """
+    images = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*)container:\s*([^#]*?)\s*(?:#.*)?$", line)
+        if not m:
+            continue
+        if m.group(2):
+            images.append(m.group(2))
+            continue
+        indent = len(m.group(1))
+        for sub in lines[i + 1:]:
+            if sub.strip() and len(sub) - len(sub.lstrip()) <= indent:
+                break
+            im = re.match(r"^\s*image:\s*([^\s#]+)", sub)
+            if im:
+                images.append(im.group(1))
+                break
+    out = []
+    for image in images:
+        if image.startswith("${{"):
+            continue
+        if "@" in image:
+            name, ver = image.split("@", 1)
+        elif ":" in image.rsplit("/", 1)[-1]:
+            name, ver = image.rsplit(":", 1)
+        else:
+            name, ver = image, "latest"
+        qualifier = ""
+        first, _, rest = name.partition("/")
+        if rest and ("." in first or ":" in first or first == "localhost"):
+            name, qualifier = rest, "?repository_url=" + urllib.parse.quote(first, safe="")
+        purl = f"pkg:docker/{name}@{urllib.parse.quote(ver, safe='')}{qualifier}"
+        if purl not in out:
+            out.append(purl)
+    return out
+
+
 def deb_purl(name: str, version: str | None) -> str:
     name = urllib.parse.quote(name, safe="")  # purl: "+" in g++ is %2B
     return f"pkg:deb/debian/{name}{'@' + version if version else ''}?{DEB_QUALIFIERS}"
@@ -110,9 +255,190 @@ def build_snapshot(root: Path, sha: str, ref: str, job_id: str, scanned: str) ->
         ver = e.get("version")
         sdk.append((f"pkg:generic/{e['name']}{'@' + ver if ver else ''}", "runtime"))
     manifests[TABLE] = manifest(TABLE, sdk)
+    if (root / CI).is_file():
+        tools, _ = parse_ci_tools((root / CI).read_text(encoding="utf-8"))
+        manifests[CI] = manifest(CI, [(p, "development") for p in tools])
+    for path, steps in WORKFLOW_TOOL_STEPS.items():
+        if (root / path).is_file():
+            pins, _ = parse_step_pins((root / path).read_text(encoding="utf-8"), path, steps)
+            manifests[path] = manifest(path, [(p, "development") for p in pins])
+    if (root / CONFORMU_DOC).is_file():
+        cu, _ = parse_conformu((root / CONFORMU_DOC).read_text(encoding="utf-8"))
+        manifests[CONFORMU_DOC] = manifest(CONFORMU_DOC, [(p, "development") for p in cu])
+    # Job container images: release.yml and nightly-build.yml build the published .deb in one.
+    wf_dir = root / ".github/workflows"
+    for wf in sorted(wf_dir.glob("*.yml")) if wf_dir.is_dir() else []:
+        images = parse_containers(wf.read_text(encoding="utf-8"))
+        if images:
+            rel = wf.relative_to(root).as_posix()
+            m = manifest(rel, [(p, "development") for p in images])
+            if rel in manifests:  # ci.yml also carries the CI tools
+                m["resolved"] = {**manifests[rel]["resolved"], **m["resolved"]}
+            manifests[rel] = m
     return {"version": 0, "job": {"correlator": "dependency-submission", "id": job_id},
             "sha": sha, "ref": ref, "detector": DETECTOR, "scanned": scanned,
             "manifests": manifests}
+
+
+def parse_deb_fields(text: str) -> dict[str, str]:
+    """Fields of `dpkg-deb -f`, with continuation lines (leading space) folded into their field."""
+    out: dict[str, str] = {}
+    cur = None
+    for line in text.splitlines():
+        if line[:1] in " \t" and cur:
+            out[cur] += " " + line.strip()
+        elif ":" in line:
+            cur, _, val = line.partition(":")
+            out[cur] = val.strip()
+    return out
+
+
+def parse_installed(text: str) -> dict[str, str]:
+    """{package: version} from `dpkg-query -W -f='${db:Status-Abbrev}\\t${Package}\\t${Version}\\n'`, installed rows only."""
+    out = {}
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[0].strip() == "ii":
+            out[parts[1]] = parts[2]
+    return out
+
+
+def file_digests(data: bytes) -> dict[str, str]:
+    return {"sha1": hashlib.sha1(data).hexdigest(), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def tracked_files(root: Path, rel: str) -> list[tuple[str, bool]]:
+    """(path, is_symlink) for every git-tracked file under rel, sorted. The pins and the
+    --spdx match both use this set, so an untracked file can satisfy neither."""
+    # safe.directory for this one read: the release jobs run as root in a container over a
+    # checkout owned by the runner user, and git refuses such a repository by default.
+    proc = subprocess.run(["git", "-c", f"safe.directory={root.resolve()}", "-C", str(root),
+                           "ls-files", "-s", "-z", "--", rel], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"git ls-files {rel} failed: {proc.stderr.strip()}")
+    out = proc.stdout
+    entries = []
+    for entry in sorted(e for e in out.split("\0") if e):
+        meta, path = entry.split("\t", 1)
+        entries.append((path, meta.split()[0] == "120000"))
+    return entries
+
+
+def tree_digest(root: Path, rel: str) -> str:
+    """SHA-256 over the git-tracked files under rel: path, then file bytes (or symlink target).
+    A tracked file missing from the working tree hashes as missing, so it reads as drift."""
+    h = hashlib.sha256()
+    for path, is_link in tracked_files(root, rel):
+        p = root / path
+        if is_link and p.is_symlink():
+            data = b"L" + os.readlink(p).encode()
+        elif not is_link and p.is_file():
+            data = b"F" + hashlib.sha256(p.read_bytes()).digest()
+        else:
+            data = b"M"
+        h.update(path.encode() + b"\0" + data + b"\n")
+    return h.hexdigest()
+
+
+def pin_sdk_hashes(root: Path) -> None:
+    """Rewrite every 'sdks' entry's sha256 pin, keeping the table's one-entry-per-line layout."""
+    table = json.loads((root / TABLE).read_text(encoding="utf-8"))
+    for e in table["sdks"]:
+        e["sha256"] = tree_digest(root, e["path"])
+    # Every top-level key survives, one list item or mapping entry per line, so --pin never
+    # drops a section (documents, no_upstream, vendors) it does not know about.
+    blocks = []
+    for key, value in table.items():
+        if isinstance(value, list):
+            inner = ",\n".join(f"    {json.dumps(v)}" for v in value)
+            blocks.append(f"  {json.dumps(key)}: [\n{inner}\n  ]" if value else f"  {json.dumps(key)}: []")
+        elif isinstance(value, dict):
+            inner = ",\n".join(f"    {json.dumps(k)}: {json.dumps(v)}" for k, v in value.items())
+            blocks.append(f"  {json.dumps(key)}: {{\n{inner}\n  }}" if value else f"  {json.dumps(key)}: {{}}")
+        else:
+            blocks.append(f"  {json.dumps(key)}: {json.dumps(value)}")
+    lines = ["{", ",\n".join(blocks), "}"]
+    (root / TABLE).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def build_spdx(root: Path, deb: dict[str, str], file_name: str, sha256: str,
+               created: str, namespace: str, payload: dict[str, dict[str, str]] | None = None,
+               installed: dict[str, str] | None = None) -> dict:
+    """SPDX 2.3 SBOM for one built .deb: the same inventory as the snapshot, rooted at the package.
+
+    deb: the package's control fields (dpkg-deb -f). Runtime dependencies come from its
+    Depends, where ${shlibs:Depends} is already resolved; vendored SDKs and FetchContent
+    libraries are CONTAINS; Build-Depends are BUILD_DEPENDENCY_OF, at the version in
+    installed (dpkg-query in the build environment) when one is given.
+
+    payload: {path inside the .deb: file_digests()} for the shipped vendor files. Each must be
+    byte-identical to a file under a listed SDK's path, and is reported as a file CONTAINS-ed by
+    that SDK; one that matches none raises ValueError.
+    """
+    payload = payload or {}
+    installed = installed or {}
+    packages: list[dict] = []
+    ids: dict[str, str] = {}
+
+    def add(purl: str, name: str, version: str | None) -> str:
+        if purl in ids:
+            return ids[purl]
+        spdx_id = f"SPDXRef-Package-{len(packages)}"
+        pkg = {"name": name, "SPDXID": spdx_id, "downloadLocation": "NOASSERTION", "filesAnalyzed": False,
+               "externalRefs": [{"referenceCategory": "PACKAGE-MANAGER", "referenceType": "purl",
+                                 "referenceLocator": purl}]}
+        if version:
+            pkg["versionInfo"] = version
+        packages.append(pkg)
+        ids[purl] = spdx_id
+        return spdx_id
+
+    root_id = add(deb_purl(deb["Package"], deb["Version"]), deb["Package"], deb["Version"])
+    packages[0]["packageFileName"] = file_name
+    packages[0]["checksums"] = [{"algorithm": "SHA256", "checksumValue": sha256}]
+    rels = [("SPDXRef-DOCUMENT", "DESCRIBES", root_id)]
+    for n, v in parse_relations(deb.get("Depends", "")):
+        rels.append((root_id, "DEPENDS_ON", add(deb_purl(n, v), n, v)))
+    for repo, tag in parse_fetchcontent((root / "AlpacaHTTP/CMakeLists.txt").read_text(encoding="utf-8")):
+        rels.append((root_id, "CONTAINS", add(f"pkg:github/{repo}@{tag}", repo, tag)))
+    vendored: dict[str, str] = {}
+    for e in json.loads((root / TABLE).read_text(encoding="utf-8"))["sdks"]:
+        ver = e.get("version")
+        sdk_id = add(f"pkg:generic/{e['name']}{'@' + ver if ver else ''}", e["name"], ver)
+        rels.append((root_id, "CONTAINS", sdk_id))
+        for path, is_link in tracked_files(root, e["path"]):
+            p = root / path
+            if not is_link and p.is_file():
+                vendored.setdefault(hashlib.sha256(p.read_bytes()).hexdigest(), sdk_id)
+    files = []
+    unmatched = []
+    for path in sorted(payload):
+        d = payload[path]
+        sdk_id = vendored.get(d["sha256"])
+        if sdk_id is None:
+            unmatched.append(path)
+            continue
+        file_id = f"SPDXRef-File-{len(files)}"
+        files.append({"fileName": f"./{path}", "SPDXID": file_id,
+                      "checksums": [{"algorithm": "SHA1", "checksumValue": d["sha1"]},
+                                    {"algorithm": "SHA256", "checksumValue": d["sha256"]}]})
+        rels.append((sdk_id, "CONTAINS", file_id))
+    if unmatched:
+        raise ValueError("shipped vendor files match no file under a 'sdks' path in "
+                         f"{TABLE} (changed in packaging, or not vendored): " + ", ".join(unmatched))
+    control = parse_control((root / "debian/control").read_text(encoding="utf-8"))
+    for n, v in control["development"]:
+        v = installed.get(n, v)
+        rels.append((add(deb_purl(n, v), n, v), "BUILD_DEPENDENCY_OF", root_id))
+    rels = list(dict.fromkeys(rels))
+    return {"spdxVersion": "SPDX-2.3", "dataLicense": "CC0-1.0", "SPDXID": "SPDXRef-DOCUMENT",
+            "name": file_name, "documentNamespace": namespace,
+            "creationInfo": {"created": created,
+                             "creators": [f"Tool: {DETECTOR['name']}-{DETECTOR['version']}"]},
+            "packages": packages,
+            "files": files,
+            "relationships": [{"spdxElementId": a, "relationshipType": t, "relatedSpdxElement": b}
+                              for a, t, b in rels]}
 
 
 def check_drift(root: Path) -> list[str]:
@@ -124,6 +450,14 @@ def check_drift(root: Path) -> list[str]:
     for p in listed:
         if not (root / p).is_dir():
             errors.append(f"{TABLE}: stale entry {p} (directory gone): remove it from 'sdks' or 'doc_only'")
+    for e in table["sdks"]:
+        if not (root / e["path"]).is_dir():
+            continue
+        if not e.get("sha256"):
+            errors.append(f"{TABLE}: {e['path']} has no sha256 pin: run python3 scripts/dependency_snapshot.py --pin")
+        elif e["sha256"] != tree_digest(root, e["path"]):
+            errors.append(f"{TABLE}: the vendored files under {e['path']} changed since their sha256 pin: "
+                          "check 'version' and 'source', then run python3 scripts/dependency_snapshot.py --pin")
 
     def walk(rel: str) -> None:
         for child in sorted((root / rel).iterdir()):
@@ -140,6 +474,73 @@ def check_drift(root: Path) -> list[str]:
 
     if (root / EXTERNAL).is_dir():
         walk(EXTERNAL)
+    if (root / CI).is_file():
+        errors += parse_ci_tools((root / CI).read_text(encoding="utf-8"))[1]
+    for path, steps in WORKFLOW_TOOL_STEPS.items():
+        if (root / path).is_file():
+            errors += parse_step_pins((root / path).read_text(encoding="utf-8"), path, steps)[1]
+    errors += check_coverage(root, table)
+    for d in table.get("documents", []):
+        if d.get("path") and not (root / d["path"]).exists():
+            errors.append(f"{TABLE}: document {d['name']!r} points at {d['path']}, which does not exist: "
+                          "fix its 'path' or remove the entry")
+    if (root / CONFORMU_DOC).is_file():
+        errors += parse_conformu((root / CONFORMU_DOC).read_text(encoding="utf-8"))[1]
+    return errors
+
+
+def check_coverage(root: Path, table: dict) -> list[str]:
+    """The update-coverage rules (docs/development.md "Dependency update checks"): a new SDK,
+    protocol folder, vendor driver or pinned workflow tool cannot arrive without an update check."""
+    errors = []
+    documents = table.get("documents", [])
+    names = {e["name"] for e in table["sdks"]} | {d["name"] for d in documents}
+    # Rule 1: every SDK has an update source.
+    for e in table["sdks"]:
+        if not (e.get("updates") or {}).get("provider"):
+            errors.append(f"{TABLE}: SDK {e['name']!r} has no 'updates' block: add where "
+                          "scripts/dependency_updates.py finds its newest version (provider release-page or json)")
+    # Rule 2: every docs-only folder holds a watched document, or says why there is none.
+    exempt = {n["path"] for n in table.get("no_upstream", [])}
+    for p in sorted(exempt - set(table["doc_only"])):
+        errors.append(f"{TABLE}: no_upstream lists {p}, which is not a 'doc_only' directory: remove the stale entry")
+    doc_paths = [d["path"] for d in documents if d.get("path")]
+    for p in table["doc_only"]:
+        if p not in exempt and not any(dp.startswith(p + "/") for dp in doc_paths):
+            errors.append(f"{TABLE}: {p} has no watched document: add a 'documents' entry whose path is "
+                          "under it, or a 'no_upstream' entry with the reason it has no upstream")
+    # Rule 3: every vendor driver directory maps to what it is built from.
+    vendors = table.get("vendors", {})
+    vdir = root / VENDORS
+    present = sorted(c.name for c in vdir.iterdir() if c.is_dir()) if vdir.is_dir() else []
+    for v in present:
+        m = vendors.get(v) or {}
+        if m.get("no_upstream"):
+            continue
+        tracked = m.get("tracked") or []
+        if not tracked:
+            errors.append(f"{TABLE}: vendor {VENDORS}/{v} is not in 'vendors': list the SDKs or documents it "
+                          "is built from under 'tracked', or give a 'no_upstream' reason")
+        for n in tracked:
+            if n not in names:
+                errors.append(f"{TABLE}: vendors[{v!r}] tracks {n!r}, which is no SDK or document name")
+    for v in vendors:
+        if vdir.is_dir() and v not in present:
+            errors.append(f"{TABLE}: vendors[{v!r}] has no {VENDORS}/{v} directory: remove the entry")
+    # Rule 4: every ver= pin in a workflow belongs to a step the snapshot reads.
+    wf_dir = root / ".github/workflows"
+    for wf in sorted(wf_dir.glob("*.yml")) if wf_dir.is_dir() else []:
+        rel = wf.relative_to(root).as_posix()
+        tracked_steps = {step for step, _ in (CI_TOOL_STEPS if rel == CI else WORKFLOW_TOOL_STEPS.get(rel, ()))}
+        step = None
+        for line in wf.read_text(encoding="utf-8").splitlines():
+            m = re.match(r"^\s*- name:\s*(.+?)\s*$", line)
+            if m:
+                step = m.group(1).strip("\"'")  # YAML quotes are not part of the name
+            elif re.match(r"^\s*ver=", line) and step not in tracked_steps:
+                errors.append(f"{rel}: the step {step!r} pins a tool with ver= that the dependency snapshot does "
+                              "not read: add it to CI_TOOL_STEPS (ci.yml) or WORKFLOW_TOOL_STEPS in "
+                              "scripts/dependency_snapshot.py")
     return errors
 
 
@@ -160,6 +561,58 @@ def self_test() -> int:
     cm = "FetchContent_Declare(\n nlohmann_json\n GIT_REPOSITORY https://github.com/nlohmann/json.git\n GIT_TAG v3.11.3\n)\n"
     assert deb_purl("g++", None).startswith("pkg:deb/debian/g%2B%2B?")
     assert parse_fetchcontent(cm) == [("nlohmann/json", "v3.11.3")]
+    ci = ("jobs:\n  a:\n    steps:\n      - name: Install deps\n        run: |\n"
+          "          sudo apt-get install -y \\\n            catch2 \\\n            gcovr  \\\n            cmake\n"
+          "          sudo apt-get install -y --no-install-recommends clang-format\n"
+          "          sudo apt-get install -y clang-tidy shellcheck nodejs\n"
+          "          echo nodejs-is-not-a-package-here\n"
+          "      - name: Build cppcheck 2.17.x from source\n        run: |\n"
+          "          ver=2.17.1\n          sha256=00\n"
+          "      - name: Install zizmor\n        run: |\n          ver=1.25.2\n"
+          "      - name: Later\n        run: ver=9.9.9\n")
+    tools, errs = parse_ci_tools(ci)
+    apt = [f"pkg:deb/ubuntu/{t}?{CI_APT_QUALIFIERS}" for t in CI_APT_TOOLS]
+    assert errs == [] and tools == ["pkg:github/danmar/cppcheck@2.17.1",
+                                    "pkg:github/zizmorcore/zizmor@v1.25.2", *apt], (tools, errs)
+    assert "cmake" in parse_apt_installs(ci) and "-y" not in parse_apt_installs(ci)
+    assert "echo" not in parse_apt_installs(ci), "a continuation ends at a line without a backslash"
+    # A commented-out install is not an install.
+    assert parse_apt_installs("    # sudo apt-get install -y nodejs\n") == set()
+    # The install command ends at a shell separator: a name after && or ; is not installed.
+    for sep in (" && echo nodejs", "; echo nodejs", " | tee nodejs"):
+        line = f"sudo apt-get install -y gcovr{sep}\n"
+        assert parse_apt_installs(line) == {"gcovr"}, (sep, parse_apt_installs(line))
+    # A reworded step or a dropped apt line is reported, never silently omitted.
+    tools, errs = parse_ci_tools(ci.replace("Install zizmor", "Fetch zizmor").replace("catch2 ", ""))
+    assert tools == ["pkg:github/danmar/cppcheck@2.17.1", *apt[1:]], tools
+    assert len(errs) == 2 and "'Install zizmor'" in errs[0] and "catch2" in errs[1], errs
+    # A tool named outside an apt-get install (here: an echo) is not an install.
+    _, errs = parse_ci_tools(ci.replace(" shellcheck nodejs", " shellcheck"))
+    assert len(errs) == 1 and "nodejs" in errs[0], errs
+    # A step with no ver= pin does not borrow the next step's.
+    _, errs = parse_ci_tools(ci.replace("          ver=2.17.1\n", ""))
+    assert len(errs) == 1 and "cppcheck" in errs[0], errs
+    cu_doc = ("curl -o cu.tar.xz 'https://download.ascom-standards.org/beta/conformu.linux-arm64.tar.xz'\n"
+              "line it prints against the build, `4.5.1.54507, Build time:\nThu 27 August 2026` -- ok\n")
+    assert parse_conformu(cu_doc) == (["pkg:github/ASCOMInitiative/ConformU@4.5.1-beta"], [])
+    # Pinned to a GitHub release (no beta download URL): the bare version, no -beta.
+    released = cu_doc.replace("download.ascom-standards.org/beta/", "github.com/ASCOMInitiative/ConformU/")
+    assert parse_conformu(released) == (["pkg:github/ASCOMInitiative/ConformU@4.5.1"], [])
+    cu, errs = parse_conformu("go back to the ordinary release asset\n")
+    assert cu == [] and len(errs) == 1 and CONFORMU_DOC in errs[0], errs
+    wf = ("jobs:\n  a:\n    container: debian:trixie\n  b:\n    container: debian:trixie  # dup\n"
+          "  c:\n    container:\n      credentials:\n        username: u\n      options: --cpus 1\n"
+          "      image: ghcr.io/o/img@sha256:ab\n    steps: []\n"
+          "  d:\n    container: ${{ matrix.c }}\n"
+          "  e:\n    container: alpine\n"
+          "  f:\n    container:\n      options: --privileged\n    steps:\n      - image: not-mine\n")
+    # image: after credentials:/options: is found; a registry goes to repository_url; an image:
+    # outside the container mapping (job f) is not the container's.
+    assert parse_containers(wf) == ["pkg:docker/debian@trixie",
+                                    "pkg:docker/o/img@sha256%3Aab?repository_url=ghcr.io",
+                                    "pkg:docker/alpine@latest"], parse_containers(wf)
+    assert parse_containers("    container: localhost:5000/team/img:1\n") == [
+        "pkg:docker/team/img@1?repository_url=localhost%3A5000"], parse_containers("container: localhost:5000/team/img:1")
     with tempfile.TemporaryDirectory() as d:
         r = Path(d)
         (r / "debian").mkdir()
@@ -169,11 +622,64 @@ def self_test() -> int:
         (r / "scripts").mkdir()
         for p in ("A/sdk-1", "B", "Q/deep"):
             (r / EXTERNAL / p).mkdir(parents=True)
+        subprocess.run(["git", "-C", d, "init", "-q"], check=True)  # vendored files are git-tracked files
+        up = {"provider": "release-page", "url": "https://example.test/", "pattern": r"sdk-(\d+)"}
         (r / TABLE).write_text(json.dumps({"sdks": [
-            {"path": f"{EXTERNAL}/A/sdk-1", "name": "a-sdk", "version": "1"},
-            {"path": f"{EXTERNAL}/Q/deep", "name": "q-sdk", "version": None}],
-            "doc_only": [f"{EXTERNAL}/B"]}))
-        assert check_drift(r) == [], check_drift(r)
+            {"path": f"{EXTERNAL}/A/sdk-1", "name": "a-sdk", "version": "1", "updates": up},
+            {"path": f"{EXTERNAL}/Q/deep", "name": "q-sdk", "version": None, "updates": up}],
+            "doc_only": [f"{EXTERNAL}/B"],
+            "no_upstream": [{"path": f"{EXTERNAL}/B", "reason": "test fixture"}]}))
+        assert [e for e in check_drift(r) if "no sha256 pin" not in e] == [], check_drift(r)
+        # --- coverage rules: a new SDK, protocol folder, vendor or pinned tool fails --check ---
+        base = json.loads((r / TABLE).read_text())
+
+        def drift_with(**changes):
+            (r / TABLE).write_text(json.dumps({**base, **changes}))
+            try:
+                return [e for e in check_drift(r) if "no sha256 pin" not in e]
+            finally:
+                (r / TABLE).write_text(json.dumps(base))
+
+        # Rule 1: every SDK has an update source.
+        errs = drift_with(sdks=[{**base["sdks"][0], "updates": None}, base["sdks"][1]])
+        assert len(errs) == 1 and "a-sdk" in errs[0] and "updates" in errs[0], errs
+        # Rule 2: every docs-only folder has a watched document under it, or a no_upstream reason.
+        errs = drift_with(no_upstream=[])
+        assert len(errs) == 1 and f"{EXTERNAL}/B" in errs[0] and "documents" in errs[0], errs
+        (r / EXTERNAL / "B/spec.md").write_text("spec")
+        assert drift_with(no_upstream=[], documents=[{"name": "b-spec", "path": f"{EXTERNAL}/B/spec.md",
+                                                      "check": {"provider": "hash", "url": "u"}, "baseline": "0"}]) == []
+        (r / EXTERNAL / "B/spec.md").unlink()
+        # A no_upstream exemption for a directory that is no longer docs-only is stale.
+        errs = drift_with(no_upstream=base["no_upstream"] + [{"path": f"{EXTERNAL}/Gone", "reason": "old"}])
+        assert len(errs) == 1 and f"{EXTERNAL}/Gone" in errs[0] and "no_upstream" in errs[0], errs
+        # Rule 3: every vendor driver directory maps to SDKs or documents, or has a no_upstream reason.
+        (r / VENDORS / "acme").mkdir(parents=True)
+        errs = drift_with()
+        assert len(errs) == 1 and "acme" in errs[0] and "vendors" in errs[0], errs
+        assert drift_with(vendors={"acme": {"tracked": ["a-sdk"]}}) == []
+        assert drift_with(vendors={"acme": {"no_upstream": "reads a user-configured feed"}}) == []
+        errs = drift_with(vendors={"acme": {"tracked": ["gone-sdk"]}})
+        assert len(errs) == 1 and "gone-sdk" in errs[0], errs
+        errs = drift_with(vendors={"acme": {"tracked": ["a-sdk"]}, "old": {"tracked": ["a-sdk"]}})
+        assert len(errs) == 1 and "'old'" in errs[0], "a vendor key with no directory is stale"
+        (r / VENDORS / "acme").rmdir()
+        # Rule 4: every ver= pin in a workflow belongs to a step the snapshot reads.
+        (r / ".github/workflows").mkdir(parents=True)
+        (r / ".github/workflows/x.yml").write_text(
+            "jobs:\n  a:\n    steps:\n      - name: Install newtool\n        run: |\n          ver=1.2.3\n")
+        errs = drift_with()
+        assert len(errs) == 1 and "x.yml" in errs[0] and "Install newtool" in errs[0], errs
+        # A quoted step name is the same step: a tracked pin written `- name: "..."` still matches.
+        osv_step = WORKFLOW_TOOL_STEPS[".github/workflows/osv-scan.yml"][0][0]
+        (r / ".github/workflows/x.yml").unlink()
+        (r / ".github/workflows/osv-scan.yml").write_text(
+            f'jobs:\n  a:\n    steps:\n      - name: "{osv_step}"\n        run: |\n          ver=2.7.0\n')
+        assert drift_with() == [], drift_with()
+        (r / ".github/workflows/osv-scan.yml").rename(r / ".github/workflows/x.yml")
+        (r / ".github/workflows/x.yml").unlink()
+        (r / ".github/workflows").rmdir()
+        (r / ".github").rmdir()
         snap = build_snapshot(r, "a" * 40, "refs/heads/main", "1", "2026-01-01T00:00:00Z")
         for k in ("version", "job", "sha", "ref", "detector", "scanned", "manifests"):
             assert k in snap, k
@@ -186,8 +692,160 @@ def self_test() -> int:
         assert "pkg:generic/q-sdk" in snap["manifests"][TABLE]["resolved"]
         assert "pkg:generic/a-sdk@1" in snap["manifests"][TABLE]["resolved"]
         assert "pkg:github/nlohmann/json@v3.11.3" in snap["manifests"]["AlpacaHTTP/CMakeLists.txt"]["resolved"]
+        assert CI not in snap["manifests"], "no ci.yml, no CI-tools manifest"
+        (r / ".github/workflows").mkdir(parents=True)
+        (r / CI).write_text(ci)
+        snap = build_snapshot(r, "a" * 40, "refs/heads/main", "1", "2026-01-01T00:00:00Z")
+        assert set(snap["manifests"][CI]["resolved"]) == set(parse_ci_tools(ci)[0])
+        assert all(x["scope"] == "development" for x in snap["manifests"][CI]["resolved"].values())
+        (r / ".github/workflows/rel.yml").write_text(wf)
+        snap = build_snapshot(r, "a" * 40, "refs/heads/main", "1", "2026-01-01T00:00:00Z")
+        assert "pkg:docker/debian@trixie" in snap["manifests"][".github/workflows/rel.yml"]["resolved"]
+        assert ".github/workflows/ci.yml" in snap["manifests"], "a workflow with no container still has its own"
+        # ci.yml with a container keeps its tool entries and gains the image (merge, not overwrite).
+        (r / CI).write_text(ci + "  z:\n    container: debian:trixie\n")
+        merged = build_snapshot(r, "a" * 40, "refs/heads/main", "1", "2026-01-01T00:00:00Z")["manifests"][CI]["resolved"]
+        assert "pkg:docker/debian@trixie" in merged and "pkg:github/danmar/cppcheck@2.17.1" in merged, merged
+        (r / CI).write_text(ci)
+        (r / ".github/workflows/rel.yml").unlink()
+        osv = "jobs:\n  s:\n    steps:\n      - name: Install OSV-Scanner\n        run: |\n          ver=2.7.0\n"
+        osv_path = next(iter(WORKFLOW_TOOL_STEPS))
+        (r / osv_path).write_text(osv)
+        snap = build_snapshot(r, "a" * 40, "refs/heads/main", "1", "2026-01-01T00:00:00Z")
+        assert list(snap["manifests"][osv_path]["resolved"]) == ["pkg:github/google/osv-scanner@v2.7.0"]
+        (r / osv_path).write_text(osv.replace("ver=2.7.0", "ver=latest"))
+        assert any(osv_path in e and "Install OSV-Scanner" in e for e in check_drift(r)), check_drift(r)
+        (r / osv_path).unlink()
+        (r / CI).write_text(ci.replace("ver=1.25.2", "ver=latest"))
+        assert any("'Install zizmor'" in e for e in check_drift(r)), check_drift(r)
+        (r / CI).unlink()
+        (r / ".claude/commands").mkdir(parents=True)
+        (r / CONFORMU_DOC).write_text(cu_doc)
+        snap = build_snapshot(r, "a" * 40, "refs/heads/main", "1", "2026-01-01T00:00:00Z")
+        assert snap["manifests"][CONFORMU_DOC]["resolved"]["pkg:github/ASCOMInitiative/ConformU@4.5.1-beta"][
+            "scope"] == "development"
+        (r / CONFORMU_DOC).write_text("no pin\n")
+        assert any(CONFORMU_DOC in e for e in check_drift(r)), check_drift(r)
+        (r / CONFORMU_DOC).unlink()
         assert snap["manifests"]["debian/control"]["resolved"][deb_purl("cmake", None)]["scope"] == "development"
         assert snap["manifests"]["debian/control"]["resolved"][deb_purl("adduser", None)]["scope"] == "runtime"
+        deb = {"Package": "alpacabridge", "Version": "5.0.0~beta2", "Architecture": "arm64",
+               "Depends": "libc6 (>= 2.38), libgpiod3 (>= 2.1), libusb-1.0-0 (>= 2:1.0.16), adduser"}
+        doc = build_spdx(r, deb, "x.deb", "f" * 64, "2026-01-01T00:00:00Z", "https://example.test/sbom")
+        assert doc["spdxVersion"] == "SPDX-2.3" and doc["SPDXID"] == "SPDXRef-DOCUMENT"
+        assert doc["dataLicense"] == "CC0-1.0" and doc["documentNamespace"] == "https://example.test/sbom"
+        pkgs = {p["SPDXID"]: p for p in doc["packages"]}
+        assert len(pkgs) == len(doc["packages"]), "SPDXIDs must be unique"
+        purl = {p["externalRefs"][0]["referenceLocator"]: p["SPDXID"] for p in doc["packages"]}
+        root_id = purl["pkg:deb/debian/alpacabridge@5.0.0~beta2?arch=arm64&distro=trixie"]
+        assert pkgs[root_id]["checksums"] == [{"algorithm": "SHA256", "checksumValue": "f" * 64}]
+        assert pkgs[root_id]["packageFileName"] == "x.deb"
+        rels = {(x["spdxElementId"], x["relationshipType"], x["relatedSpdxElement"]) for x in doc["relationships"]}
+        assert ("SPDXRef-DOCUMENT", "DESCRIBES", root_id) in rels
+        # Runtime: the BUILT package's Depends (shlibs resolved), not debian/control's.
+        for name in ("libc6", "libgpiod3", "libusb-1.0-0", "adduser"):
+            assert (root_id, "DEPENDS_ON", purl[deb_purl(name, None)]) in rels, name
+        assert deb_purl("libusb-1.0-0", None) in purl and deb_purl("libc6", None) in purl
+        # Vendored SDKs and FetchContent libraries ship inside the package.
+        for p in ("pkg:generic/a-sdk@1", "pkg:generic/q-sdk", "pkg:github/nlohmann/json@v3.11.3"):
+            assert (root_id, "CONTAINS", purl[p]) in rels, p
+        # Build-Depends are build-only.
+        assert (purl[deb_purl("cmake", None)], "BUILD_DEPENDENCY_OF", root_id) in rels
+        assert (purl[deb_purl("libfoo", "1.2-3")], "BUILD_DEPENDENCY_OF", root_id) in rels
+        assert len(rels) == len(doc["relationships"]), "no duplicate relationships"
+        for p in doc["packages"]:
+            assert {"name", "SPDXID", "downloadLocation", "filesAnalyzed"} <= set(p), p
+        # --- Vendored file pins and the shipped-file gate ---
+        lib, fw = b"A-lib-bytes", b"Q-firmware"
+        (r / EXTERNAL / "A/sdk-1/lib").mkdir()
+        (r / EXTERNAL / "A/sdk-1/lib/liba.so.1.0").write_bytes(lib)
+        (r / EXTERNAL / "A/sdk-1/lib/liba.so").symlink_to("liba.so.1.0")
+        (r / EXTERNAL / "Q/deep/qhy.hex").write_bytes(fw)
+        subprocess.run(["git", "-C", d, "init", "-q"], check=True)
+        subprocess.run(["git", "-C", d, "add", "-A"], check=True)
+        errs = check_drift(r)
+        assert len(errs) == 2 and all("no sha256 pin" in e for e in errs), errs
+        t = json.loads((r / TABLE).read_text())
+        t["documents"] = [{"name": "b-doc", "path": f"{EXTERNAL}/B/doc.md",
+                           "check": {"provider": "hash", "url": "https://example.test/b.pdf"}, "baseline": "00"}]
+        (r / TABLE).write_text(json.dumps(t))
+        (r / EXTERNAL / "B/doc.md").write_text("doc")
+        pin_sdk_hashes(r)
+        assert check_drift(r) == [], check_drift(r)
+        kept = json.loads((r / TABLE).read_text())
+        assert kept["documents"] == t["documents"] and kept["no_upstream"] == t["no_upstream"], \
+            "--pin keeps every top-level section"
+        (r / EXTERNAL / "B/doc.md").unlink()
+        errs = check_drift(r)
+        assert len(errs) == 1 and "b-doc" in errs[0] and f"{EXTERNAL}/B/doc.md" in errs[0], errs
+        t = json.loads((r / TABLE).read_text())
+        del t["documents"]
+        (r / TABLE).write_text(json.dumps(t))
+        pinned = t["sdks"][0]["sha256"]
+        assert re.fullmatch(r"[0-9a-f]{64}", pinned) and pinned == tree_digest(r, f"{EXTERNAL}/A/sdk-1")
+        (r / EXTERNAL / "A/sdk-1/lib/liba.so.1.0").write_bytes(b"swapped")
+        errs = check_drift(r)
+        assert len(errs) == 1 and f"{EXTERNAL}/A/sdk-1" in errs[0] and "--pin" in errs[0], errs
+        (r / EXTERNAL / "A/sdk-1/lib/liba.so.1.0").write_bytes(lib)
+        assert check_drift(r) == [], "restoring the bytes restores the pin"
+        (r / EXTERNAL / "A/sdk-1/lib/liba.so").unlink()
+        (r / EXTERNAL / "A/sdk-1/lib/liba.so").symlink_to("other")
+        assert len(check_drift(r)) == 1, "a retargeted symlink changes the digest"
+        (r / EXTERNAL / "A/sdk-1/lib/liba.so").unlink()
+        (r / EXTERNAL / "A/sdk-1/lib/liba.so").symlink_to("liba.so.1.0")
+        payload = {"usr/lib/alpacabridge/liba.so.1.0": file_digests(lib),
+                   "usr/lib/firmware/qhy/qhy.hex": file_digests(fw)}
+        installed = {"cmake": "3.31.6-2", "libfoo": "1.2-3", "libc6": "2.41-12"}
+        doc = build_spdx(r, deb, "x.deb", "f" * 64, "2026-01-01T00:00:00Z", "https://example.test/sbom",
+                         payload=payload, installed=installed)
+        purl = {p["externalRefs"][0]["referenceLocator"]: p["SPDXID"] for p in doc["packages"]}
+        pkgs = {p["SPDXID"]: p for p in doc["packages"]}
+        files = {f["fileName"]: f for f in doc["files"]}
+        assert set(files) == {"./usr/lib/alpacabridge/liba.so.1.0", "./usr/lib/firmware/qhy/qhy.hex"}, files
+        f_lib = files["./usr/lib/alpacabridge/liba.so.1.0"]
+        assert {"algorithm": "SHA256", "checksumValue": hashlib.sha256(lib).hexdigest()} in f_lib["checksums"]
+        assert {"algorithm": "SHA1", "checksumValue": hashlib.sha1(lib).hexdigest()} in f_lib["checksums"]
+        rels = {(x["spdxElementId"], x["relationshipType"], x["relatedSpdxElement"]) for x in doc["relationships"]}
+        assert (purl["pkg:generic/a-sdk@1"], "CONTAINS", f_lib["SPDXID"]) in rels
+        assert (purl["pkg:generic/q-sdk"], "CONTAINS", files["./usr/lib/firmware/qhy/qhy.hex"]["SPDXID"]) in rels
+        # Build-Depends carry the version installed in the build environment.
+        cmake = pkgs[purl[deb_purl("cmake", "3.31.6-2")]]
+        assert cmake["versionInfo"] == "3.31.6-2"
+        assert (purl[deb_purl("cmake", "3.31.6-2")], "BUILD_DEPENDENCY_OF", purl[
+            "pkg:deb/debian/alpacabridge@5.0.0~beta2?arch=arm64&distro=trixie"]) in rels
+        assert deb_purl("g++", None) in purl, "a build dep not installed keeps no version"
+        # dpkg-deb -f output: a folded field keeps its continuation lines.
+        fields = parse_deb_fields("Package: alpacabridge\nVersion: 5.0.0\n"
+                                  "Depends: libc6 (>= 2.38),\n libgpiod3 (>= 2.1),\n adduser\nArchitecture: arm64\n")
+        assert fields["Depends"] == "libc6 (>= 2.38), libgpiod3 (>= 2.1), adduser", fields
+        assert fields["Package"] == "alpacabridge" and fields["Architecture"] == "arm64", fields
+        # dpkg-query: only installed ("ii") rows give a version.
+        inst = parse_installed("ii \tcmake\t3.31.6-2\nrc \tlibold\t1.0\nii \tg++\t4:14.2.0-1\n")
+        assert inst == {"cmake": "3.31.6-2", "g++": "4:14.2.0-1"}, inst
+        # An untracked file under an SDK path is not vendored: it must not satisfy the gate.
+        (r / EXTERNAL / "A/sdk-1/lib/untracked.so").write_bytes(b"untracked-bytes")
+        try:
+            build_spdx(r, deb, "x.deb", "f" * 64, "t", "n",
+                       payload={"usr/lib/alpacabridge/untracked.so": file_digests(b"untracked-bytes")}, installed={})
+        except ValueError as e:
+            assert "usr/lib/alpacabridge/untracked.so" in str(e), e
+        else:
+            raise AssertionError("an untracked file must not match")
+        (r / EXTERNAL / "A/sdk-1/lib/untracked.so").unlink()
+        # A tracked file deleted from the working tree is drift, not a traceback.
+        (r / EXTERNAL / "Q/deep/qhy.hex").unlink()
+        errs = check_drift(r)
+        assert len(errs) == 1 and f"{EXTERNAL}/Q/deep" in errs[0] and "--pin" in errs[0], errs
+        (r / EXTERNAL / "Q/deep/qhy.hex").write_bytes(fw)
+        assert check_drift(r) == [], check_drift(r)
+        # A shipped vendor file that matches no vendored file fails the SBOM.
+        try:
+            build_spdx(r, deb, "x.deb", "f" * 64, "t", "n",
+                       payload={"usr/lib/alpacabridge/libevil.so": file_digests(b"evil")}, installed={})
+        except ValueError as e:
+            assert "usr/lib/alpacabridge/libevil.so" in str(e), e
+        else:
+            raise AssertionError("an unmatched shipped file must fail")
         (r / EXTERNAL / "New").mkdir()
         errs = check_drift(r)
         assert len(errs) == 1 and f"{EXTERNAL}/New is not in {TABLE}" in errs[0], errs
@@ -210,9 +868,49 @@ def main() -> int:
     ap.add_argument("--sha")
     ap.add_argument("--ref")
     ap.add_argument("--output")
+    ap.add_argument("--spdx", metavar="DEB")
+    ap.add_argument("--pin", action="store_true")
     a = ap.parse_args()
     if a.self_test:
         return self_test()
+    if a.pin:
+        pin_sdk_hashes(ROOT)
+        print(f"{TABLE}: sha256 pins rewritten")
+        return 0
+    if a.spdx:
+        deb_path = Path(a.spdx)
+        fields = ("Package", "Version", "Architecture", "Depends")
+        out = subprocess.run(["dpkg-deb", "-f", str(deb_path), *fields],
+                             check=True, capture_output=True, text=True).stdout
+        deb = parse_deb_fields(out)
+        sha256 = hashlib.sha256(deb_path.read_bytes()).hexdigest()
+        payload = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["dpkg-deb", "-x", str(deb_path), tmp], check=True)
+            for top in SHIPPED_VENDOR_DIRS:
+                for dirpath, _, names in os.walk(Path(tmp) / top):
+                    for n in names:
+                        p = Path(dirpath) / n
+                        if p.is_file() and not p.is_symlink():
+                            payload[p.relative_to(tmp).as_posix()] = file_digests(p.read_bytes())
+        query = subprocess.run(["dpkg-query", "-W", "-f=${db:Status-Abbrev}\\t${Package}\\t${Version}\\n"],
+                               check=True, capture_output=True, text=True).stdout
+        installed = parse_installed(query)
+        repo = os.environ.get("GITHUB_REPOSITORY", "open-astro/AlpacaBridge")
+        created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            doc = build_spdx(ROOT, deb, deb_path.name, sha256, created,
+                             f"https://github.com/{repo}/sbom/{deb_path.name}-{sha256}",
+                             payload=payload, installed=installed)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 1
+        text = json.dumps(doc, indent=2) + "\n"
+        if a.output:
+            Path(a.output).write_text(text, encoding="utf-8")
+        else:
+            sys.stdout.write(text)
+        return 0
     if a.check:
         errs = check_drift(ROOT)
         for e in errs:

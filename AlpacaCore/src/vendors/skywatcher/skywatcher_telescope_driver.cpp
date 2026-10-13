@@ -765,7 +765,7 @@ public:
     bool get_is_pulse_guiding() const override {
         std::lock_guard<std::mutex> lock(mutex_);
         check_connected();
-        const auto now = std::chrono::steady_clock::now();
+        const auto now = clock_.now();
         for (int i = 0; i < 2; ++i) {
             if (pulse_axis_active_[i] && now >= pulse_guide_end_time_[i]) {
                 pulse_axis_active_[i] = false;
@@ -1326,6 +1326,7 @@ public:
         }
         stop_pulse_ops();
         bool displaced = false;
+        uint64_t home_error_epoch = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             check_connected();
@@ -1349,10 +1350,11 @@ public:
             // that calls FindHome after a failed GOTO must not be told the
             // OLD goto failed while it's homing.
             clear_last_slew_error_locked();
+            home_error_epoch = slew_error_epoch_;
         }
 
         start_slew_body(
-            [this](util::OperationContext& ctx) {
+            [this, home_error_epoch](util::OperationContext& ctx) {
                 BodyScope scope(ctx);
                 std::unique_lock<std::mutex> lock(mutex_);
                 if (!connected_ || ctx.stop_reason() != util::StopReason::None) {
@@ -1368,6 +1370,9 @@ public:
                         run_autohome(lock);
                         set_tracking_locked(lock, false);
                         refresh_position_cache_locked(true);
+                        if (!owns_slew_state_locked(ctx)) {
+                            return;
+                        }
                         at_home_ = true;
                     } else {
                         // No sensors: goto the power-on index (counts kHomeCounts).
@@ -1381,6 +1386,9 @@ public:
                         // stops the axes wherever they are) before claiming AtHome.
                         refresh_position_cache_locked(true);
                         at_home_ = std::abs(cached_ra_axis_deg_) < 0.1 && std::abs(cached_dec_axis_deg_) < 0.1;
+                        if (!at_home_) {
+                            throw AlpacaException("FindHome count-frame slew did not reach home");
+                        }
                     }
                     if (owns_slew_state_locked(ctx)) {
                         homing_ = false;
@@ -1392,11 +1400,19 @@ public:
                         set_slewing_cached_false_locked();
                     }
                 } catch (const std::exception& ex) {
-                    abandon_slew_body_locked(ctx, homing_);
-                    ALPACA_LOG_WARN("SkyWatcher", std::string("FindHome failed: ") + ex.what());
+                    if (ctx.stop_reason() != util::StopReason::None) {
+                        abandon_slew_body_locked(ctx, homing_);
+                    } else {
+                        fail_async_phase_locked(ctx, homing_, home_error_epoch,
+                                                std::string("FindHome failed: ") + ex.what());
+                    }
                 } catch (...) {
-                    abandon_slew_body_locked(ctx, homing_);
-                    ALPACA_LOG_WARN("SkyWatcher", "FindHome failed with unknown exception");
+                    if (ctx.stop_reason() != util::StopReason::None) {
+                        abandon_slew_body_locked(ctx, homing_);
+                    } else {
+                        fail_async_phase_locked(ctx, homing_, home_error_epoch,
+                                                "FindHome failed with unknown exception");
+                    }
                 }
             },
             displaced,
@@ -1430,6 +1446,7 @@ public:
         double target_ra_axis = 0.0;
         double target_dec_axis = 0.0;
         bool displaced = false;
+        uint64_t park_error_epoch = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             check_connected();
@@ -1457,10 +1474,11 @@ public:
             // that calls Park after a failed GOTO must not be told the OLD
             // goto failed while it's parking.
             clear_last_slew_error_locked();
+            park_error_epoch = slew_error_epoch_;
         }
 
         start_slew_body(
-            [this, target_ra_axis, target_dec_axis](util::OperationContext& ctx) {
+            [this, target_ra_axis, target_dec_axis, park_error_epoch](util::OperationContext& ctx) {
                 BodyScope scope(ctx);
                 std::unique_lock<std::mutex> lock(mutex_);
                 if (!connected_ || ctx.stop_reason() != util::StopReason::None) {
@@ -1484,11 +1502,18 @@ public:
                         at_home_ = target_ra_axis == 0.0 && target_dec_axis == 0.0;
                     }
                 } catch (const std::exception& ex) {
-                    abandon_slew_body_locked(ctx, parking_);
-                    ALPACA_LOG_WARN("SkyWatcher", std::string("Park failed: ") + ex.what());
+                    if (ctx.stop_reason() != util::StopReason::None) {
+                        abandon_slew_body_locked(ctx, parking_);
+                    } else {
+                        fail_async_phase_locked(ctx, parking_, park_error_epoch,
+                                                std::string("Park failed: ") + ex.what());
+                    }
                 } catch (...) {
-                    abandon_slew_body_locked(ctx, parking_);
-                    ALPACA_LOG_WARN("SkyWatcher", "Park failed with unknown exception");
+                    if (ctx.stop_reason() != util::StopReason::None) {
+                        abandon_slew_body_locked(ctx, parking_);
+                    } else {
+                        fail_async_phase_locked(ctx, parking_, park_error_epoch, "Park failed with unknown exception");
+                    }
                 }
             },
             displaced,
@@ -1523,7 +1548,7 @@ public:
                 throw AlpacaException("Invalid PulseGuide direction", AlpacaError::InvalidValue);
             }
 
-            const auto now = std::chrono::steady_clock::now();
+            const auto now = clock_.now();
 
             // Reads are live (dead-reckoned) during pulses — no frozen-target
             // accumulation, and pulses never rewrite the slew Target
@@ -5489,6 +5514,59 @@ private:
         restoring_tracking_ = false;
         restore_tracking_after_slew_ = false;
         tracking_ = false;
+    }
+
+    std::string stop_axes_after_operation_failure_locked() {
+        cancel_rate_verify_locked();
+        std::string errors;
+        const auto stop = [&](int axis, int index) {
+            try {
+                protocol_->instant_stop(axis);
+                cmd_axis_rate_deg_s_[index] = 0.0;
+            } catch (const std::exception& ex) {
+                if (!errors.empty()) errors += "; ";
+                errors += "axis " + std::to_string(axis) + ": " + ex.what();
+            } catch (...) {
+                if (!errors.empty()) errors += "; ";
+                errors += "axis " + std::to_string(axis) + ": unknown stop error";
+            }
+        };
+        stop(kAxisRa, 0);
+        stop(kAxisDec, 1);
+        return errors;
+    }
+
+    void fail_async_phase_locked(util::OperationContext& ctx, bool& phase_flag, std::uint64_t error_epoch,
+                                 const std::string& message) {
+        if (!owns_slew_state_locked(ctx) || ctx.stop_reason() != util::StopReason::None ||
+            error_epoch != slew_error_epoch_) {
+            return;
+        }
+        const std::string stop_error = stop_axes_after_operation_failure_locked();
+        if (!owns_slew_state_locked(ctx) || ctx.stop_reason() != util::StopReason::None ||
+            error_epoch != slew_error_epoch_) {
+            return;
+        }
+        phase_flag = false;
+        parked_ = false;
+        at_home_ = false;
+        goto_in_progress_ = false;
+        restoring_tracking_ = false;
+        restore_tracking_after_slew_ = false;
+        const auto full_error = stop_error.empty() ? message
+                                                   : message + "; stopping after failure failed: " + stop_error +
+                                                         "; the mount may still be moving";
+        last_slew_error_ = full_error;
+        if (stop_error.empty()) {
+            tracking_ = false;
+            set_slewing_cached_false_locked();
+        } else {
+            ALPACA_LOG_ERROR("SkyWatcher", "Stop after async motion failure failed: " + stop_error +
+                                               "; the mount may still be moving");
+        }
+        slew_force_until_ = std::chrono::steady_clock::time_point::min();
+        invalidate_position_cache_locked(false);
+        ALPACA_LOG_WARN("SkyWatcher", full_error);
     }
 
     // A Park or FindHome body that failed or was stopped: end its phase flag

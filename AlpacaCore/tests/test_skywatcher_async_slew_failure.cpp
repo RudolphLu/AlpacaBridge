@@ -189,4 +189,96 @@ TEST_CASE("SkyWatcher async - AbortSlew's own cancellation is not reported as a 
     driver->set_connected(false);
 }
 
+TEST_CASE("SkyWatcher async - Park dispatch failure surfaces through Slewing and leaves AtPark false",
+          "[skywatcher][async][parkfailure]") {
+    alpacacore::test::FakeTaskClock clock;
+    FakeSkyWatcherMount mount(alpacacore::test::FakeMountProfile::wave_100i(), clock);
+    REQUIRE(mount.ok());
+    auto driver = connected_driver(mount, clock);
+    // RA starts, then DEC dispatch fails: cleanup must stop both axes.
+    mount.reject_start_motion(2, 1);
+
+    REQUIRE_NOTHROW(driver->park());
+    std::string message;
+    REQUIRE(run_clock_until(
+        clock, [&] { return read_slewing(*driver, &message) == SlewingRead::Threw; },
+        std::chrono::milliseconds(10000)));
+    CHECK(message.find("Park failed") != std::string::npos);
+    CHECK(read_slewing(*driver) == SlewingRead::Threw);
+    CHECK_FALSE(driver->get_at_park());
+    CHECK(mount.stop_count(1) > 0);
+    CHECK(mount.stop_count(2) > 0);
+    CHECK_FALSE(mount.axis_running(1));
+    CHECK_FALSE(mount.axis_running(2));
+    REQUIRE_NOTHROW(driver->abort_slew());
+    CHECK(read_slewing(*driver) == SlewingRead::False);
+    driver->set_connected(false);
+}
+
+TEST_CASE("SkyWatcher async - AutoHome failure surfaces through Slewing and leaves AtHome false",
+          "[skywatcher][async][homefailure]") {
+    alpacacore::test::FakeTaskClock clock;
+    FakeSkyWatcherMount mount(alpacacore::test::FakeMountProfile::wave_100i(), clock);
+    REQUIRE(mount.ok());
+    auto driver = connected_driver(mount, clock);
+    mount.reject_start_motion(1, 1);
+    mount.reject_instant_stop(1, 1);
+
+    REQUIRE_NOTHROW(driver->find_home());
+    std::string message;
+    REQUIRE(run_clock_until(
+        clock, [&] { return read_slewing(*driver, &message) == SlewingRead::Threw; },
+        std::chrono::milliseconds(10000)));
+    CHECK(message.find("FindHome failed") != std::string::npos);
+    CHECK(message.find("stopping after failure failed") != std::string::npos);
+    CHECK(message.find("axis 1") != std::string::npos);
+    CHECK(read_slewing(*driver) == SlewingRead::Threw);
+    CHECK_FALSE(driver->get_at_home());
+    CHECK(mount.stop_count(2) > 0);  // DEC stop is still attempted after the RA stop fails.
+    REQUIRE_NOTHROW(driver->abort_slew());
+    CHECK(read_slewing(*driver) == SlewingRead::False);
+    driver->set_connected(false);
+}
+
+TEST_CASE("SkyWatcher async - count-frame FindHome failure persists through Slewing",
+          "[skywatcher][async][homefailure]") {
+    alpacacore::test::FakeTaskClock clock;
+    FakeSkyWatcherMount mount(alpacacore::test::FakeMountProfile::eqm35_pro(), clock);
+    REQUIRE(mount.ok());
+    auto driver = connected_driver(mount, clock);
+    mount.reject_start_motion(1, 1);
+
+    REQUIRE_NOTHROW(driver->find_home());
+    std::string message;
+    REQUIRE(run_clock_until(
+        clock, [&] { return read_slewing(*driver, &message) == SlewingRead::Threw; },
+        std::chrono::milliseconds(10000)));
+    CHECK(message.find("FindHome failed") != std::string::npos);
+    CHECK_FALSE(driver->get_at_home());
+    REQUIRE_NOTHROW(driver->abort_slew());
+    driver->set_connected(false);
+}
+
+TEST_CASE("SkyWatcher async - count-frame FindHome rejects a short landing", "[skywatcher][async][homefailure]") {
+    alpacacore::test::FakeTaskClock clock;
+    FakeSkyWatcherMount mount(alpacacore::test::FakeMountProfile::eqm35_pro(), clock);
+    REQUIRE(mount.ok());
+    auto driver = connected_driver(mount, clock);
+    mount.jump_axis_degrees(1, 5.0);
+    mount.land_short_by(1, 1, 0.2, 60000);
+
+    REQUIRE_NOTHROW(driver->find_home());
+    std::string message;
+    REQUIRE(run_clock_until(
+        clock, [&] { return read_slewing(*driver, &message) == SlewingRead::Threw; },
+        std::chrono::milliseconds(10000)));
+    CHECK(message.find("FindHome count-frame slew did not reach home") != std::string::npos);
+    CHECK_FALSE(driver->get_at_home());
+    CHECK(std::abs(mount.axis_degrees(1)) > 0.1);
+
+    REQUIRE_NOTHROW(driver->abort_slew());
+    CHECK(read_slewing(*driver) == SlewingRead::False);
+    driver->set_connected(false);
+}
+
 #endif  // _WIN32

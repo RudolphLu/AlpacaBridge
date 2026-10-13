@@ -394,6 +394,54 @@ TEST_CASE("SynScan Telescope Driver - a far-off client UTCDate is logged once pe
     driver->set_connected(false);
 }
 
+TEST_CASE("SynScan Telescope Driver - a blind P command is in the TRACE wire log", "[synscan][telescope][unit]") {
+    // MoveAxis, pulse guides and landing nudges all reach the handset as
+    // fire-and-forget "P" commands. The wire log covered only commands that
+    // wait for a reply, so a rig TRACE could not show which direction byte a
+    // move actually sent (#1030: a commanded west RA move went east).
+    std::mutex lines_mutex;
+    std::vector<std::string> lines;
+    struct LogGuard {
+        alpacacore::logging::LogSink previous_sink = alpacacore::logging::get_log_sink();
+        alpacacore::logging::LogLevel previous_level = alpacacore::logging::get_log_level();
+        ~LogGuard() {
+            alpacacore::logging::set_log_sink(previous_sink);
+            alpacacore::logging::set_log_level(previous_level);
+        }
+    } log_guard;
+    alpacacore::logging::set_log_sink(
+        [&](alpacacore::logging::LogLevel level, std::string_view component, std::string_view message) {
+            if (level == alpacacore::logging::LogLevel::Trace && component == "SynScan") {
+                std::lock_guard<std::mutex> lock(lines_mutex);
+                lines.emplace_back(message);
+            }
+        });
+    alpacacore::logging::set_log_level(alpacacore::logging::LogLevel::Trace);
+
+    alpacacore::test::FakeMountServer server;
+    REQUIRE(server.ok());
+    alpacacore::vendor::synscan::ConnectionInfo conn;
+    conn.type = alpacacore::vendor::synscan::ConnectionType::Network;
+    conn.host = "127.0.0.1";
+    conn.tcp_port = server.port();
+    conn.response_timeout_ms = 50;
+    auto driver =
+        alpacacore::vendor::synscan::create_synscan_telescope(0, conn, alpacacore::vendor::synscan::SynScanVersion::V4);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(5)));
+
+    driver->move_axis(0, 0.5);
+    driver->move_axis(0, 0.0);
+    driver->set_connected(false);
+
+    // P, 3 bytes follow, device 16 (RA axis): the variable-rate move.
+    const std::string ra_move = std::string("HC P\\x03\\x10");
+    std::lock_guard<std::mutex> lock(lines_mutex);
+    const auto hits =
+        std::count_if(lines.begin(), lines.end(), [&](const std::string& line) { return line.rfind(ra_move, 0) == 0; });
+    INFO("TRACE lines: " << lines.size());
+    CHECK(hits >= 2);  // the move and its stop
+}
+
 // #627: `x < min || x > max` is false for NaN, so NaN passed every range check
 // and was stored (targets, elevation) or reached the mount (the site latitude
 // and longitude setters check the connection only AFTER the range, so a NaN
@@ -624,7 +672,7 @@ TEST_CASE("SynScan Telescope Driver - AbortSlew reports a stop it could not send
         CHECK(axis_stops == 4);  // each axis gets both stop directions
     }
 
-    SECTION("a dropped link throws DriverException and leaves Slewing true") {
+    SECTION("a dropped link throws DriverException and keeps the slew error observable") {
         REQUIRE(server.drop_connections());
         try {
             driver->abort_slew();
@@ -633,7 +681,13 @@ TEST_CASE("SynScan Telescope Driver - AbortSlew reports a stop it could not send
             CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
             CHECK(std::string(ex.what()).rfind("AbortSlew stop failed: ", 0) == 0);
         }
-        CHECK(driver->get_slewing());
+        try {
+            (void)driver->get_slewing();
+            FAIL("Slewing returned a completion value after the stop failed");
+        } catch (const alpacacore::AlpacaException& ex) {
+            CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+            CHECK(std::string(ex.what()).rfind("AbortSlew stop failed: ", 0) == 0);
+        }
     }
 
     driver->set_connected(false);

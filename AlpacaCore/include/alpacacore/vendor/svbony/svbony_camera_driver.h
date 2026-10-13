@@ -19,6 +19,8 @@
 
 namespace alpacacore::vendor::svbony {
 
+class SVBSDK;
+
 /**
  * @brief Create an SVBONY camera driver by camera index (enumeration order).
  *

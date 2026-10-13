@@ -471,4 +471,31 @@ TEST_CASE("ZWO blocking slew - position reports mount feedback after GOTO", "[zw
     driver->set_connected(false);
 }
 
+TEST_CASE("ZWO async - redundant Connected=true preserves a stored slew failure",
+          "[zwo][telescope][async][slewfailure]") {
+    auto st = std::make_shared<FakeZwoState>();
+    alpacacore::test::FakeMountServer server(zwo_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::zwo::create_zwo_telescope(0, endpoint(server.port()));
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+
+    st->reject_sr.store(true);
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(5.5, 20.0));
+    REQUIRE(wait_until([&] { return read_slewing(*driver) == SlewingRead::Threw; }, 5000));
+    CHECK(read_slewing(*driver) == SlewingRead::Threw);
+
+    // Platform 7 may resend Connected=true while already connected. That is
+    // only a refresh, not a successful motion recovery.
+    REQUIRE_NOTHROW(driver->set_connected(true));
+    CHECK(read_slewing(*driver) == SlewingRead::Threw);
+
+    // A full successful reconnect is a valid recovery and clears the old error.
+    st->reject_sr.store(false);
+    driver->set_connected(false);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    const SlewingRead after_reconnect = read_slewing(*driver);
+    CHECK((after_reconnect == SlewingRead::True || after_reconnect == SlewingRead::False));
+    driver->set_connected(false);
+}
+
 #endif  // _WIN32

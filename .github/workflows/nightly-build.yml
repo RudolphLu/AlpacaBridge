@@ -15,6 +15,10 @@
 # nothing else. The release is marked --latest=false so the repository's
 # Latest release stays the stable one.
 #
+# Each published .deb carries a signed build provenance attestation and an
+# SPDX SBOM attestation (Actions > Attestations); `gh attestation verify` on
+# the file proves it was built here, by this workflow, from the named commit.
+#
 # Upstream builds main only (the cron, or `gh workflow run nightly-build.yml
 # -f force=true`), so the public nightly-build release always names a main
 # commit. Forks never build on the cron; a manual run there builds the branch
@@ -76,7 +80,9 @@ jobs:
     needs: check
     if: needs.check.outputs.build == 'true'
     permissions:
-      contents: write   # move the nightly-build tag, gh release create/edit/upload
+      contents: write       # move the nightly-build tag, gh release create/edit/upload
+      id-token: write       # OIDC token Sigstore signs the attestations with
+      attestations: write   # store the provenance and SBOM attestations
     runs-on: ubuntu-24.04-arm
     # Built on the target distribution so dpkg-shlibdeps derives trixie
     # package names, as release.yml's beta-deb job does.
@@ -135,6 +141,25 @@ jobs:
           dpkg-deb --info "dist/${ASSET}" | sed -n '/Package:/,/Depends:/p'
           ls -l dist
 
+      - name: Generate the SBOM
+        # The repository's own inventory (scripts/dependency_snapshot.py), not a
+        # scanner: the vendored SDK .so files in the package carry no metadata a
+        # scanner could identify.
+        env:
+          ASSET: ${{ steps.version.outputs.asset }}
+        run: python3 scripts/dependency_snapshot.py --spdx "dist/${ASSET}" --output dist/sbom.spdx.json
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2 pinned (immutable ref)
+        with:
+          subject-path: dist/${{ steps.version.outputs.asset }}
+
+      - name: Attest the SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e  # v4.1.0 pinned (immutable ref)
+        with:
+          subject-path: dist/${{ steps.version.outputs.asset }}
+          sbom-path: dist/sbom.spdx.json
+
       - name: Move the nightly-build tag
         env:
           GH_TOKEN: ${{ github.token }}
@@ -165,6 +190,7 @@ jobs:
             echo '```bash'
             echo "curl -LO ${url}"
             echo "curl -LO ${url}.sha256 && sha256sum -c ${ASSET}.sha256"
+            echo "gh attestation verify ${ASSET} --repo ${GITHUB_REPOSITORY}   # optional: proves this workflow built it"
             echo "sudo apt install ./${ASSET}"
             echo '```'
             echo ""

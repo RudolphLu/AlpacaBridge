@@ -190,6 +190,13 @@ public:
         malform_left_ = times;
     }
 
+    /// Answer ":J" on an axis that is already running with "!2" (motor not
+    /// stopped), as a board that refuses to start a running axis does.
+    void reject_j_on_running_axis(bool reject = true) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        reject_j_on_running_ = reject;
+    }
+
     /// The ":e1" payload (default "033A44": Wave 100i, MC 3.58 / code 0x44).
     void set_version_reply(std::string payload) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -322,6 +329,8 @@ private:
         }
         if (malform_left_ > 0) {
             --malform_left_;
+            // The board decoded and APPLIED a start before its ack was garbled.
+            if (cmd == 'J') running_[axis - 1] = true;
             return "25278";  // no leading "=" / "!": a byte dropped on a noisy link
         }
         switch (cmd) {
@@ -364,6 +373,7 @@ private:
                 running_[axis - 1] = false;
                 return "=";
             case 'J':
+                if (reject_j_on_running_ && running_[axis - 1]) return "!2";
                 running_[axis - 1] = true;
                 return "=";
             case 'F':
@@ -471,6 +481,7 @@ private:
     std::string version_reply_ = "033A44";
     int answer_baud_ = 0;
     int mispair_left_ = 0;
+    bool reject_j_on_running_ = false;
     int malform_left_ = 0;   // frames to answer with a byte-dropped malformed reply
     char drop_command_ = 0;  // frames of this command to lose on the wire (#559)
     int drop_left_ = 0;

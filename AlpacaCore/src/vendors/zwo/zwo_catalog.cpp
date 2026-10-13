@@ -144,8 +144,6 @@ void register_zwo_factory(DeviceCatalog& catalog) {
     Factory wheel;
     wheel.key = DeviceKey{"zwo", DeviceType::FilterWheel};
     wheel.create = [](const DeviceConfig& config, int device_number) -> std::unique_ptr<AlpacaDriver> {
-        refuse_if(zwo_bound_refusal(config, kZwoFilterwheelId, kZwoFilterwheelIndex,
-                                    "ZWO filter wheel requires filterwheelIndex or filterwheelId"));
         const int id = static_cast<int>(config.get(kZwoFilterwheelId));
         std::unique_ptr<FilterWheelDriver> driver =
             id >= 0 ? vendor::zwo::create_zwo_efw_filterwheel(device_number, id)
@@ -159,8 +157,6 @@ void register_zwo_factory(DeviceCatalog& catalog) {
     Factory focuser;
     focuser.key = DeviceKey{"zwo", DeviceType::Focuser};
     focuser.create = [](const DeviceConfig& config, int device_number) -> std::unique_ptr<AlpacaDriver> {
-        refuse_if(zwo_bound_refusal(config, kZwoFocuserId, kZwoFocuserIndex,
-                                    "ZWO EAF focuser requires focuserIndex or focuserId"));
         const int id = static_cast<int>(config.get(kZwoFocuserId));
         if (id >= 0) return vendor::zwo::create_zwo_eaf_focuser(device_number, id);
         return vendor::zwo::create_zwo_eaf_focuser_by_index(device_number,
@@ -171,8 +167,6 @@ void register_zwo_factory(DeviceCatalog& catalog) {
     Factory rotator;
     rotator.key = DeviceKey{"zwo", DeviceType::Rotator};
     rotator.create = [](const DeviceConfig& config, int device_number) -> std::unique_ptr<AlpacaDriver> {
-        refuse_if(zwo_bound_refusal(config, kZwoRotatorId, kZwoRotatorIndex,
-                                    "ZWO rotator requires rotatorIndex or rotatorId"));
         const int id = static_cast<int>(config.get(kZwoRotatorId));
         if (id >= 0) return vendor::zwo::create_zwo_caa_rotator(device_number, id);
         return vendor::zwo::create_zwo_caa_rotator_by_index(device_number,
