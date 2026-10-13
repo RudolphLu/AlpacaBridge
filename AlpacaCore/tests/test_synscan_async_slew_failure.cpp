@@ -59,6 +59,11 @@ struct FakeSynScanState {
     std::atomic<int> goto_count{0};
     std::atomic<Clock::rep> goto_started{0};
     std::atomic<bool> goto_stopped{false};
+    // The position a precise GOTO landed on; empty until the first one (#1105). With land_on_goto false the mount
+    // never moves, so the driver's landing check fails the slew after one repeat GOTO.
+    std::atomic<bool> land_on_goto{true};
+    std::mutex landed_mutex;
+    std::string landed;
     std::mutex command_mutex;
     std::vector<std::string> commands;
     void record(const std::string& command) {
@@ -97,14 +102,21 @@ alpacacore::test::FakeMountServer::Responder synscan_responder(const std::shared
             case 'e':
             case 'E':
             case 'z':
-            case 'Z':
-                return "12AB0500,20000500#";
+            case 'Z': {
+                std::lock_guard<std::mutex> lock(st->landed_mutex);
+                return st->landed.empty() ? "12AB0500,20000500#" : st->landed;
+            }
             case 'r':
             case 'R':
             case 'b':
             case 'B':
                 if (st->reject_goto.load()) {
                     return "";  // no reply at all: the response timeout fires inside the slew task
+                }
+                if (chunk[0] == 'r' && chunk.size() >= 18 && st->land_on_goto.load()) {
+                    // A precise GOTO lands on its aim, so the landing check after it (#1105) sees an arrival.
+                    std::lock_guard<std::mutex> lock(st->landed_mutex);
+                    st->landed = chunk.substr(1, 17) + "#";
                 }
                 st->goto_started.store(Clock::now().time_since_epoch().count());
                 st->goto_stopped.store(false);
@@ -419,6 +431,7 @@ TEST_CASE("SynScan PulseGuide - guide position does not publish as target", "[sy
 
 TEST_CASE("SynScan async slew - position reports mount feedback after PulseGuide", "[synscan][telescope][async]") {
     auto st = std::make_shared<FakeSynScanState>();
+    st->land_on_goto.store(false);
     alpacacore::test::FakeMountServer server(synscan_responder(st));
     REQUIRE(server.ok());
     auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
@@ -437,7 +450,8 @@ TEST_CASE("SynScan async slew - position reports mount feedback after PulseGuide
     CHECK(position_is_distinct);
     driver->slew_to_coordinates_async(target_ra, target_dec);
     REQUIRE(wait_until([&] { return st->goto_count.load() > 0; }, 5000));
-    REQUIRE(wait_until([&] { return !driver->get_slewing(); }, 12000));
+    // The mount never moves, so the slew ends with the far-miss failure after one repeat GOTO (#1105).
+    REQUIRE(wait_until([&] { return read_slewing(*driver) != SlewingRead::True; }, 30000));
 
     // The fake mount acknowledges the GOTO but stays at its fixed position.
     // Completion must not make the requested target masquerade as readback.
