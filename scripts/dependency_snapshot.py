@@ -502,6 +502,8 @@ def check_coverage(root: Path, table: dict) -> list[str]:
                           "scripts/dependency_updates.py finds its newest version (provider release-page or json)")
     # Rule 2: every docs-only folder holds a watched document, or says why there is none.
     exempt = {n["path"] for n in table.get("no_upstream", [])}
+    for p in sorted(exempt - set(table["doc_only"])):
+        errors.append(f"{TABLE}: no_upstream lists {p}, which is not a 'doc_only' directory: remove the stale entry")
     doc_paths = [d["path"] for d in documents if d.get("path")]
     for p in table["doc_only"]:
         if p not in exempt and not any(dp.startswith(p + "/") for dp in doc_paths):
@@ -648,6 +650,9 @@ def self_test() -> int:
         assert drift_with(no_upstream=[], documents=[{"name": "b-spec", "path": f"{EXTERNAL}/B/spec.md",
                                                       "check": {"provider": "hash", "url": "u"}, "baseline": "0"}]) == []
         (r / EXTERNAL / "B/spec.md").unlink()
+        # A no_upstream exemption for a directory that is no longer docs-only is stale.
+        errs = drift_with(no_upstream=base["no_upstream"] + [{"path": f"{EXTERNAL}/Gone", "reason": "old"}])
+        assert len(errs) == 1 and f"{EXTERNAL}/Gone" in errs[0] and "no_upstream" in errs[0], errs
         # Rule 3: every vendor driver directory maps to SDKs or documents, or has a no_upstream reason.
         (r / VENDORS / "acme").mkdir(parents=True)
         errs = drift_with()

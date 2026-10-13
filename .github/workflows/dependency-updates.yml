@@ -1,9 +1,11 @@
-# Opens one issue per dependency with a newer upstream version, and one per
+# Opens one issue per dependency with a newer upstream version, one per
+# upstream document that changed ("Upstream document changed"), and one per
 # update source that can no longer be read (scripts/dependency_updates.py; see
 # docs/development.md "Dependency update checks"). It checks the GitHub-hosted
-# pins in the dependency snapshot and the SDKs with an `updates` block in
-# scripts/dependency_sdk_versions.json. Issue state lives in each issue body,
-# so the workflow never commits. Dependabot keeps owning the action pins.
+# pins in the dependency snapshot, every SDK's `updates` block and the
+# `documents` list in scripts/dependency_sdk_versions.json. Issue state lives
+# in each issue body, so the workflow never commits. Dependabot keeps owning
+# the action pins.
 
 name: Dependency updates
 
@@ -22,7 +24,7 @@ jobs:
   check:
     name: Check upstream versions
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 15
+    timeout-minutes: 30   # ~45 sequential requests (30 s each at most) plus a ~50 MB download
     permissions:
       contents: read
       issues: write   # open, retitle and close the dependency issues

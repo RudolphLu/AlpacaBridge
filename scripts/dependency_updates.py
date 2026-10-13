@@ -40,6 +40,7 @@ import contextlib
 import gzip
 import hashlib
 import html
+import http.client
 import io
 import json
 import os
@@ -64,6 +65,8 @@ BROKEN_LABELS = ("dependencies", "bug", "P4")
 DOC_LABELS = ("dependencies", "documentation", "P4")
 OSV_LABELS = ("dependencies", "bug", "P2")
 TAG_PAGES = 10
+PAGE_TIMEOUT = 30  # seconds per page or API request; about 45 run in sequence each week
+DOCUMENT_TIMEOUT = 300  # a hashed document can be large (the ~50 MB ConformU beta tarball)
 LIST_LIMIT = 5000  # issues read back for their markers; the OSV dedupe needs closed ones too
 OSV_THRESHOLD = 7.0  # CVSS: High is 7.0-8.9, Critical 9.0-10.0
 OSV_MAX_ROWS = 100  # rows per summary issue; keeps the body far below GitHub's 65536 characters
@@ -104,7 +107,7 @@ def highest(versions: list[str]) -> str | None:
     return max(stable)[1] if stable else None
 
 
-def http_fetch(url: str) -> tuple[bytes, str]:
+def http_fetch(url: str, timeout: int = PAGE_TIMEOUT) -> tuple[bytes, str]:
     """(body, content type). A gzip body is decompressed: urllib does not, and some vendor
     sites send one even unasked."""
     headers = {"User-Agent": "Mozilla/5.0 (compatible; alpacabridge-dependency-updates)"}
@@ -112,12 +115,13 @@ def http_fetch(url: str) -> tuple[bytes, str]:
     if token and url.startswith("https://api.github.com/"):
         headers["Authorization"] = f"Bearer {token}"
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=120) as r:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as r:
             return decode_body(r.read(), r.headers.get("Content-Encoding", "")), r.headers.get("Content-Type", "")
     except urllib.error.HTTPError as e:
         raise FetchError(f"HTTP {e.code} from {url}") from e
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        raise FetchError(f"{url}: {e}") from e
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as e:
+        # HTTPException covers a connection dropped mid-body (IncompleteRead): a broken source.
+        raise FetchError(f"{url}: {type(e).__name__}: {e}") from e
 
 
 def decode_body(body: bytes, encoding: str) -> bytes:
@@ -254,7 +258,7 @@ def targets(snap: dict, table: dict) -> tuple[list[dict], list[str]]:
 
 
 def check(t: dict, get: HttpGet, fetch: Fetch | None = None) -> dict:
-    fetch = fetch or http_fetch
+    fetch = fetch or (lambda u: http_fetch(u, timeout=DOCUMENT_TIMEOUT))
     try:
         if t.get("compare", "version") == "version":
             parse_version(t["current"])  # a pin that is no version (a commit SHA) is a broken entry
@@ -674,6 +678,38 @@ def self_test() -> int:
     assert "CVE-2026-4" not in f.issues[1]["body"], "only the new finding is listed"
     # --- SDK and document providers ---
     assert decode_body(gzip.compress(b"page"), "gzip") == b"page" and decode_body(b"page", "") == b"page"
+    # A connection that drops mid-body (http.client.IncompleteRead) is a broken source too, and
+    # ordinary pages use a short timeout while a large document (the ConformU tarball) gets a long one.
+    seen_timeouts = []
+
+    class Resp:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            raise http.client.IncompleteRead(b"partial", 1000)
+
+    real_urlopen = urllib.request.urlopen
+    urllib.request.urlopen = lambda req, timeout: seen_timeouts.append(timeout) or Resp()
+    try:
+        try:
+            http_fetch("https://d.test/big.tar.xz")
+        except FetchError as e:
+            assert "IncompleteRead" in str(e) or "partial" in str(e) or "read" in str(e).lower(), e
+        else:
+            raise AssertionError("a dropped connection must raise FetchError")
+        broken = check({"key": "doc:t", "name": "t", "current": "0", "compare": "equal", "document": True,
+                        "check": ("hash", "https://d.test/big.tar.xz")}, http_get)
+        assert broken["error"], broken
+    finally:
+        urllib.request.urlopen = real_urlopen
+    assert seen_timeouts == [PAGE_TIMEOUT, DOCUMENT_TIMEOUT], seen_timeouts
+    assert PAGE_TIMEOUT <= 30 < DOCUMENT_TIMEOUT
     # A truncated or corrupt gzip body is a broken source, not a crash of the whole run.
     for bad in (gzip.compress(b"page")[:-6], b"not gzip at all"):
         try:
