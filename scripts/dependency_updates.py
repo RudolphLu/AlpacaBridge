@@ -403,8 +403,8 @@ def system_body(r: dict) -> str:
             f"| Upstream | `{r['latest']}` |\n| Source | {r['source']} |\n\n"
             "The build takes this library from Debian (`debian/control`), so there is no pin to bump. Review "
             "what the new release adds or fixes for the driver (for libgphoto2: new camera bodies), and set "
-            "the `baseline` in `scripts/dependency_sdk_versions.json` to the upstream version once reviewed, "
-            "or when Debian ships it. This issue closes by itself once the baseline matches.\n\n"
+            "the `baseline` in `scripts/dependency_sdk_versions.json` to the upstream version (without a `v` "
+            "prefix, as Debian spells it) once reviewed, or when Debian ships it. This issue closes by itself once the baseline matches.\n\n"
             "Opened by `.github/workflows/dependency-updates.yml`.\n")
 
 
@@ -1022,6 +1022,24 @@ def self_test() -> int:
     doc = {"key": "doc:indi-x", "name": "indi-x", "current": "a" * 40, "latest": "b" * 40, "document": True,
            "compare": "equal", "check": ("github-file", "indilib/indi", "drivers/x.cpp"), "source": "s"}
     assert "https://github.com/indilib/indi/compare/" + "a" * 40 + "..." + "b" * 40 in changelog_for(doc, get)
+    # Changelog links that come from the table, through targets(): a json SDK's changelog_field
+    # (ZWO's software_update_log_url, from the matching entry only) and a static changelog URL.
+    pages["https://zwo.test/cl"] = json.dumps([{"acf": {"software_downloads": [
+        {"software_download_title": "CAA SDK", "software_version": "V1.6.0", "software_update_log_url": "https://zwo.test/caa-log"},
+        {"software_download_title": "EAF SDK", "software_version": "V1.8.1", "software_update_log_url": "https://zwo.test/eaf-log"}]}}])
+    pages["https://q.test/sdk"] = "sdk_linux_arm64_26.07.28.tar.gz"
+    cl_table = {"sdks": [
+        {"name": "zwo-eaf-sdk", "version": "1.7.7",
+         "updates": {"provider": "json", "url": "https://zwo.test/cl", "path": "0.acf.software_downloads",
+                     "match": {"software_download_title": "EAF SDK"}, "field": "software_version",
+                     "changelog_field": "software_update_log_url"}},
+        {"name": "qhy-sdk", "version": "26.06.04",
+         "updates": {"provider": "release-page", "url": "https://q.test/sdk",
+                     "pattern": r"sdk_linux_arm64_(\d+\.\d+\.\d+)\.tar\.gz", "changelog": "https://q.test/log_en.md"}}]}
+    cl = {t["key"]: check(t, get) for t in targets({"manifests": {}}, cl_table)[0]}
+    zwo_notes = changelog_for(cl["zwo-eaf-sdk"], get)
+    assert "https://zwo.test/eaf-log" in zwo_notes and "caa-log" not in zwo_notes, zwo_notes
+    assert "https://q.test/log_en.md" in changelog_for(cl["qhy-sdk"], get)
     # A source with a static changelog URL in its table entry links it.
     qhy = {"key": "qhy-sdk", "name": "qhy-sdk", "current": "1", "latest": "2", "compare": "version",
            "check": ("page", "u", "p"), "changelog": "https://www.qhyccd.com/html/prepub/log_en.md", "source": "u"}
