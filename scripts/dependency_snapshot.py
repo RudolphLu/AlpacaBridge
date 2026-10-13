@@ -352,6 +352,10 @@ def pin_sdk_hashes(root: Path) -> None:
     lines.append("  ],")
     lines.append('  "doc_only": [')
     lines.append(",\n".join(f"    {json.dumps(p)}" for p in table["doc_only"]))
+    if "documents" in table:  # upstream documents scripts/dependency_updates.py watches
+        lines.append("  ],")
+        lines.append('  "documents": [')
+        lines.append(",\n".join(f"    {json.dumps(d)}" for d in table["documents"]))
     lines.append("  ]")
     lines.append("}")
     (root / TABLE).write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -475,6 +479,10 @@ def check_drift(root: Path) -> list[str]:
     for path, steps in WORKFLOW_TOOL_STEPS.items():
         if (root / path).is_file():
             errors += parse_step_pins((root / path).read_text(encoding="utf-8"), path, steps)[1]
+    for d in table.get("documents", []):
+        if d.get("path") and not (root / d["path"]).exists():
+            errors.append(f"{TABLE}: document {d['name']!r} points at {d['path']}, which does not exist: "
+                          "fix its 'path' or remove the entry")
     if (root / CONFORMU_DOC).is_file():
         errors += parse_conformu((root / CONFORMU_DOC).read_text(encoding="utf-8"))[1]
     return errors
@@ -649,9 +657,21 @@ def self_test() -> int:
         subprocess.run(["git", "-C", d, "add", "-A"], check=True)
         errs = check_drift(r)
         assert len(errs) == 2 and all("no sha256 pin" in e for e in errs), errs
+        t = json.loads((r / TABLE).read_text())
+        t["documents"] = [{"name": "b-doc", "path": f"{EXTERNAL}/B/doc.md",
+                           "check": {"provider": "hash", "url": "https://example.test/b.pdf"}, "baseline": "00"}]
+        (r / TABLE).write_text(json.dumps(t))
+        (r / EXTERNAL / "B/doc.md").write_text("doc")
         pin_sdk_hashes(r)
         assert check_drift(r) == [], check_drift(r)
-        pinned = json.loads((r / TABLE).read_text())["sdks"][0]["sha256"]
+        assert json.loads((r / TABLE).read_text())["documents"] == t["documents"], "--pin keeps documents"
+        (r / EXTERNAL / "B/doc.md").unlink()
+        errs = check_drift(r)
+        assert len(errs) == 1 and "b-doc" in errs[0] and f"{EXTERNAL}/B/doc.md" in errs[0], errs
+        t = json.loads((r / TABLE).read_text())
+        del t["documents"]
+        (r / TABLE).write_text(json.dumps(t))
+        pinned = t["sdks"][0]["sha256"]
         assert re.fullmatch(r"[0-9a-f]{64}", pinned) and pinned == tree_digest(r, f"{EXTERNAL}/A/sdk-1")
         (r / EXTERNAL / "A/sdk-1/lib/liba.so.1.0").write_bytes(b"swapped")
         errs = check_drift(r)

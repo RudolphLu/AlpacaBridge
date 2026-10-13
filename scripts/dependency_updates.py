@@ -4,18 +4,23 @@
 The dependencies are the ones scripts/dependency_snapshot.py submits to the dependency
 graph, so there is one inventory. What is checked:
 
-- every ``pkg:github/OWNER/REPO@VERSION`` entry (cppcheck, zizmor, nlohmann/json, ConformU):
-  the repository's latest GitHub release, or its highest version tag when it has no releases;
-- every SDK in scripts/dependency_sdk_versions.json with an ``updates`` block
-  (``{"provider": "release-page", "url": ..., "pattern": ...}``): the highest version the
-  pattern's first group matches on that page.
+- every ``pkg:github/OWNER/REPO@VERSION`` entry (cppcheck, zizmor, OSV-Scanner, nlohmann/json,
+  ConformU): the repository's latest GitHub release, or its highest version tag without one;
+- every SDK in scripts/dependency_sdk_versions.json, through its ``updates`` block: provider
+  ``release-page`` (the highest version a regex matches on a page) or ``json`` (a field of the
+  matching entry in a JSON list, ZWO's SDK endpoint);
+- every entry in that file's ``documents`` list (protocol documents, the INDI sources drivers
+  were derived from, the ConformU beta build): provider ``github-file`` (the newest commit on a
+  file), ``hash`` (sha256 of the document, or of an HTML page's visible text) or ``page`` (the
+  highest version a regex matches), against the recorded ``baseline``.
 
 Debian, Ubuntu and docker entries are not checked: apt and the image tag already resolve to
 the newest package at build time, and .github/workflows/osv-scan.yml reports their
 vulnerabilities. An SDK with no ``updates`` block is listed as a manual check.
 
 Issues (state lives in a marker comment in each issue body; nothing is committed):
-- a newer version opens "Update <name> <current> -> <latest>" (dependencies, enhancement, P4);
+- a newer version opens "Update <name> <current> -> <latest>" (dependencies, enhancement, P4),
+  and a changed document "Upstream document changed: <name> ..." (dependencies, documentation, P4);
   a still newer one retitles it with a comment; the repository reaching it closes it;
 - a source that cannot be read opens "Update check broken: <name>" (dependencies, bug, P4),
   closed when the source reads again, so a changed page is never mistaken for "no update".
@@ -32,6 +37,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gzip
+import hashlib
+import html
 import io
 import json
 import os
@@ -39,6 +47,7 @@ import re
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Callable
@@ -51,13 +60,15 @@ MARKER = "dependency-updates"
 MARKER_RE = re.compile(r"<!-- " + MARKER + r": (\{.*?\}) -->")
 UPDATE_LABELS = ("dependencies", "enhancement", "P4")
 BROKEN_LABELS = ("dependencies", "bug", "P4")
+DOC_LABELS = ("dependencies", "documentation", "P4")
 OSV_LABELS = ("dependencies", "bug", "P2")
 TAG_PAGES = 10
 LIST_LIMIT = 5000  # issues read back for their markers; the OSV dedupe needs closed ones too
-OSV_THRESHOLD = 7.0
-OSV_MAX_ROWS = 100  # rows per summary issue; keeps the body far below GitHub's 65536 characters  # CVSS: High is 7.0-8.9, Critical 9.0-10.0
+OSV_THRESHOLD = 7.0  # CVSS: High is 7.0-8.9, Critical 9.0-10.0
+OSV_MAX_ROWS = 100  # rows per summary issue; keeps the body far below GitHub's 65536 characters
 
 HttpGet = Callable[[str], str]
+Fetch = Callable[[str], "tuple[bytes, str]"]  # url -> (body, content type)
 
 
 class FetchError(Exception):
@@ -66,7 +77,7 @@ class FetchError(Exception):
 
 def parse_version(v: str) -> tuple[tuple[int, ...], bool]:
     """(numeric parts, is a pre-release) for '3.11.3', 'v1.25.2', '4.5.1-beta', '2.3'."""
-    m = re.match(r"^v?(\d+(?:\.\d+)*)(.*)$", v.strip())
+    m = re.match(r"^[vV]?(\d+(?:\.\d+)*)(.*)$", v.strip())
     if not m:
         raise ValueError(f"not a version: {v!r}")
     parts = tuple(int(x) for x in m.group(1).split("."))
@@ -92,18 +103,27 @@ def highest(versions: list[str]) -> str | None:
     return max(stable)[1] if stable else None
 
 
-def http_get(url: str) -> str:
-    headers = {"User-Agent": "alpacabridge-dependency-updates"}
+def http_fetch(url: str) -> tuple[bytes, str]:
+    """(body, content type). A gzip body is decompressed: urllib does not, and some vendor
+    sites send one even unasked."""
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; alpacabridge-dependency-updates)"}
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if token and url.startswith("https://api.github.com/"):
         headers["Authorization"] = f"Bearer {token}"
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as r:
-            return r.read().decode("utf-8", errors="replace")
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=120) as r:
+            body, ctype = r.read(), r.headers.get("Content-Type", "")
+            if r.headers.get("Content-Encoding", "").lower() == "gzip":
+                body = gzip.decompress(body)
+            return body, ctype
     except urllib.error.HTTPError as e:
         raise FetchError(f"HTTP {e.code} from {url}") from e
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         raise FetchError(f"{url}: {e}") from e
+
+
+def http_get(url: str) -> str:
+    return http_fetch(url)[0].decode("utf-8", errors="replace")
 
 
 def latest_github(repo: str, get: HttpGet) -> str:
@@ -136,6 +156,46 @@ def latest_github(repo: str, get: HttpGet) -> str:
     return best
 
 
+def latest_json(url: str, path: str, match: dict, field: str, get: HttpGet) -> str:
+    """The ``field`` of the entry matching ``match`` in the list at dotted ``path`` (ZWO's SDK list)."""
+    node = json.loads(get(url))
+    try:
+        for seg in path.split("."):
+            node = node[int(seg)] if seg.isdigit() else node[seg]
+    except (KeyError, IndexError, TypeError) as e:
+        raise FetchError(f"{url}: no {path!r} in the response (has the format changed?)") from e
+    for entry in node if isinstance(node, list) else []:
+        if isinstance(entry, dict) and all(entry.get(k) == v for k, v in match.items()):
+            if field in entry and highest([str(entry[field])]):
+                return str(entry[field])
+            raise FetchError(f"{url}: entry {match} has no version in {field!r}")
+    raise FetchError(f"{url}: no entry matches {match} (has the list changed?)")
+
+
+def latest_file_commit(repo: str, path: str, get: HttpGet) -> str:
+    """The newest commit on the default branch that touched ``path``."""
+    commits = json.loads(get(f"https://api.github.com/repos/{repo}/commits?path={urllib.parse.quote(path)}&per_page=1"))
+    if not commits:
+        raise FetchError(f"{repo}: no commit touches {path} (moved or deleted?)")
+    return commits[0]["sha"]
+
+
+def normalised_text(html_text: str) -> str:
+    """Visible text of an HTML page: no scripts, styles, comments or tags, whitespace collapsed."""
+    t = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", html_text)
+    t = re.sub(r"(?s)<!--.*?-->", " ", t)
+    t = re.sub(r"(?s)<[^>]+>", " ", t)
+    return re.sub(r"\s+", " ", html.unescape(t)).strip()
+
+
+def content_hash(url: str, fetch: Fetch) -> str:
+    """sha256 of a document: its bytes, or for an HTML page its normalised visible text."""
+    body, ctype = fetch(url)
+    if "html" in ctype.lower():
+        body = normalised_text(body.decode("utf-8", errors="replace")).encode("utf-8")
+    return hashlib.sha256(body).hexdigest()
+
+
 def latest_page(url: str, pattern: str, get: HttpGet) -> str:
     best = highest(re.findall(pattern, get(url)))
     if not best:
@@ -144,7 +204,11 @@ def latest_page(url: str, pattern: str, get: HttpGet) -> str:
 
 
 def targets(snap: dict, table: dict) -> tuple[list[dict], list[str]]:
-    """(checkable dependencies, names of SDKs left to a manual check)."""
+    """(checkable dependencies, names of SDKs with no update source).
+
+    Each target has ``compare``: "version" (an update is a higher version) or "equal" (a
+    document: a commit SHA or content hash that differs from the recorded baseline).
+    """
     out: dict[str, dict] = {}
     for path, man in snap["manifests"].items():
         for purl in man["resolved"]:
@@ -152,29 +216,72 @@ def targets(snap: dict, table: dict) -> tuple[list[dict], list[str]]:
             if m:
                 repo, ver = m.groups()
                 out.setdefault(repo.lower(), {"key": repo.lower(), "name": repo, "current": ver, "where": path,
-                                              "check": ("github", repo), "source": f"https://github.com/{repo}/releases"})
+                                              "check": ("github", repo), "source": f"https://github.com/{repo}/releases",
+                                              "compare": "version", "document": False})
     manual = []
     for e in table["sdks"]:
-        up = e.get("updates")
-        if up and up.get("provider") == "release-page" and e.get("version"):
-            out.setdefault(e["name"], {"key": e["name"], "name": e["name"], "current": e["version"],
-                                       "where": snapshot.TABLE, "check": ("page", up["url"], up["pattern"]),
-                                       "source": up["url"]})
+        up = e.get("updates") or {}
+        base = {"key": e["name"], "name": e["name"], "current": e.get("version"), "where": snapshot.TABLE,
+                "source": up.get("url", ""), "compare": "version", "document": False}
+        if up.get("provider") == "release-page" and e.get("version"):
+            out.setdefault(e["name"], {**base, "check": ("page", up["url"], up["pattern"])})
+        elif up.get("provider") == "json" and e.get("version"):
+            out.setdefault(e["name"], {**base, "check": ("json", up["url"], up["path"], up["match"], up["field"])})
         else:
             manual.append(e["name"])
+    for d in table.get("documents", []):
+        c = d["check"]
+        base = {"key": "doc:" + d["name"], "name": d["name"], "current": d["baseline"], "where": snapshot.TABLE,
+                "document": True, "path": d.get("path")}
+        if c["provider"] == "github-file":
+            out["doc:" + d["name"]] = {**base, "check": ("github-file", c["repo"], c["file"]), "compare": "equal",
+                                       "source": f"https://github.com/{c['repo']}/commits/HEAD/{c['file']}"}
+        elif c["provider"] == "hash":
+            out["doc:" + d["name"]] = {**base, "check": ("hash", c["url"]), "compare": "equal", "source": c["url"]}
+        elif c["provider"] == "page":
+            out["doc:" + d["name"]] = {**base, "check": ("page", c["url"], c["pattern"]), "compare": "version",
+                                       "source": c["url"]}
+        else:
+            manual.append(d["name"])
     return sorted(out.values(), key=lambda t: t["key"]), manual
 
 
-def check(t: dict, get: HttpGet) -> dict:
+def check(t: dict, get: HttpGet, fetch: Fetch | None = None) -> dict:
+    fetch = fetch or http_fetch
     try:
-        parse_version(t["current"])  # a pin that is no version (a commit SHA) is a broken entry
-        if t["check"][0] == "github":
+        if t.get("compare", "version") == "version":
+            parse_version(t["current"])  # a pin that is no version (a commit SHA) is a broken entry
+        kind = t["check"][0]
+        if kind == "github":
             latest = latest_github(t["check"][1], get)
+        elif kind == "json":
+            latest = latest_json(*t["check"][1:], get)
+        elif kind == "github-file":
+            latest = latest_file_commit(t["check"][1], t["check"][2], get)
+        elif kind == "hash":
+            latest = content_hash(t["check"][1], fetch)
         else:
             latest = latest_page(t["check"][1], t["check"][2], get)
         return {**t, "latest": latest, "error": None}
     except (FetchError, KeyError, ValueError, json.JSONDecodeError) as e:
         return {**t, "latest": None, "error": str(e)}
+
+
+def differs(r: dict) -> bool:
+    """True when upstream is ahead of the repository (or, for a document, has changed)."""
+    if r.get("compare") == "equal":
+        return r["latest"] != r["current"]
+    return is_newer(r["latest"], r["current"])
+
+
+def short(v: str) -> str:
+    return v[:12] if re.fullmatch(r"[0-9a-f]{40,64}", v or "") else v
+
+
+def title_of(r: dict) -> str:
+    if r.get("document"):
+        return f"Upstream document changed: {r['name']} {short(r['current'])} -> {short(r['latest'])}"
+    return f"Update {r['name']} {r['current']} -> {r['latest']}"
 
 
 def marker(state: dict) -> str:
@@ -229,6 +336,8 @@ class GhIssues:
 
 
 def update_body(r: dict) -> str:
+    if r.get("document"):
+        return document_body(r)
     return (f"{marker({'kind': 'update', 'key': r['key'], 'version': r['latest'], 'current': r['current']})}\n"
             f"`{r['name']}` has a newer upstream version.\n\n"
             f"| | |\n|---|---|\n| In this repository | `{r['current']}` |\n| Upstream | `{r['latest']}` |\n"
@@ -237,6 +346,18 @@ def update_body(r: dict) -> str:
             "`--pin` digest, see docs/development.md \"Dependency graph\"), check the upstream "
             "changelog, and let CI run. This issue closes by itself once the repository is at "
             "that version.\n\nOpened by `.github/workflows/dependency-updates.yml`.\n")
+
+
+def document_body(r: dict) -> str:
+    local = f"| Local copy | `{r['path']}` |\n" if r.get("path") else ""
+    return (f"{marker({'kind': 'update', 'key': r['key'], 'version': r['latest'], 'current': r['current']})}\n"
+            f"An upstream document a driver is built from has changed: `{r['name']}`.\n\n"
+            f"| | |\n|---|---|\n| Recorded baseline | `{r['current']}` |\n| Upstream now | `{r['latest']}` |\n"
+            f"{local}| Source | {r['source']} |\n\n"
+            "Review what changed upstream against the driver (and refresh the local copy if there is one), "
+            "then set this document's `baseline` in `scripts/dependency_sdk_versions.json` to the upstream "
+            "value above. This issue closes by itself once the baseline matches.\n\n"
+            "Opened by `.github/workflows/dependency-updates.yml`.\n")
 
 
 def broken_body(r: dict) -> str:
@@ -311,11 +432,11 @@ def _reconcile_one(r: dict, issues, by: dict, declined: set, declined_broken: di
         issues.edit_body(declined_broken[r["key"]][0]["number"], resolved_body(*declined_broken[r["key"]]))
         log.append(f"cleared the hand-close of broken-source issue #{declined_broken[r['key']][0]['number']}")
     upd = by.get(("update", r["key"]))
-    newer = is_newer(r["latest"], r["current"])
-    title = f"Update {r['name']} {r['current']} -> {r['latest']}"
+    newer = differs(r)
+    title = title_of(r)
     if newer and not upd:
         if (r["key"], r["latest"], r["current"]) not in declined:
-            issues.create(title, update_body(r), UPDATE_LABELS)
+            issues.create(title, update_body(r), DOC_LABELS if r.get("document") else UPDATE_LABELS)
             log.append(f"opened update issue for {r['name']} {r['latest']}")
     elif newer and upd is not None and (upd[1].get("version"), upd[1].get("current")) != (r["latest"], r["current"]):
         note = (f"Upstream is now at `{r['latest']}`." if upd[1].get("version") != r["latest"]
@@ -538,6 +659,73 @@ def self_test() -> int:
     report["results"][0]["packages"][1]["groups"].append({"ids": ["CVE-2026-5"], "max_severity": "8.1"})
     assert osv_summary(report, f, f.issues, "o/r") and "CVE-2026-5" in f.issues[1]["body"]
     assert "CVE-2026-4" not in f.issues[1]["body"], "only the new finding is listed"
+    # --- SDK and document providers ---
+    assert parse_version("V1.41") == ((1, 41), False) and highest(["2.0.2.1", "2.1.0.1"]) == "2.1.0.1"
+    zwo = "https://zwo.test/sdk"
+    pages[zwo] = json.dumps([{"acf": {"software_downloads": [
+        {"software_download_title": "EAF SDK", "software_version": "V1.8.1"},
+        {"software_download_title": "ASI Camera SDK", "software_version": "V1.41"}]}}])
+    assert latest_json(zwo, "0.acf.software_downloads", {"software_download_title": "ASI Camera SDK"},
+                       "software_version", get) == "V1.41"
+    for path, match in (("0.acf.gone", {"software_download_title": "EAF SDK"}),
+                        ("0.acf.software_downloads", {"software_download_title": "Renamed SDK"})):
+        try:
+            latest_json(zwo, path, match, "software_version", get)
+        except FetchError:
+            pass
+        else:
+            raise AssertionError(f"{path} {match} must be a broken source")
+    pages["https://api.github.com/repos/indilib/indi/commits?path=drivers/x.cpp&per_page=1"] = json.dumps([{"sha": "b" * 40}])
+    pages["https://api.github.com/repos/indilib/indi/commits?path=drivers/gone.cpp&per_page=1"] = "[]"
+    assert latest_file_commit("indilib/indi", "drivers/x.cpp", get) == "b" * 40
+    try:
+        latest_file_commit("indilib/indi", "drivers/gone.cpp", get)
+    except FetchError:
+        pass
+    else:
+        raise AssertionError("a file no commit touches is a broken source")
+    docs = {"https://d.test/a.html": (b"<html><script>var t=1;</script><p>Cmd  :GR#</p><!-- 12:00 --></html>", "text/html"),
+            "https://d.test/b.html": (b"<html><script>var t=2;</script><p>Cmd\n:GR#</p><!-- 12:01 --></html>", "text/html"),
+            "https://d.test/c.pdf": (b"%PDF-1", "application/pdf")}
+    fetch = docs.__getitem__
+    assert content_hash("https://d.test/a.html", fetch) == content_hash("https://d.test/b.html", fetch), \
+        "scripts, comments and whitespace do not change an HTML page's hash"
+    assert content_hash("https://d.test/c.pdf", fetch) == hashlib.sha256(b"%PDF-1").hexdigest()
+    pages["https://o.test/dl"] = "Astroasis_Oasis_Focuser_ASCOM_2.1.0.1_Setup.zip Oasis_Focuser_Firmware_Ver_1.4.0.zip"
+    table = {"sdks": [{"name": "zwo-eaf-sdk", "version": "1.7.7",
+                       "updates": {"provider": "json", "url": zwo, "path": "0.acf.software_downloads",
+                                   "match": {"software_download_title": "EAF SDK"}, "field": "software_version"}}],
+             "documents": [
+                 {"name": "indi-x", "check": {"provider": "github-file", "repo": "indilib/indi", "file": "drivers/x.cpp"},
+                  "baseline": "a" * 40},
+                 {"name": "pdf", "path": "AlpacaCore/external/x.md", "check": {"provider": "hash", "url": "https://d.test/c.pdf"},
+                  "baseline": hashlib.sha256(b"%PDF-1").hexdigest()},
+                 {"name": "oasis", "check": {"provider": "page", "url": "https://o.test/dl",
+                                             "pattern": r"Astroasis_Oasis_Focuser_ASCOM_(\d+(?:\.\d+)+)_Setup"},
+                  "baseline": "2.0.2.1"}]}
+    ts, manual = targets({"manifests": {}}, table)
+    assert manual == [] and [t["key"] for t in ts] == ["doc:indi-x", "doc:oasis", "doc:pdf", "zwo-eaf-sdk"], ts
+    results = [check(t, get, fetch) for t in ts]
+    res = {r["key"]: r for r in results}
+    assert all(r["error"] is None for r in results), results
+    assert [k for k in res if differs(res[k])] == ["doc:indi-x", "doc:oasis", "zwo-eaf-sdk"], \
+        "a changed commit, a newer installer and a newer SDK differ; an unchanged hash does not"
+    f = Fake()
+    reconcile(results, f, f.issues)
+    by_title = {i["title"]: i for i in f.issues}
+    assert set(by_title) == {"Upstream document changed: indi-x aaaaaaaaaaaa -> bbbbbbbbbbbb",
+                             "Upstream document changed: oasis 2.0.2.1 -> 2.1.0.1",
+                             "Update zwo-eaf-sdk 1.7.7 -> V1.8.1"}, set(by_title)
+    assert by_title["Upstream document changed: oasis 2.0.2.1 -> 2.1.0.1"]["labels"] == DOC_LABELS
+    assert by_title["Update zwo-eaf-sdk 1.7.7 -> V1.8.1"]["labels"] == UPDATE_LABELS
+    # The baseline is set to upstream in a PR: the document issue closes.
+    table["documents"][0]["baseline"] = "b" * 40
+    ts, _ = targets({"manifests": {}}, table)
+    f.calls.clear()
+    reconcile([check(t, get, fetch) for t in ts], f, f.issues)
+    assert ("close", 1) in f.calls or any(c[0] == "close" for c in f.calls), f.calls
+    assert not [i for i in f.issues if i["state"] == "OPEN" and "indi-x" in i["title"]]
+
     # A large first scan: the issue body stays under GitHub's 65536-character limit, and the
     # findings it could not list stay unreported for the next run instead of failing every day.
     big = {"results": [{"packages": [{"package": {"name": f"lib{n}", "version": "1"},
@@ -606,8 +794,8 @@ def main() -> int:
     print("| Dependency | Repository | Upstream | Status |\n|---|---|---|---|")
     for r in results:
         status = ("source unreadable: " + r["error"]) if r["error"] else (
-            "update available" if is_newer(r["latest"], r["current"]) else "current")
-        print(f"| {r['name']} | {r['current']} | {r['latest'] or '-'} | {status} |")
+            ("changed" if r.get("document") else "update available") if differs(r) else "current")
+        print(f"| {r['name']} | {short(r['current'])} | {short(r['latest'] or '-')} | {status} |")
     for name in manual:
         print(f"| {name} | - | - | manual check (no `updates` source) |")
     log = reconcile(results, issues, issues.list("all"))
