@@ -31,6 +31,8 @@ High/Critical findings (CVSS >= 7.0) no earlier summary issue reported.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -124,6 +126,9 @@ def latest_github(repo: str, get: HttpGet) -> str:
         tags += batch
         if len(batch) < 100:
             break
+    else:
+        print(f"warning: {repo}: read only the first {TAG_PAGES * 100} tags; a higher version "
+              "may be beyond them", file=sys.stderr)
     best = highest(tags)
     if not best:
         raise FetchError(f"{repo}: no release and no version tag")
@@ -248,8 +253,9 @@ def reconcile(results: list[dict], issues, all_issues: list[dict]) -> list[str]:
     """Open, retitle and close issues so they match results. Returns one line per action.
 
     all_issues holds open and closed issues. A closed update issue whose marker is not
-    ``resolved`` was closed by a maintainer ("won't bump"), so that version is skipped until
-    upstream releases a newer one. An open issue for a dependency no longer in results closes.
+    ``resolved`` was closed by a maintainer ("won't bump"), so that (current, latest) pair is
+    skipped until upstream releases a newer version or the repository moves (a "Closes #N" PR
+    that bumped only part of the way). An open issue for a dependency no longer in results closes.
     """
     by, declined = {}, set()
     for i in all_issues:
@@ -259,7 +265,7 @@ def reconcile(results: list[dict], issues, all_issues: list[dict]) -> list[str]:
         if i.get("state", "OPEN").upper() == "OPEN":
             by[(st["kind"], st["key"])] = (i, st)
         elif st["kind"] == "update" and not st.get("resolved"):
-            declined.add((st["key"], st.get("version")))
+            declined.add((st["key"], st.get("version"), st.get("current")))
     log = []
     for r in results:
         broken = by.get(("broken", r["key"]))
@@ -276,7 +282,7 @@ def reconcile(results: list[dict], issues, all_issues: list[dict]) -> list[str]:
         newer = is_newer(r["latest"], r["current"])
         title = f"Update {r['name']} {r['current']} -> {r['latest']}"
         if newer and not upd:
-            if (r["key"], r["latest"]) in declined:
+            if (r["key"], r["latest"], r["current"]) in declined:
                 continue
             issues.create(title, update_body(r), UPDATE_LABELS)
             log.append(f"opened update issue for {r['name']} {r['latest']}")
@@ -360,6 +366,14 @@ def self_test() -> int:
     pages["https://api.github.com/repos/g/h/tags?per_page=100"] = json.dumps([{"name": f"0.{i}"} for i in range(100)])
     pages["https://api.github.com/repos/g/h/tags?per_page=100&page=2"] = json.dumps([{"name": "3.0"}])
     assert latest_github("g/h", get) == "3.0", "tags on page 2 are read"
+    # Every page full: the cap is reported, not silent.
+    for page in range(1, TAG_PAGES + 1):
+        pages[f"https://api.github.com/repos/m/n/tags?per_page=100" + (f"&page={page}" if page > 1 else "")] = \
+            json.dumps([{"name": f"{page}.{i}"} for i in range(100)])
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        assert latest_github("m/n", get) == f"{TAG_PAGES}.99"
+    assert "first 1000 tags" in err.getvalue(), err.getvalue()
     assert latest_page("https://k.org/gpiod/", r"libgpiod-(\d[\d.]*\d)\.tar\.xz", get) == "2.3.1"
 
     snap = {"manifests": {"ci.yml": {"resolved": {"pkg:github/a/b@v1.0.0": {}, "pkg:deb/ubuntu/x?arch=arm64": {}}},
@@ -441,6 +455,15 @@ def self_test() -> int:
     f.calls.clear()
     reconcile([check(t, get) for t in ts], f, f.issues)
     assert f.calls == [], "a hand-closed issue for this version is not reopened"
+    # A "Closes #N" PR that bumps only part of the way also closes the issue without the
+    # resolved flag; the repository moved, so the remaining gap is reported again.
+    snap["manifests"]["ci.yml"]["resolved"] = {"pkg:github/a/b@v1.5.0": {}}
+    ts, _ = targets(snap, table)
+    reconcile([check(t, get) for t in ts], f, f.issues)
+    assert ("create", "Update a/b v1.5.0 -> v2.1.0") in f.calls, f.calls
+    [i for i in f.issues if i["title"] == "Update a/b v1.5.0 -> v2.1.0"][0]["state"] = "CLOSED"
+    snap["manifests"]["ci.yml"]["resolved"] = {"pkg:github/a/b@v1.0.0": {}}
+    ts, _ = targets(snap, table)
     pages["https://api.github.com/repos/a/b/releases/latest"] = json.dumps({"tag_name": "v2.2.0"})
     reconcile([check(t, get) for t in ts], f, f.issues)
     assert ("create", "Update a/b v1.0.0 -> v2.2.0") in f.calls, f.calls
