@@ -4,7 +4,8 @@
 # `apt-get satisfy`, so every package is at the exact version a user gets; the
 # SBOM cannot be scanned as is, because its runtime entries carry only `>=`
 # constraints. Findings go to Security > Code scanning; new High/Critical ones
-# also open one summary issue (scripts/dependency_updates.py --osv-summary).
+# that Debian has fixed in trixie (and does not rate unimportant) also open one
+# summary issue (scripts/dependency_updates.py --osv-summary).
 # Vendored SDKs have no advisory source and are not covered.
 
 name: OSV scan
