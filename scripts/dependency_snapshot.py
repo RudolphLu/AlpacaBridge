@@ -149,7 +149,7 @@ def parse_apt_installs(text: str) -> set[str]:
     names: set[str] = set()
     lines = text.splitlines()
     for i, line in enumerate(lines):
-        if "apt-get install" not in line:
+        if "apt-get install" not in line or line.lstrip().startswith("#"):
             continue
         words = line.split("apt-get install", 1)[1].split()
         while line.rstrip().endswith("\\") and i + 1 < len(lines):
@@ -512,6 +512,8 @@ def self_test() -> int:
                                     "pkg:github/zizmorcore/zizmor@v1.25.2", *apt], (tools, errs)
     assert "cmake" in parse_apt_installs(ci) and "-y" not in parse_apt_installs(ci)
     assert "echo" not in parse_apt_installs(ci), "a continuation ends at a line without a backslash"
+    # A commented-out install is not an install.
+    assert parse_apt_installs("    # sudo apt-get install -y nodejs\n") == set()
     # The install command ends at a shell separator: a name after && or ; is not installed.
     for sep in (" && echo nodejs", "; echo nodejs", " | tee nodejs"):
         line = f"sudo apt-get install -y gcovr{sep}\n"

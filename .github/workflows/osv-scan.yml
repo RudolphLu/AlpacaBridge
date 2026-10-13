@@ -72,12 +72,14 @@ jobs:
 
       - name: Scan
         # Exit 1 means findings, which is the expected result here, not a
-        # failure; 127 (error) and 128 (no packages found) fail the job.
+        # failure; 127 (error) and 128 (no packages found) fail the job. The
+        # default shell is `bash -e`, so the exit code is caught with `||`,
+        # never read from `$?` after a bare command.
         run: |
           set -uo pipefail
           for fmt in sarif json; do
-            osv-scanner scan image --archive osv-target.tar --format "${fmt}" > "osv.${fmt}"
-            rc=$?
+            rc=0
+            osv-scanner scan image --archive osv-target.tar --format "${fmt}" > "osv.${fmt}" || rc=$?
             if [ "${rc}" -ne 0 ] && [ "${rc}" -ne 1 ]; then
               echo "osv-scanner --format ${fmt} exited ${rc}" >&2
               exit "${rc}"
@@ -94,4 +96,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: python3 scripts/dependency_updates.py --osv-summary osv.json | tee -a "${GITHUB_STEP_SUMMARY}"
+        # pipefail: the default `bash -e` would let tee hide a failed script.
+        run: |
+          set -o pipefail
+          python3 scripts/dependency_updates.py --osv-summary osv.json | tee -a "${GITHUB_STEP_SUMMARY}"

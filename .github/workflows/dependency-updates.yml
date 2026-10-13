@@ -36,4 +36,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: python3 scripts/dependency_updates.py | tee -a "${GITHUB_STEP_SUMMARY}"
+        # pipefail: the default `bash -e` would let tee hide a failed script,
+        # such as an issue the API refused to open.
+        run: |
+          set -o pipefail
+          python3 scripts/dependency_updates.py | tee -a "${GITHUB_STEP_SUMMARY}"

@@ -50,6 +50,7 @@ MARKER_RE = re.compile(r"<!-- " + MARKER + r": (\{.*?\}) -->")
 UPDATE_LABELS = ("dependencies", "enhancement", "P4")
 BROKEN_LABELS = ("dependencies", "bug", "P4")
 OSV_LABELS = ("dependencies", "bug", "P2")
+TAG_PAGES = 10
 OSV_THRESHOLD = 7.0  # CVSS: High is 7.0-8.9, Critical 9.0-10.0
 
 HttpGet = Callable[[str], str]
@@ -109,7 +110,19 @@ def latest_github(repo: str, get: HttpGet) -> str:
     except FetchError as e:
         if "HTTP 404" not in str(e):
             raise
-    tags = [t["name"] for t in json.loads(get(f"https://api.github.com/repos/{repo}/tags?per_page=100"))]
+    # /tags is ordered by ref, not by version, so read every page (up to TAG_PAGES).
+    tags: list[str] = []
+    for page in range(1, TAG_PAGES + 1):
+        url = f"https://api.github.com/repos/{repo}/tags?per_page=100" + (f"&page={page}" if page > 1 else "")
+        try:
+            batch = [t["name"] for t in json.loads(get(url))]
+        except FetchError as e:
+            if page > 1 and "HTTP 404" in str(e):
+                break
+            raise
+        tags += batch
+        if len(batch) < 100:
+            break
     best = highest(tags)
     if not best:
         raise FetchError(f"{repo}: no release and no version tag")
@@ -203,7 +216,7 @@ class GhIssues:
 
 
 def update_body(r: dict) -> str:
-    return (f"{marker({'kind': 'update', 'key': r['key'], 'version': r['latest']})}\n"
+    return (f"{marker({'kind': 'update', 'key': r['key'], 'version': r['latest'], 'current': r['current']})}\n"
             f"`{r['name']}` has a newer upstream version.\n\n"
             f"| | |\n|---|---|\n| In this repository | `{r['current']}` |\n| Upstream | `{r['latest']}` |\n"
             f"| Pinned in | `{r['where']}` |\n| Source | {r['source']} |\n\n"
@@ -246,9 +259,11 @@ def reconcile(results: list[dict], issues, open_issues: list[dict]) -> list[str]
         if newer and not upd:
             issues.create(title, update_body(r), UPDATE_LABELS)
             log.append(f"opened update issue for {r['name']} {r['latest']}")
-        elif newer and upd is not None and upd[1].get("version") != r["latest"]:
-            issues.update(upd[0]["number"], title, update_body(r), f"Upstream is now at `{r['latest']}`.")
-            log.append(f"retitled #{upd[0]['number']} to {r['latest']}")
+        elif newer and upd is not None and (upd[1].get("version"), upd[1].get("current")) != (r["latest"], r["current"]):
+            note = (f"Upstream is now at `{r['latest']}`." if upd[1].get("version") != r["latest"]
+                    else f"The repository is now at `{r['current']}`, still behind `{r['latest']}`.")
+            issues.update(upd[0]["number"], title, update_body(r), note)
+            log.append(f"retitled #{upd[0]['number']} to {r['current']} -> {r['latest']}")
         elif not newer and upd is not None:
             issues.close(upd[0]["number"], f"The repository is now at `{r['current']}`; "
                                            f"upstream latest is `{r['latest']}`.")
@@ -280,11 +295,11 @@ def osv_summary(report: dict, issues, all_issues: list[dict], repo: str) -> list
         st = read_marker(i.get("body", ""))
         if st and st.get("kind") == "osv":
             reported.update(st.get("ids", []))
-    new = [f for f in osv_findings(report) if f["id"] not in reported]
+    new = [f for f in osv_findings(report) if not reported.intersection(f["ids"])]
     if not new:
         return []
     rows = "\n".join(f"| {f['severity']:.1f} | `{f['package']}` {f['version']} | {', '.join(f['ids'])} |" for f in new)
-    body = (f"{marker({'kind': 'osv', 'ids': sorted(f['id'] for f in new)})}\n"
+    body = (f"{marker({'kind': 'osv', 'ids': sorted({i for f in new for i in f['ids']})})}\n"
             f"The OSV scan of the nightly `.deb`'s installed runtime packages (Debian trixie) found "
             f"{len(new)} new High or Critical finding(s):\n\n| CVSS | Package | Advisories |\n|---|---|---|\n"
             f"{rows}\n\nAll findings, including lower and unscored ones, are under "
@@ -314,6 +329,10 @@ def self_test() -> int:
 
     assert latest_github("a/b", get) == "v2.0.0"
     assert latest_github("c/d", get) == "1.10", "no releases: highest version tag"
+    # /tags is not sorted by version: a later page can hold the highest one.
+    pages["https://api.github.com/repos/g/h/tags?per_page=100"] = json.dumps([{"name": f"0.{i}"} for i in range(100)])
+    pages["https://api.github.com/repos/g/h/tags?per_page=100&page=2"] = json.dumps([{"name": "3.0"}])
+    assert latest_github("g/h", get) == "3.0", "tags on page 2 are read"
     assert latest_page("https://k.org/gpiod/", r"libgpiod-(\d[\d.]*\d)\.tar\.xz", get) == "2.3.1"
 
     snap = {"manifests": {"ci.yml": {"resolved": {"pkg:github/a/b@v1.0.0": {}, "pkg:deb/ubuntu/x?arch=arm64": {}}},
@@ -370,6 +389,12 @@ def self_test() -> int:
     assert ("update", 1, "Update a/b v1.0.0 -> v2.1.0") in f.calls, f.calls
     assert ("close", 2) in f.calls, "the broken source reads again: its issue closes"
     assert not any(c[0] == "create" for c in f.calls), f.calls
+    # The repository bumps to an intermediate release still behind upstream: the title follows.
+    snap["manifests"]["ci.yml"]["resolved"] = {"pkg:github/a/b@v2.0.0": {}}
+    ts, _ = targets(snap, table)
+    f.calls.clear()
+    reconcile([check(t, get) for t in ts], f, f.open())
+    assert ("update", 1, "Update a/b v2.0.0 -> v2.1.0") in f.calls, f.calls
     # The repository catches up: the update issue closes.
     snap["manifests"]["ci.yml"]["resolved"] = {"pkg:github/a/b@v2.1.0": {}}
     ts, _ = targets(snap, table)
@@ -392,6 +417,9 @@ def self_test() -> int:
     assert "CVE-2026-2" not in f.issues[0]["body"] and "DEBIAN-CVE-2026-3" not in f.issues[0]["body"]
     f.issues[0]["state"] = "CLOSED"
     assert osv_summary(report, f, f.issues, "o/r") == [], "findings already reported, even in a closed issue"
+    # OSV adds an alias that sorts first: still the same, already reported finding.
+    report["results"][0]["packages"][0]["groups"][0]["ids"].append("AAA-2026-1")
+    assert osv_summary(report, f, f.issues, "o/r") == [], "a reported group matched on any of its ids"
     report["results"][0]["packages"][1]["groups"].append({"ids": ["CVE-2026-5"], "max_severity": "8.1"})
     assert osv_summary(report, f, f.issues, "o/r") and "CVE-2026-5" in f.issues[1]["body"]
     assert "CVE-2026-4" not in f.issues[1]["body"], "only the new finding is listed"
