@@ -476,7 +476,9 @@ public:
             pulse_guiding_end_ = std::chrono::steady_clock::time_point{};
             ra_offset_hours_ = 0.0;
             dec_offset_deg_ = 0.0;
-            clear_last_slew_error_locked();
+            if (!keep_telemetry_caches) {
+                clear_last_slew_error_locked();
+            }
             if (!keep_telemetry_caches) {
                 // open-astro#409: once per REAL connection. The
                 // keep_telemetry_caches=true caller is the "Connected=true

@@ -519,6 +519,60 @@ TEST_CASE("Bisque Telescope Driver - connected slew, sync and MoveAxis refuse no
     driver->set_connected(false);
 }
 
+TEST_CASE("Bisque async slew - completion poll errors are surfaced and valid replies are preserved",
+          "[bisque][telescope][async][slewfailure]") {
+    auto completion_state = std::make_shared<std::atomic<int>>(0);
+    alpacacore::test::FakeMountServer server([completion_state](const std::string& command) {
+        if (command.find("ConnectAndDoNotUnpark") != std::string::npos) return "1#";
+        if (command.find("GetRaDec") != std::string::npos) return "|No error. Error = 0.5.5,20.0#";
+        if (command.find("GetAzAlt") != std::string::npos) return "|No error. Error = 0.100.0,45.0#";
+        if (command.find("IsParked") != std::string::npos) return "|No error. Error = 0.false#";
+        if (command.find("IsSlewComplete") != std::string::npos) {
+            switch (completion_state->load()) {
+                case 0:
+                    return "|No error. Error = 1.IsSlewComplete unavailable#";
+                case 1:
+                    return "|No error. Error = 0.0junk#";
+                case 2:
+                    return "|No error. Error = 0.0#";
+                default:
+                    return "|No error. Error = 0.2#";  // TheSkyX documents non-zero as complete.
+            }
+        }
+        return "|No error. Error = 0.OK#";
+    });
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::bisque::create_bisque_telescope(0, loopback(server.port()));
+    REQUIRE_NOTHROW(driver->set_connected(true));
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(5.5, 20.0));
+
+    // The driver deliberately holds Slewing=true for 8 seconds after dispatch.
+    std::this_thread::sleep_for(std::chrono::milliseconds(8100));
+
+    try {
+        static_cast<void>(driver->get_slewing());
+        FAIL("Expected TheSkyX completion error");
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+        CHECK(std::string(ex.what()).find("TheSkyX error") != std::string::npos);
+    }
+
+    completion_state->store(1);
+    try {
+        static_cast<void>(driver->get_slewing());
+        FAIL("Expected malformed completion error");
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+        CHECK(std::string(ex.what()).find("Failed to parse IsSlewComplete") != std::string::npos);
+    }
+
+    completion_state->store(2);
+    CHECK(driver->get_slewing());
+    completion_state->store(3);
+    CHECK_FALSE(driver->get_slewing());
+    driver->set_connected(false);
+}
+
 // open-astro#727: a TheSkyX that accepts the TCP connect but never answers the handshake
 // must not leave the shared wrapper connected, or every later connect is refused.
 TEST_CASE("Bisque Telescope Driver - handshake timeout releases the wrapper", "[bisque][telescope][unit][connect]") {
