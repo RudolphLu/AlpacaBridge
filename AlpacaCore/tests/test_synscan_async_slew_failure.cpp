@@ -59,6 +59,9 @@ struct FakeSynScanState {
     std::atomic<int> goto_count{0};
     std::atomic<Clock::rep> goto_started{0};
     std::atomic<bool> goto_stopped{false};
+    // The position a precise GOTO landed on; empty until the first one (#1105).
+    std::mutex landed_mutex;
+    std::string landed;
     std::mutex command_mutex;
     std::vector<std::string> commands;
     void record(const std::string& command) {
@@ -97,14 +100,21 @@ alpacacore::test::FakeMountServer::Responder synscan_responder(const std::shared
             case 'e':
             case 'E':
             case 'z':
-            case 'Z':
-                return "12AB0500,20000500#";
+            case 'Z': {
+                std::lock_guard<std::mutex> lock(st->landed_mutex);
+                return st->landed.empty() ? "12AB0500,20000500#" : st->landed;
+            }
             case 'r':
             case 'R':
             case 'b':
             case 'B':
                 if (st->reject_goto.load()) {
                     return "";  // no reply at all: the response timeout fires inside the slew task
+                }
+                if (chunk[0] == 'r' && chunk.size() >= 18) {
+                    // A precise GOTO lands on its aim, so the landing check after it (#1105) sees an arrival.
+                    std::lock_guard<std::mutex> lock(st->landed_mutex);
+                    st->landed = chunk.substr(1, 17) + "#";
                 }
                 st->goto_started.store(Clock::now().time_since_epoch().count());
                 st->goto_stopped.store(false);
