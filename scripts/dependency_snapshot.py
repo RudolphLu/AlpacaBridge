@@ -495,7 +495,7 @@ def check_coverage(root: Path, table: dict) -> list[str]:
     errors = []
     documents = table.get("documents", [])
     libraries = table.get("system_libraries", [])
-    names = {e["name"] for e in table["sdks"]} | {d["name"] for d in documents} | {lib.get("name") for lib in libraries}
+    names = {e["name"] for e in table["sdks"]} | {d["name"] for d in documents} | {lib["name"] for lib in libraries if lib.get("name")}
     # Debian-provided libraries need an upstream to compare and the baseline Debian ships.
     for lib in libraries:
         missing = [k for k in ("name", "repo", "baseline") if not lib.get(k)]

@@ -10,13 +10,18 @@ graph, so there is one inventory. What is checked:
   ``release-page`` (the highest version a regex matches on a page) or ``json`` (a field of the
   matching entry in a JSON list, ZWO's SDK endpoint);
 - every entry in that file's ``documents`` list (protocol documents, the INDI sources drivers
-  were derived from, the ConformU beta build): provider ``github-file`` (the newest commit on a
-  file), ``hash`` (sha256 of the document, or of an HTML page's visible text) or ``page`` (the
-  highest version a regex matches), against the recorded ``baseline``.
+  were derived from, the gphoto2 tool, the ConformU beta build): provider ``github-file`` (the
+  newest commit on a file), ``hash`` (sha256 of the document, or of an HTML page's visible text),
+  ``page`` (the highest version a regex matches) or ``github-release`` (the repository's latest
+  release), against the recorded ``baseline``;
+- every entry in its ``system_libraries`` list (libraries the build takes from Debian, such as
+  libgphoto2 and LibRaw): the upstream repository's latest release against the version Debian
+  trixie ships.
 
-Debian, Ubuntu and docker entries are not checked: apt and the image tag already resolve to
-the newest package at build time, and .github/workflows/osv-scan.yml reports their
-vulnerabilities. An SDK with no ``updates`` block is listed as a manual check.
+Other Debian, Ubuntu and docker entries are not checked: apt and the image tag already resolve
+to the newest package at build time, and .github/workflows/osv-scan.yml reports their
+vulnerabilities. An SDK with no ``updates`` block is listed as a manual check. Update and
+document issues end with a "## Changelog" section when the source has one.
 
 Issues (state lives in a marker comment in each issue body; nothing is committed):
 - a newer version opens "Update <name> <current> -> <latest>" (dependencies, enhancement, P4),
@@ -26,7 +31,9 @@ Issues (state lives in a marker comment in each issue body; nothing is committed
   closed when the source reads again, so a changed page is never mistaken for "no update".
 
 --osv-summary reads osv-scanner JSON and opens one issue (dependencies, bug, P2) listing the
-High/Critical findings (CVSS >= 7.0) no earlier summary issue reported.
+actionable findings no earlier summary issue reported: CVSS >= 7.0, a ``fixed`` version in the
+package's Debian trixie entry, not rated "unimportant" by Debian, one row per advisory and
+source package however many binary packages report it.
 
   dependency_updates.py [--dry-run]            check and update issues (gh, GH_TOKEN, GH_REPO)
   dependency_updates.py --osv-summary FILE [--dry-run]
@@ -418,7 +425,11 @@ def changelog_for(r: dict, get: HttpGet) -> str:
             rel = json.loads(get(f"https://api.github.com/repos/{repo}/releases/tags/{urllib.parse.quote(r['latest'])}"))
             link, text = rel.get("html_url") or link, (rel.get("body") or "").strip()
         except (FetchError, json.JSONDecodeError):
-            link = link or f"https://github.com/{repo}/compare/{r['current']}...{r['latest']}"
+            # Upstream tags may carry a "v" prefix the recorded baseline lacks (libgphoto2: v2.5.34).
+            base = r["current"]
+            if r["latest"][:1] in "vV" and base[:1] not in "vV":
+                base = r["latest"][0] + base
+            link = link or f"https://github.com/{repo}/compare/{base}...{r['latest']}"
     elif kind == "github-file":
         link = f"https://github.com/{r['check'][1]}/compare/{r['current']}...{r['latest']}"
     if r.get("changelog_json"):
@@ -555,14 +566,23 @@ def _reconcile_one(r: dict, issues, by: dict, declined: set, declined_broken: di
     return log
 
 
+OSV_RELEASE = "Debian:13"  # trixie, the release the .deb is built for and the scan image runs
+
+
 def osv_fix(vulns: dict, ids: list[str], ecosystem: str, name: str) -> str | None:
-    """The version that fixes any of ``ids`` in this package's release (``ecosystem``, e.g.
-    "Debian:13"), or None when there is no fix there or Debian rates the issue "unimportant"."""
+    """The version that fixes any of ``ids`` in this package's release, or None when there is no
+    fix there or Debian rates the issue "unimportant".
+
+    A bare "Debian" (or missing) ecosystem means OSV_RELEASE. Debian advisories name the source
+    package; when none of an advisory's entries for the release carries the report's name (a
+    binary name such as libc6), its entries for that release are used.
+    """
+    release = ecosystem if ":" in (ecosystem or "") else OSV_RELEASE
     for vid in ids:
-        for a in (vulns.get(vid) or {}).get("affected") or []:
-            p = a.get("package") or {}
-            if (ecosystem and p.get("ecosystem") != ecosystem) or (name and p.get("name", name) != name):
-                continue
+        entries = [a for a in (vulns.get(vid) or {}).get("affected") or []
+                   if (a.get("package") or {}).get("ecosystem") == release]
+        named = [a for a in entries if (a.get("package") or {}).get("name") == name] or entries
+        for a in named:
             if (a.get("ecosystem_specific") or {}).get("urgency") == "unimportant":
                 continue
             for r in a.get("ranges") or []:
@@ -575,7 +595,7 @@ def osv_fix(vulns: dict, ids: list[str], ecosystem: str, name: str) -> str | Non
 def osv_findings(report: dict) -> list[dict]:
     """Actionable High/Critical findings from osv-scanner --format json: max_severity >=
     OSV_THRESHOLD and a fixed version in the package's own release. One finding per advisory
-    group, however many binary packages of the same source report it."""
+    group and source package, however many binary packages of that source report it."""
     found: list[dict] = []
     for res in report.get("results") or []:
         for p in res.get("packages") or []:
@@ -592,7 +612,7 @@ def osv_findings(report: dict) -> list[dict]:
                 fixed = osv_fix(vulns, ids, pkg.get("ecosystem", ""), pkg.get("name", ""))
                 if fixed is None:
                     continue
-                same = next((f for f in found if set(f["ids"]) & set(ids)), None)
+                same = next((f for f in found if f["package"] == pkg.get("name", "?") and set(f["ids"]) & set(ids)), None)
                 if same:
                     same["ids"] = sorted(set(same["ids"]) | set(ids))
                     continue
@@ -813,7 +833,7 @@ def self_test() -> int:
     f = Fake()
     assert osv_summary(report, f, f.issues, "o/r") and len(f.issues) == 1 and f.issues[0]["labels"] == OSV_LABELS
     body = f.issues[0]["body"]
-    assert body.count("CVE-2026-1,") == 1 or body.count("| 9.8 |") == 1, "one row per advisory, not per binary package"
+    assert body.count("| 9.8 |") == 1, "one row per advisory, not per binary package"
     for absent in ("DEBIAN-CVE-2019-1010022", "DEBIAN-CVE-2026-97399", "DEBIAN-CVE-2026-6", "DEBIAN-CVE-2026-2",
                    "DEBIAN-CVE-2026-3"):
         assert absent not in body, absent
@@ -828,6 +848,20 @@ def self_test() -> int:
         vuln("DEBIAN-CVE-2026-5", {"Debian:13": "8.14.1-2+deb13u3"}, name="curl"))
     assert osv_summary(report, f, f.issues, "o/r") and "DEBIAN-CVE-2026-5" in f.issues[1]["body"]
     assert "DEBIAN-CVE-2026-4" not in f.issues[1]["body"], "only the new finding is listed"
+    # The report's own spelling may differ from the advisory's: a bare "Debian" ecosystem, or a binary
+    # package name where Debian advisories name the source package. Neither drops the finding.
+    odd = {"results": [{"packages": [
+        {"package": {"name": "libc6", "version": "2.41-12", "ecosystem": "Debian"},
+         "groups": [{"ids": ["DEBIAN-CVE-2026-7"], "max_severity": "9.1"}],
+         "vulnerabilities": [vuln("DEBIAN-CVE-2026-7", fixed13)]}]}]}
+    assert [x["id"] for x in osv_findings(odd)] == ["DEBIAN-CVE-2026-7"], osv_findings(odd)
+    # The same CVE in two different source packages (a library and a copy bundled elsewhere) stays
+    # two findings, each with its own fixed version.
+    two = {"results": [{"packages": [
+        pkg("curl", [{"ids": ["CVE-2026-8"], "max_severity": "8.0"}], [{**vuln("CVE-2026-8", {"Debian:13": "1-1"}, name="curl")}]),
+        pkg("libcurl-bundler", [{"ids": ["CVE-2026-8"], "max_severity": "8.0"}],
+            [vuln("CVE-2026-8", {"Debian:13": "9-9"}, name="libcurl-bundler")])]}]}
+    assert sorted((x["package"], x["fixed"]) for x in osv_findings(two)) == [("curl", "1-1"), ("libcurl-bundler", "9-9")]
     # A marker from the first summary format (kind "osv", #1135) does not suppress a finding.
     g = Fake()
     g.issues.append({"number": 1, "title": "old", "state": "CLOSED",
@@ -975,7 +1009,7 @@ def self_test() -> int:
     assert "Nikon Z8 support" in f.issues[0]["body"] and "## Changelog" in f.issues[0]["body"]
     # No release notes (tag only): a compare link; a failing lookup: no section, the issue still opens.
     tag_only = {**lib, "latest": "v9.9.9"}
-    assert "compare/2.5.31...v9.9.9" in changelog_for(tag_only, get)
+    assert "compare/v2.5.31...v9.9.9" in changelog_for(tag_only, get), "the baseline takes upstream's v prefix"
     f = Fake()
     reconcile([tag_only], f, f.issues, notes=lambda r: 1 / 0)
     assert len(f.issues) == 1 and "## Changelog" not in f.issues[0]["body"]

@@ -374,8 +374,9 @@ Each `sdks` entry also carries a `sha256` pin: a digest of the git-tracked files
 
 1. an SDK in `sdks` has no `updates` block;
 2. a docs-only directory has neither a `documents` entry whose `path` is under it nor a `no_upstream` entry giving the reason (for example the ASIAIR Plus udev rules, written in this repository);
-3. a directory under `AlpacaCore/src/vendors/` is not in `vendors`, which maps each vendor to the SDK and document names it is built from (`tracked`) or to a `no_upstream` reason (gphoto: Debian packages; weewx: a feed the user configures), or `vendors` names an SDK, document or directory that does not exist;
+3. a directory under `AlpacaCore/src/vendors/` is not in `vendors`, which maps each vendor to the SDK and document names it is built from (`tracked`) or to a `no_upstream` reason (weewx: a feed the user configures), or `vendors` names an SDK, document or directory that does not exist;
 4. a workflow step pins a tool with `ver=` that `CI_TOOL_STEPS` or `WORKFLOW_TOOL_STEPS` does not list.
+5. a `system_libraries` entry has no upstream `repo` or no `baseline`.
 
 So a new vendor, SDK, protocol folder or pinned tool cannot merge without an update check, or a stated reason why it has none. Each failure names the file and the entry to add.
 
