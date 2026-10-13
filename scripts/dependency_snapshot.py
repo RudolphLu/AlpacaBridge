@@ -40,6 +40,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TABLE = "scripts/dependency_sdk_versions.json"
 EXTERNAL = "AlpacaCore/external"
+VENDORS = "AlpacaCore/src/vendors"
 DEB_QUALIFIERS = "arch=arm64&distro=trixie"
 # Package directories holding vendor binaries and firmware copied from AlpacaCore/external/.
 SHIPPED_VENDOR_DIRS = ("usr/lib/alpacabridge", "usr/lib/firmware")
@@ -108,7 +109,7 @@ def parse_fetchcontent(text: str) -> list[tuple[str, str]]:
 
 def _step_block(text: str, step: str) -> str | None:
     """The body of the workflow step named ``step``, up to the next ``- name:``."""
-    m = re.search(rf"^\s*- name: {re.escape(step)}\s*$(.*?)(?=^\s*- name:|\Z)", text, re.M | re.S)
+    m = re.search(rf"^\s*- name: [\"']?{re.escape(step)}[\"']?\s*$(.*?)(?=^\s*- name:|\Z)", text, re.M | re.S)
     return m.group(1) if m else None
 
 
@@ -344,16 +345,19 @@ def pin_sdk_hashes(root: Path) -> None:
     table = json.loads((root / TABLE).read_text(encoding="utf-8"))
     for e in table["sdks"]:
         e["sha256"] = tree_digest(root, e["path"])
-    lines = ["{"]
-    if "_comment" in table:
-        lines.append(f'  "_comment": {json.dumps(table["_comment"])},')
-    lines.append('  "sdks": [')
-    lines.append(",\n".join(f"    {json.dumps(e)}" for e in table["sdks"]))
-    lines.append("  ],")
-    lines.append('  "doc_only": [')
-    lines.append(",\n".join(f"    {json.dumps(p)}" for p in table["doc_only"]))
-    lines.append("  ]")
-    lines.append("}")
+    # Every top-level key survives, one list item or mapping entry per line, so --pin never
+    # drops a section (documents, no_upstream, vendors) it does not know about.
+    blocks = []
+    for key, value in table.items():
+        if isinstance(value, list):
+            inner = ",\n".join(f"    {json.dumps(v)}" for v in value)
+            blocks.append(f"  {json.dumps(key)}: [\n{inner}\n  ]" if value else f"  {json.dumps(key)}: []")
+        elif isinstance(value, dict):
+            inner = ",\n".join(f"    {json.dumps(k)}: {json.dumps(v)}" for k, v in value.items())
+            blocks.append(f"  {json.dumps(key)}: {{\n{inner}\n  }}" if value else f"  {json.dumps(key)}: {{}}")
+        else:
+            blocks.append(f"  {json.dumps(key)}: {json.dumps(value)}")
+    lines = ["{", ",\n".join(blocks), "}"]
     (root / TABLE).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -475,8 +479,68 @@ def check_drift(root: Path) -> list[str]:
     for path, steps in WORKFLOW_TOOL_STEPS.items():
         if (root / path).is_file():
             errors += parse_step_pins((root / path).read_text(encoding="utf-8"), path, steps)[1]
+    errors += check_coverage(root, table)
+    for d in table.get("documents", []):
+        if d.get("path") and not (root / d["path"]).exists():
+            errors.append(f"{TABLE}: document {d['name']!r} points at {d['path']}, which does not exist: "
+                          "fix its 'path' or remove the entry")
     if (root / CONFORMU_DOC).is_file():
         errors += parse_conformu((root / CONFORMU_DOC).read_text(encoding="utf-8"))[1]
+    return errors
+
+
+def check_coverage(root: Path, table: dict) -> list[str]:
+    """The update-coverage rules (docs/development.md "Dependency update checks"): a new SDK,
+    protocol folder, vendor driver or pinned workflow tool cannot arrive without an update check."""
+    errors = []
+    documents = table.get("documents", [])
+    names = {e["name"] for e in table["sdks"]} | {d["name"] for d in documents}
+    # Rule 1: every SDK has an update source.
+    for e in table["sdks"]:
+        if not (e.get("updates") or {}).get("provider"):
+            errors.append(f"{TABLE}: SDK {e['name']!r} has no 'updates' block: add where "
+                          "scripts/dependency_updates.py finds its newest version (provider release-page or json)")
+    # Rule 2: every docs-only folder holds a watched document, or says why there is none.
+    exempt = {n["path"] for n in table.get("no_upstream", [])}
+    for p in sorted(exempt - set(table["doc_only"])):
+        errors.append(f"{TABLE}: no_upstream lists {p}, which is not a 'doc_only' directory: remove the stale entry")
+    doc_paths = [d["path"] for d in documents if d.get("path")]
+    for p in table["doc_only"]:
+        if p not in exempt and not any(dp.startswith(p + "/") for dp in doc_paths):
+            errors.append(f"{TABLE}: {p} has no watched document: add a 'documents' entry whose path is "
+                          "under it, or a 'no_upstream' entry with the reason it has no upstream")
+    # Rule 3: every vendor driver directory maps to what it is built from.
+    vendors = table.get("vendors", {})
+    vdir = root / VENDORS
+    present = sorted(c.name for c in vdir.iterdir() if c.is_dir()) if vdir.is_dir() else []
+    for v in present:
+        m = vendors.get(v) or {}
+        if m.get("no_upstream"):
+            continue
+        tracked = m.get("tracked") or []
+        if not tracked:
+            errors.append(f"{TABLE}: vendor {VENDORS}/{v} is not in 'vendors': list the SDKs or documents it "
+                          "is built from under 'tracked', or give a 'no_upstream' reason")
+        for n in tracked:
+            if n not in names:
+                errors.append(f"{TABLE}: vendors[{v!r}] tracks {n!r}, which is no SDK or document name")
+    for v in vendors:
+        if vdir.is_dir() and v not in present:
+            errors.append(f"{TABLE}: vendors[{v!r}] has no {VENDORS}/{v} directory: remove the entry")
+    # Rule 4: every ver= pin in a workflow belongs to a step the snapshot reads.
+    wf_dir = root / ".github/workflows"
+    for wf in sorted(wf_dir.glob("*.yml")) if wf_dir.is_dir() else []:
+        rel = wf.relative_to(root).as_posix()
+        tracked_steps = {step for step, _ in (CI_TOOL_STEPS if rel == CI else WORKFLOW_TOOL_STEPS.get(rel, ()))}
+        step = None
+        for line in wf.read_text(encoding="utf-8").splitlines():
+            m = re.match(r"^\s*- name:\s*(.+?)\s*$", line)
+            if m:
+                step = m.group(1).strip("\"'")  # YAML quotes are not part of the name
+            elif re.match(r"^\s*ver=", line) and step not in tracked_steps:
+                errors.append(f"{rel}: the step {step!r} pins a tool with ver= that the dependency snapshot does "
+                              "not read: add it to CI_TOOL_STEPS (ci.yml) or WORKFLOW_TOOL_STEPS in "
+                              "scripts/dependency_snapshot.py")
     return errors
 
 
@@ -559,11 +623,63 @@ def self_test() -> int:
         for p in ("A/sdk-1", "B", "Q/deep"):
             (r / EXTERNAL / p).mkdir(parents=True)
         subprocess.run(["git", "-C", d, "init", "-q"], check=True)  # vendored files are git-tracked files
+        up = {"provider": "release-page", "url": "https://example.test/", "pattern": r"sdk-(\d+)"}
         (r / TABLE).write_text(json.dumps({"sdks": [
-            {"path": f"{EXTERNAL}/A/sdk-1", "name": "a-sdk", "version": "1"},
-            {"path": f"{EXTERNAL}/Q/deep", "name": "q-sdk", "version": None}],
-            "doc_only": [f"{EXTERNAL}/B"]}))
+            {"path": f"{EXTERNAL}/A/sdk-1", "name": "a-sdk", "version": "1", "updates": up},
+            {"path": f"{EXTERNAL}/Q/deep", "name": "q-sdk", "version": None, "updates": up}],
+            "doc_only": [f"{EXTERNAL}/B"],
+            "no_upstream": [{"path": f"{EXTERNAL}/B", "reason": "test fixture"}]}))
         assert [e for e in check_drift(r) if "no sha256 pin" not in e] == [], check_drift(r)
+        # --- coverage rules: a new SDK, protocol folder, vendor or pinned tool fails --check ---
+        base = json.loads((r / TABLE).read_text())
+
+        def drift_with(**changes):
+            (r / TABLE).write_text(json.dumps({**base, **changes}))
+            try:
+                return [e for e in check_drift(r) if "no sha256 pin" not in e]
+            finally:
+                (r / TABLE).write_text(json.dumps(base))
+
+        # Rule 1: every SDK has an update source.
+        errs = drift_with(sdks=[{**base["sdks"][0], "updates": None}, base["sdks"][1]])
+        assert len(errs) == 1 and "a-sdk" in errs[0] and "updates" in errs[0], errs
+        # Rule 2: every docs-only folder has a watched document under it, or a no_upstream reason.
+        errs = drift_with(no_upstream=[])
+        assert len(errs) == 1 and f"{EXTERNAL}/B" in errs[0] and "documents" in errs[0], errs
+        (r / EXTERNAL / "B/spec.md").write_text("spec")
+        assert drift_with(no_upstream=[], documents=[{"name": "b-spec", "path": f"{EXTERNAL}/B/spec.md",
+                                                      "check": {"provider": "hash", "url": "u"}, "baseline": "0"}]) == []
+        (r / EXTERNAL / "B/spec.md").unlink()
+        # A no_upstream exemption for a directory that is no longer docs-only is stale.
+        errs = drift_with(no_upstream=base["no_upstream"] + [{"path": f"{EXTERNAL}/Gone", "reason": "old"}])
+        assert len(errs) == 1 and f"{EXTERNAL}/Gone" in errs[0] and "no_upstream" in errs[0], errs
+        # Rule 3: every vendor driver directory maps to SDKs or documents, or has a no_upstream reason.
+        (r / VENDORS / "acme").mkdir(parents=True)
+        errs = drift_with()
+        assert len(errs) == 1 and "acme" in errs[0] and "vendors" in errs[0], errs
+        assert drift_with(vendors={"acme": {"tracked": ["a-sdk"]}}) == []
+        assert drift_with(vendors={"acme": {"no_upstream": "reads a user-configured feed"}}) == []
+        errs = drift_with(vendors={"acme": {"tracked": ["gone-sdk"]}})
+        assert len(errs) == 1 and "gone-sdk" in errs[0], errs
+        errs = drift_with(vendors={"acme": {"tracked": ["a-sdk"]}, "old": {"tracked": ["a-sdk"]}})
+        assert len(errs) == 1 and "'old'" in errs[0], "a vendor key with no directory is stale"
+        (r / VENDORS / "acme").rmdir()
+        # Rule 4: every ver= pin in a workflow belongs to a step the snapshot reads.
+        (r / ".github/workflows").mkdir(parents=True)
+        (r / ".github/workflows/x.yml").write_text(
+            "jobs:\n  a:\n    steps:\n      - name: Install newtool\n        run: |\n          ver=1.2.3\n")
+        errs = drift_with()
+        assert len(errs) == 1 and "x.yml" in errs[0] and "Install newtool" in errs[0], errs
+        # A quoted step name is the same step: a tracked pin written `- name: "..."` still matches.
+        osv_step = WORKFLOW_TOOL_STEPS[".github/workflows/osv-scan.yml"][0][0]
+        (r / ".github/workflows/x.yml").unlink()
+        (r / ".github/workflows/osv-scan.yml").write_text(
+            f'jobs:\n  a:\n    steps:\n      - name: "{osv_step}"\n        run: |\n          ver=2.7.0\n')
+        assert drift_with() == [], drift_with()
+        (r / ".github/workflows/osv-scan.yml").rename(r / ".github/workflows/x.yml")
+        (r / ".github/workflows/x.yml").unlink()
+        (r / ".github/workflows").rmdir()
+        (r / ".github").rmdir()
         snap = build_snapshot(r, "a" * 40, "refs/heads/main", "1", "2026-01-01T00:00:00Z")
         for k in ("version", "job", "sha", "ref", "detector", "scanned", "manifests"):
             assert k in snap, k
@@ -649,9 +765,23 @@ def self_test() -> int:
         subprocess.run(["git", "-C", d, "add", "-A"], check=True)
         errs = check_drift(r)
         assert len(errs) == 2 and all("no sha256 pin" in e for e in errs), errs
+        t = json.loads((r / TABLE).read_text())
+        t["documents"] = [{"name": "b-doc", "path": f"{EXTERNAL}/B/doc.md",
+                           "check": {"provider": "hash", "url": "https://example.test/b.pdf"}, "baseline": "00"}]
+        (r / TABLE).write_text(json.dumps(t))
+        (r / EXTERNAL / "B/doc.md").write_text("doc")
         pin_sdk_hashes(r)
         assert check_drift(r) == [], check_drift(r)
-        pinned = json.loads((r / TABLE).read_text())["sdks"][0]["sha256"]
+        kept = json.loads((r / TABLE).read_text())
+        assert kept["documents"] == t["documents"] and kept["no_upstream"] == t["no_upstream"], \
+            "--pin keeps every top-level section"
+        (r / EXTERNAL / "B/doc.md").unlink()
+        errs = check_drift(r)
+        assert len(errs) == 1 and "b-doc" in errs[0] and f"{EXTERNAL}/B/doc.md" in errs[0], errs
+        t = json.loads((r / TABLE).read_text())
+        del t["documents"]
+        (r / TABLE).write_text(json.dumps(t))
+        pinned = t["sdks"][0]["sha256"]
         assert re.fullmatch(r"[0-9a-f]{64}", pinned) and pinned == tree_digest(r, f"{EXTERNAL}/A/sdk-1")
         (r / EXTERNAL / "A/sdk-1/lib/liba.so.1.0").write_bytes(b"swapped")
         errs = check_drift(r)
