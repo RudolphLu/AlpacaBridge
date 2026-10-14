@@ -49,6 +49,8 @@ namespace {
 constexpr double kHoursToDegrees = 15.0;
 constexpr auto kPositionCacheTtl = std::chrono::seconds(2);
 constexpr int kPositionLinkFailureThreshold = 3;
+// Consecutive failed Park slew-status queries tolerated before the Park fails (open-astro#1122).
+constexpr int kParkPollFailureThreshold = 3;
 constexpr auto kSiteInfoRetryDelay = std::chrono::seconds(2);
 constexpr double kMaxMoveAxisRateDegPerSec = 4.0;
 constexpr double kDefaultGuideRateDegPerSec = 7.5 / 3600.0;
@@ -1153,6 +1155,7 @@ public:
             // Publish the slewing state before the task starts so a poller
             // never sees Slewing false between Park returning and dispatch.
             slewing_cached_ = true;
+            park_poll_failures_ = 0;
             slew_force_until_ = clock_.now() + std::chrono::seconds(8);
             position_override_until_ = util::TaskClock::clock::time_point::min();
             guide_position_valid_ = false;
@@ -2306,9 +2309,30 @@ private:
         bool was_slewing = slewing_cached_;
         try {
             slewing_cached_ = SynScanProtocolWrapper::instance().is_goto_in_progress();
+            if (propagate_error) {
+                park_poll_failures_ = 0;
+            }
+        } catch (const std::exception& ex) {
+            if (propagate_error) {
+                // One lost reply must not stop the mount mid-Park: only a run of failures fails it.
+                const int failures = ++park_poll_failures_;
+                if (failures >= kParkPollFailureThreshold) {
+                    throw;
+                }
+                ALPACA_LOG_WARN("SynScan", "Park slew status poll failed (" + std::to_string(failures) + "/" +
+                                               std::to_string(kParkPollFailureThreshold) + "): " + ex.what());
+                return true;
+            }
+            // Keep last known state if polling times out.
         } catch (...) {
             if (propagate_error) {
-                throw;
+                const int failures = ++park_poll_failures_;
+                if (failures >= kParkPollFailureThreshold) {
+                    throw;
+                }
+                ALPACA_LOG_WARN("SynScan", "Park slew status poll failed (" + std::to_string(failures) + "/" +
+                                               std::to_string(kParkPollFailureThreshold) + ")");
+                return true;
             }
             // Keep last known state if polling times out.
         }
@@ -2639,8 +2663,11 @@ private:
                 }
                 ALPACA_LOG_WARN("SynScan", miss + "; repeating the GOTO once (open-astro#1105)");
                 // The same target, not one aimed by the residual: the miss is the handset's, not an offset to
-                // correct, and an aim moved by 49' would land 49' the other way.
+                // correct, and an aim moved by 49' would land 49' the other way. The carried aim returns to the
+                // target too, so the next re-GOTO round is aimed by the repeat's residual alone (open-astro#1120).
                 far_miss_repeated = true;
+                aim_ra = ra;
+                aim_dec = dec;
                 equatorial_cache_valid_ = false;
                 altaz_cache_valid_ = false;
                 guide_position_valid_ = false;
@@ -2812,6 +2839,7 @@ private:
     mutable bool parked_;
     mutable bool at_home_;
     mutable bool slewing_cached_ = false;
+    mutable int park_poll_failures_ = 0;  // consecutive failed Park status polls, under mutex_
     // motion_generation_ of the GOTO whose landing refinement is under way; 0 when none (open-astro#880).
     mutable uint64_t refining_generation_ = 0;
     // open-astro#575: an async slew dispatch that fails AFTER

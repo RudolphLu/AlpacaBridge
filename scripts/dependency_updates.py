@@ -10,13 +10,18 @@ graph, so there is one inventory. What is checked:
   ``release-page`` (the highest version a regex matches on a page) or ``json`` (a field of the
   matching entry in a JSON list, ZWO's SDK endpoint);
 - every entry in that file's ``documents`` list (protocol documents, the INDI sources drivers
-  were derived from, the ConformU beta build): provider ``github-file`` (the newest commit on a
-  file), ``hash`` (sha256 of the document, or of an HTML page's visible text) or ``page`` (the
-  highest version a regex matches), against the recorded ``baseline``.
+  were derived from, the gphoto2 tool, the ConformU beta build): provider ``github-file`` (the
+  newest commit on a file), ``hash`` (sha256 of the document, or of an HTML page's visible text),
+  ``page`` (the highest version a regex matches) or ``github-release`` (the repository's latest
+  release), against the recorded ``baseline``;
+- every entry in its ``system_libraries`` list (libraries the build takes from Debian, such as
+  libgphoto2 and LibRaw): the upstream repository's latest release against the version Debian
+  trixie ships.
 
-Debian, Ubuntu and docker entries are not checked: apt and the image tag already resolve to
-the newest package at build time, and .github/workflows/osv-scan.yml reports their
-vulnerabilities. An SDK with no ``updates`` block is listed as a manual check.
+Other Debian, Ubuntu and docker entries are not checked: apt and the image tag already resolve
+to the newest package at build time, and .github/workflows/osv-scan.yml reports their
+vulnerabilities. An SDK with no ``updates`` block is listed as a manual check. Update and
+document issues end with a "## Changelog" section when the source has one.
 
 Issues (state lives in a marker comment in each issue body; nothing is committed):
 - a newer version opens "Update <name> <current> -> <latest>" (dependencies, enhancement, P4),
@@ -26,7 +31,9 @@ Issues (state lives in a marker comment in each issue body; nothing is committed
   closed when the source reads again, so a changed page is never mistaken for "no update".
 
 --osv-summary reads osv-scanner JSON and opens one issue (dependencies, bug, P2) listing the
-High/Critical findings (CVSS >= 7.0) no earlier summary issue reported.
+actionable findings no earlier summary issue reported: CVSS >= 7.0, a ``fixed`` version in the
+package's Debian trixie entry, not rated "unimportant" by Debian, one row per advisory and
+source package however many binary packages report it.
 
   dependency_updates.py [--dry-run]            check and update issues (gh, GH_TOKEN, GH_REPO)
   dependency_updates.py --osv-summary FILE [--dry-run]
@@ -47,6 +54,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -69,6 +77,7 @@ PAGE_TIMEOUT = 30  # seconds per page or API request; about 45 run in sequence e
 DOCUMENT_TIMEOUT = 300  # a hashed document can be large (the ~50 MB ConformU beta tarball)
 LIST_LIMIT = 5000  # issues read back for their markers; the OSV dedupe needs closed ones too
 OSV_THRESHOLD = 7.0  # CVSS: High is 7.0-8.9, Critical 9.0-10.0
+OSV_MARKER = "osv2"  # "osv" was the first format (#1135), which listed unfixable findings
 OSV_MAX_ROWS = 100  # rows per summary issue; keeps the body far below GitHub's 65536 characters
 
 HttpGet = Callable[[str], str]
@@ -167,6 +176,17 @@ def latest_github(repo: str, get: HttpGet) -> str:
     return best
 
 
+def latest_json_field(url: str, path: str, match: dict, field: str, get: HttpGet) -> str | None:
+    """Any ``field`` of the entry matching ``match`` (a changelog URL), or None if it has none."""
+    node = json.loads(get(url))
+    for seg in path.split("."):
+        node = node[int(seg)] if seg.isdigit() else node[seg]
+    for entry in node if isinstance(node, list) else []:
+        if isinstance(entry, dict) and all(entry.get(k) == v for k, v in match.items()):
+            return entry.get(field) or None
+    return None
+
+
 def latest_json(url: str, path: str, match: dict, field: str, get: HttpGet) -> str:
     """The ``field`` of the entry matching ``match`` in the list at dotted ``path`` (ZWO's SDK list)."""
     node = json.loads(get(url))
@@ -234,10 +254,14 @@ def targets(snap: dict, table: dict) -> tuple[list[dict], list[str]]:
         up = e.get("updates") or {}
         base = {"key": e["name"], "name": e["name"], "current": e.get("version"), "where": snapshot.TABLE,
                 "source": up.get("url", ""), "compare": "version", "document": False}
+        if up.get("changelog"):
+            base["changelog"] = up["changelog"]
         if up.get("provider") == "release-page" and e.get("version"):
             out.setdefault(e["name"], {**base, "check": ("page", up["url"], up["pattern"])})
         elif up.get("provider") == "json" and e.get("version"):
             out.setdefault(e["name"], {**base, "check": ("json", up["url"], up["path"], up["match"], up["field"])})
+            if up.get("changelog_field"):
+                out[e["name"]]["changelog_json"] = (up["url"], up["path"], up["match"], up["changelog_field"])
         else:
             manual.append(e["name"])
     for d in table.get("documents", []):
@@ -252,8 +276,18 @@ def targets(snap: dict, table: dict) -> tuple[list[dict], list[str]]:
         elif c["provider"] == "page":
             out["doc:" + d["name"]] = {**base, "check": ("page", c["url"], c["pattern"]), "compare": "version",
                                        "source": c["url"]}
+        elif c["provider"] == "github-release":
+            out["doc:" + d["name"]] = {**base, "check": ("github", c["repo"]), "compare": "version",
+                                       "source": f"https://github.com/{c['repo']}/releases"}
         else:
             manual.append(d["name"])
+    # Libraries the build takes from Debian (debian/control), checked against their upstream
+    # releases; the baseline is the version Debian trixie ships.
+    for lib in table.get("system_libraries", []):
+        out[lib["name"]] = {"key": lib["name"], "name": lib["name"], "current": lib["baseline"],
+                            "where": snapshot.TABLE, "check": ("github", lib["repo"]), "compare": "version",
+                            "document": False, "system": True, "debian": lib.get("debian", lib["name"]),
+                            "source": f"https://github.com/{lib['repo']}/releases"}
     return sorted(out.values(), key=lambda t: t["key"]), manual
 
 
@@ -349,14 +383,68 @@ class GhIssues:
 def update_body(r: dict) -> str:
     if r.get("document"):
         return document_body(r)
+    if r.get("system"):
+        return system_body(r)
     return (f"{marker({'kind': 'update', 'key': r['key'], 'version': r['latest'], 'current': r['current']})}\n"
             f"`{r['name']}` has a newer upstream version.\n\n"
-            f"| | |\n|---|---|\n| In this repository | `{r['current']}` |\n| Upstream | `{r['latest']}` |\n"
+            f"| Field | Value |\n|---|---|\n| In this repository | `{r['current']}` |\n| Upstream | `{r['latest']}` |\n"
             f"| Pinned in | `{r['where']}` |\n| Source | {r['source']} |\n\n"
             "Bump the pin where it is declared (for a vendored SDK, also its directory and the "
             "`--pin` digest, see docs/development.md \"Dependency graph\"), check the upstream "
             "changelog, and let CI run. This issue closes by itself once the repository is at "
             "that version.\n\nOpened by `.github/workflows/dependency-updates.yml`.\n")
+
+
+def system_body(r: dict) -> str:
+    return (f"{marker({'kind': 'update', 'key': r['key'], 'version': r['latest'], 'current': r['current']})}\n"
+            f"Upstream `{r['name']}` is ahead of the version this project builds against.\n\n"
+            f"| Field | Value |\n|---|---|\n| Recorded baseline (Debian trixie `{r['debian']}`) | `{r['current']}` |\n"
+            f"| Upstream | `{r['latest']}` |\n| Source | {r['source']} |\n\n"
+            "The build takes this library from Debian (`debian/control`), so there is no pin to bump. Review "
+            "what the new release adds or fixes for the driver (for libgphoto2: new camera bodies), and set "
+            "the `baseline` in `scripts/dependency_sdk_versions.json` to the upstream version (without a `v` "
+            "prefix, as Debian spells it) once reviewed, or when Debian ships it. This issue closes by itself once the baseline matches.\n\n"
+            "Opened by `.github/workflows/dependency-updates.yml`.\n")
+
+
+CHANGELOG_MAX = 3000  # characters of upstream release notes quoted in an issue
+FENCE = "`" * 3
+
+
+def changelog_for(r: dict, get: HttpGet) -> str:
+    """A "## Changelog" section for an update or document issue, or "" when there is none.
+
+    Upstream text goes in one code block, its own fences neutralised, so an @mention or #123 in
+    release notes cannot ping anyone or link to an issue here.
+    """
+    kind, link, text = r["check"][0], r.get("changelog"), ""
+    if kind == "github":
+        repo = r["check"][1]
+        try:
+            rel = json.loads(get(f"https://api.github.com/repos/{repo}/releases/tags/{urllib.parse.quote(r['latest'])}"))
+            link, text = rel.get("html_url") or link, (rel.get("body") or "").strip()
+        except (FetchError, json.JSONDecodeError):
+            # Upstream tags may carry a "v" prefix the recorded baseline lacks (libgphoto2: v2.5.34).
+            base = r["current"]
+            if r["latest"][:1] in "vV" and base[:1] not in "vV":
+                base = r["latest"][0] + base
+            link = link or f"https://github.com/{repo}/compare/{base}...{r['latest']}"
+    elif kind == "github-file":
+        link = f"https://github.com/{r['check'][1]}/compare/{r['current']}...{r['latest']}"
+    if r.get("changelog_json"):
+        url, path, match, field = r["changelog_json"]
+        try:
+            link = latest_json_field(url, path, match, field, get) or link
+        except (FetchError, KeyError, IndexError, TypeError, ValueError):
+            pass
+    if not link and not text:
+        return ""
+    out = "## Changelog\n\n" + (f"{link}\n" if link else "")
+    if text:
+        if len(text) > CHANGELOG_MAX:
+            text = text[:CHANGELOG_MAX] + "\n[cut; see the link above]"
+        out += f"\n{FENCE}text\n" + text.replace(FENCE, "` ` `") + f"\n{FENCE}\n"
+    return out
 
 
 def document_body(r: dict) -> str:
@@ -365,7 +453,7 @@ def document_body(r: dict) -> str:
     # keeps them apart from SDK and purl keys in reconcile().
     return (f"{marker({'kind': 'update', 'key': r['key'], 'version': r['latest'], 'current': r['current']})}\n"
             f"An upstream document a driver is built from has changed: `{r['name']}`.\n\n"
-            f"| | |\n|---|---|\n| Recorded baseline | `{r['current']}` |\n| Upstream now | `{r['latest']}` |\n"
+            f"| Field | Value |\n|---|---|\n| Recorded baseline | `{r['current']}` |\n| Upstream now | `{r['latest']}` |\n"
             f"{local}| Source | {r['source']} |\n\n"
             "Review what changed upstream against the driver (and refresh the local copy if there is one), "
             "then set this document's `baseline` in `scripts/dependency_sdk_versions.json` to the upstream "
@@ -387,7 +475,7 @@ def resolved_body(issue: dict, state: dict) -> str:
     return MARKER_RE.sub(lambda _: marker({**state, "resolved": True}), issue.get("body", ""), count=1)
 
 
-def reconcile(results: list[dict], issues, all_issues: list[dict]) -> list[str]:
+def reconcile(results: list[dict], issues, all_issues: list[dict], notes=None) -> list[str]:
     """Open, retitle and close issues so they match results. Returns one line per action;
     a line starting with ``FAILED`` is an issue call that failed (the others still run).
 
@@ -415,7 +503,7 @@ def reconcile(results: list[dict], issues, all_issues: list[dict]) -> list[str]:
     log = []
     for r in results:
         try:
-            log += _reconcile_one(r, issues, by, declined, declined_broken)
+            log += _reconcile_one(r, issues, by, declined, declined_broken, notes)
         except Exception as e:  # one failed gh call must not stop the other dependencies
             log.append(f"FAILED {r['name']}: {getattr(e, 'stderr', None) or e}")
     tracked = {r["key"] for r in results}
@@ -430,7 +518,19 @@ def reconcile(results: list[dict], issues, all_issues: list[dict]) -> list[str]:
     return log
 
 
-def _reconcile_one(r: dict, issues, by: dict, declined: set, declined_broken: dict) -> list[str]:
+def _with_notes(r: dict, notes) -> str:
+    """The issue body plus its changelog section; a failed changelog lookup only drops the section."""
+    section = ""
+    if notes is not None:
+        try:
+            section = notes(r) or ""
+        except Exception as e:  # the changelog is a convenience: never let it stop the issue
+            print(f"warning: no changelog for {r.get('name')}: {type(e).__name__}: {e}", file=sys.stderr)
+            section = ""
+    return update_body(r) + (("\n" + section) if section else "")
+
+
+def _reconcile_one(r: dict, issues, by: dict, declined: set, declined_broken: dict, notes=None) -> list[str]:
     log = []
     broken = by.get(("broken", r["key"]))
     if r["error"]:
@@ -449,12 +549,12 @@ def _reconcile_one(r: dict, issues, by: dict, declined: set, declined_broken: di
     title = title_of(r)
     if newer and not upd:
         if (r["key"], r["latest"], r["current"]) not in declined:
-            issues.create(title, update_body(r), DOC_LABELS if r.get("document") else UPDATE_LABELS)
+            issues.create(title, _with_notes(r, notes), DOC_LABELS if r.get("document") else UPDATE_LABELS)
             log.append(f"opened update issue for {r['name']} {r['latest']}")
     elif newer and upd is not None and (upd[1].get("version"), upd[1].get("current")) != (r["latest"], r["current"]):
         note = (f"Upstream is now at `{r['latest']}`." if upd[1].get("version") != r["latest"]
                 else f"The repository is now at `{r['current']}`, still behind `{r['latest']}`.")
-        issues.update(upd[0]["number"], title, update_body(r), note)
+        issues.update(upd[0]["number"], title, _with_notes(r, notes), note)
         log.append(f"retitled #{upd[0]['number']} to {r['current']} -> {r['latest']}")
     elif not newer and upd is not None:
         if r.get("document"):
@@ -466,47 +566,180 @@ def _reconcile_one(r: dict, issues, by: dict, declined: set, declined_broken: di
     return log
 
 
-def osv_findings(report: dict) -> list[dict]:
-    """High/Critical groups (max_severity >= OSV_THRESHOLD) from osv-scanner --format json."""
-    out = []
+OSV_RELEASE = "Debian:13"  # trixie, the release the .deb is built for and the scan image runs
+
+
+def osv_fix(vulns: dict, ids: list[str], ecosystem: str, name: str) -> str | None:
+    """The version that fixes any of ``ids`` in this package's release, or None when there is no
+    fix there or Debian rates the issue "unimportant".
+
+    A bare "Debian" (or missing) ecosystem means OSV_RELEASE. Debian advisories name the source
+    package; when none of an advisory's entries for the release carries the report's name (a
+    binary name such as libc6), its entries for that release are used.
+    """
+    release = ecosystem if ":" in (ecosystem or "") else OSV_RELEASE
+    for vid in ids:
+        entries = [a for a in (vulns.get(vid) or {}).get("affected") or []
+                   if (a.get("package") or {}).get("ecosystem") == release]
+        named = [a for a in entries if (a.get("package") or {}).get("name") == name] or entries
+        for a in named:
+            if (a.get("ecosystem_specific") or {}).get("urgency") == "unimportant":
+                continue
+            for r in a.get("ranges") or []:
+                for e in r.get("events") or []:
+                    if "fixed" in e:
+                        return e["fixed"]
+    return None
+
+
+def direct_sources(depends: str, sources: str) -> set[str]:
+    """Debian source packages of the .deb's own runtime dependencies, without the C/C++ runtime.
+
+    depends: the .deb's Depends field (dpkg-deb -f). sources: "binary source" lines from
+    dpkg-query -W -f='${Package} ${source:Package}' in the scan image. A dependency with no
+    line keeps its own name.
+    """
+    to_source = {}
+    for line in sources.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            to_source[parts[0].split(":")[0]] = parts[1]
+    names = set()
+    for group in depends.replace("\n", " ").split(","):
+        for alt in group.split("|"):  # every alternative: the image may have installed any of them
+            m = re.match(r"\s*([a-z0-9][a-z0-9+.\-]*)", alt)
+            if m:
+                names.add(m.group(1))
+    found = {to_source.get(name, name) for name in names}
+    return {src for src in found if not is_toolchain_runtime(src)}
+
+
+def is_toolchain_runtime(source: str) -> bool:
+    """glibc and gcc-N (libc6, libstdc++6, libgcc-s1): the C/C++ runtime every program links,
+    which no application can replace or pin, so its advisories are never actionable here."""
+    return source == "glibc" or re.fullmatch(r"gcc-\d+", source) is not None
+
+
+def osv_unimportant(report: dict, vid: str, name: str) -> bool:
+    """True when the report's record of ``vid`` has Debian rate it "unimportant" for ``name``.
+
+    The first record of the ID is enough: a Debian advisory (DEBIAN-CVE-*, DSA, DLA) is the same
+    record wherever the report repeats it, with one affected entry per source package and release.
+    """
+    for res in report.get("results") or []:
+        for p in res.get("packages") or []:
+            for v in p.get("vulnerabilities") or []:
+                if v.get("id") != vid:
+                    continue
+                entries = [a for a in v.get("affected") or []
+                           if (a.get("package") or {}).get("ecosystem") == OSV_RELEASE]
+                named = [a for a in entries if (a.get("package") or {}).get("name") == name] or entries
+                return bool(named) and all((a.get("ecosystem_specific") or {}).get("urgency") == "unimportant"
+                                           for a in named)
+    return False
+
+
+SARIF_PACKAGE_RE = re.compile(r"Package '([^@']+)@[^']*' is vulnerable to '([^']+)'")
+
+
+def filter_sarif(sarif: dict, report: dict, direct: set[str]) -> dict:
+    """The SARIF with only findings in ``direct`` source packages that Debian does not rate
+    unimportant: what code scanning shows. Rules stay as they are (results refer to them by index)."""
+    out = json.loads(json.dumps(sarif))
+    for run in out.get("runs") or []:
+        kept = []
+        for r in run.get("results") or []:
+            m = SARIF_PACKAGE_RE.search((r.get("message") or {}).get("text", ""))
+            if m and m.group(1) in direct and not osv_unimportant(report, m.group(2), m.group(1)):
+                kept.append(r)
+        run["results"] = kept
+    return out
+
+
+def osv_scope_unreadable(report: dict, sources: str) -> bool:
+    """True when the JSON names a package by its binary name (libcurl4t64) rather than its Debian
+    source (curl): the direct-dependency scope would then match nothing and open no issue, silently.
+    sources: the same "binary source" lines direct_sources() reads."""
+    binary_only = set()
+    source_names = set()
+    for line in sources.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            binary, source = parts[0].split(":")[0], parts[1]
+            source_names.add(source)
+            if binary != source:
+                binary_only.add(binary)
+    binary_only -= source_names
+    named = {(p.get("package") or {}).get("name") for res in report.get("results") or []
+             for p in res.get("packages") or []}
+    return bool(named & binary_only)
+
+
+def sarif_unreadable(sarif: dict) -> tuple[int, int]:
+    """(results, results whose message SARIF_PACKAGE_RE cannot read)."""
+    results = [r for run in sarif.get("runs") or [] for r in run.get("results") or []]
+    return len(results), sum(1 for r in results if not SARIF_PACKAGE_RE.search((r.get("message") or {}).get("text", "")))
+
+
+def osv_findings(report: dict, direct: set[str] | None = None) -> list[dict]:
+    """Actionable High/Critical findings from osv-scanner --format json: max_severity >=
+    OSV_THRESHOLD and a fixed version in the package's own release. One finding per advisory
+    group and source package, however many binary packages of that source report it."""
+    found: list[dict] = []
     for res in report.get("results") or []:
         for p in res.get("packages") or []:
             pkg = p.get("package", {})
+            if direct is not None and pkg.get("name") not in direct:
+                continue  # the base system, not one of the .deb's own dependencies
+            vulns = {v.get("id"): v for v in p.get("vulnerabilities") or []}
             for g in p.get("groups") or []:
                 try:
                     sev = float(g.get("max_severity") or "")
                 except ValueError:
                     continue
                 ids = sorted(g.get("ids") or [])
-                if sev >= OSV_THRESHOLD and ids:
-                    out.append({"id": ids[0], "ids": ids, "severity": sev, "package": pkg.get("name", "?"),
-                                "version": pkg.get("version", "?")})
-    return sorted(out, key=lambda f: (-f["severity"], f["id"]))
+                if sev < OSV_THRESHOLD or not ids:
+                    continue
+                fixed = osv_fix(vulns, ids, pkg.get("ecosystem", ""), pkg.get("name", ""))
+                if fixed is None:
+                    continue
+                same = next((f for f in found if f["package"] == pkg.get("name", "?") and set(f["ids"]) & set(ids)), None)
+                if same:
+                    same["ids"] = sorted(set(same["ids"]) | set(ids))
+                    continue
+                found.append({"id": ids[0], "ids": ids, "severity": sev, "package": pkg.get("name", "?"),
+                              "version": pkg.get("version", "?"), "fixed": fixed})
+    return sorted(found, key=lambda f: (-f["severity"], f["id"]))
 
 
-def osv_summary(report: dict, issues, all_issues: list[dict], repo: str) -> list[str]:
+def osv_summary(report: dict, issues, all_issues: list[dict], repo: str, direct: set[str] | None = None) -> list[str]:
     reported = set()
     for i in all_issues:
         st = read_marker(i.get("body", ""))
-        if st and st.get("kind") == "osv":
+        if st and st.get("kind") == OSV_MARKER:
             reported.update(st.get("ids", []))
-    found = [f for f in osv_findings(report) if not reported.intersection(f["ids"])]
+    found = [f for f in osv_findings(report, direct) if not reported.intersection(f["ids"])]
     if not found:
         return []
     # Keep the body under GitHub's 65536-character limit: list at most OSV_MAX_ROWS; the rest
     # stay unreported and open the next run's issue.
     new, rest = found[:OSV_MAX_ROWS], len(found) - OSV_MAX_ROWS
-    rows = "\n".join(f"| {f['severity']:.1f} | `{f['package']}` {f['version']} | {', '.join(f['ids'])} |" for f in new)
-    body = (f"{marker({'kind': 'osv', 'ids': sorted({i for f in new for i in f['ids']})})}\n"
+    rows = "\n".join(f"| {f['severity']:.1f} | `{f['package']}` {f['version']} | `{f['fixed']}` | {', '.join(f['ids'])} |"
+                     for f in new)
+    body = (f"{marker({'kind': OSV_MARKER, 'ids': sorted({i for f in new for i in f['ids']})})}\n"
             f"The OSV scan of the nightly `.deb`'s installed runtime packages (Debian trixie) found "
-            f"{len(new)} new High or Critical finding(s):\n\n| CVSS | Package | Advisories |\n|---|---|---|\n"
+            f"{len(new)} new High or Critical finding(s) that Debian has already fixed in trixie:\n\n"
+            f"| CVSS | Package | Fixed in | Advisories |\n|---|---|---|---|\n"
             f"{rows}\n\n"
             + (f"{rest} more are not listed here; the next scan opens an issue for them.\n\n" if rest > 0 else "")
-            + f"All findings, including lower and unscored ones, are under "
-            f"https://github.com/{repo}/security/code-scanning (tool `osv-scanner`). These packages come "
-            "from Debian, so a fix usually reaches users through `apt upgrade`; act here when AlpacaBridge "
-            "pins, bundles or builds against an affected version.\n\nOpened by `.github/workflows/osv-scan.yml`.\n")
-    issues.create(f"Vulnerabilities: {len(new)} new High/Critical in the nightly .deb's packages", body, OSV_LABELS)
+            + f"Findings below High or with no trixie fix yet are listed only under "
+            f"https://github.com/{repo}/security/code-scanning (tool `osv-scanner`). Base-system packages, the "
+            "C/C++ runtime and findings Debian rates unimportant are left out of both; they are only in the "
+            "scan run's `osv-full-results` artifact. A fixed version reaches users "
+            "through `apt upgrade`; act here when AlpacaBridge should require it (a higher minimum version in "
+            "`Depends`) or when a build or test image still carries the affected version.\n\n"
+            "Opened by `.github/workflows/osv-scan.yml`.\n")
+    issues.create(f"Vulnerabilities: {len(new)} fixable High/Critical in the nightly .deb's packages", body, OSV_LABELS)
     return [f"opened OSV summary issue for {len(new)} finding(s)"]
 
 
@@ -657,25 +890,166 @@ def self_test() -> int:
     # A body someone edited into garbage is not mistaken for a tracked issue.
     assert read_marker("<!-- dependency-updates: {not json} -->") is None and read_marker("") is None
 
+    def vuln(vid, fixed_in=None, urgency="low", name="glibc"):
+        """An OSV record shaped like Debian's: one affected entry per release, fixed or not."""
+        affected = []
+        for eco in ("Debian:12", "Debian:13", "Debian:14"):
+            events = [{"introduced": "0"}] + ([{"fixed": fixed_in[eco]}] if fixed_in and eco in fixed_in else [])
+            affected.append({"package": {"ecosystem": eco, "name": name}, "ranges": [{"type": "ECOSYSTEM", "events": events}],
+                             "ecosystem_specific": {"urgency": urgency}})
+        return {"id": vid, "affected": affected}
+
+    def pkg(name, groups, vulns, binary=None):
+        return {"package": {"name": name, "version": "2.41-12", "ecosystem": "Debian:13", **({"binary": binary} if binary else {})},
+                "groups": groups, "vulnerabilities": vulns}
+
+    fixed13 = {"Debian:13": "2.41-12+deb13u5"}
     report = {"results": [{"packages": [
-        {"package": {"name": "libfoo", "version": "1.0"},
-         "groups": [{"ids": ["DSA-2", "CVE-2026-1"], "max_severity": "9.8"},
-                    {"ids": ["CVE-2026-2"], "max_severity": "5.0"},
-                    {"ids": ["DEBIAN-CVE-2026-3"], "max_severity": ""}]},
-        {"package": {"name": "libbar", "version": "2.0"},
-         "groups": [{"ids": ["CVE-2026-4"], "max_severity": "7.0"}]}]}]}
-    assert [x["id"] for x in osv_findings(report)] == ["CVE-2026-1", "CVE-2026-4"], osv_findings(report)
+        # The same advisory reported through two binary packages of one source: one finding.
+        pkg("glibc", [{"ids": ["CVE-2026-1", "DEBIAN-CVE-2026-1"], "max_severity": "9.8"}],
+            [vuln("DEBIAN-CVE-2026-1", fixed13)], binary="libc6"),
+        pkg("glibc", [{"ids": ["CVE-2026-1", "DEBIAN-CVE-2026-1"], "max_severity": "9.8"}],
+            [vuln("DEBIAN-CVE-2026-1", fixed13)], binary="libc-bin"),
+        pkg("glibc", [{"ids": ["DEBIAN-CVE-2019-1010022"], "max_severity": "9.8"},  # no fix anywhere, unimportant
+                      {"ids": ["DEBIAN-CVE-2026-97399"], "max_severity": "8.0"},    # fixed only in Debian 14
+                      {"ids": ["DEBIAN-CVE-2026-6"], "max_severity": "9.0"},        # fixed in trixie but unimportant
+                      {"ids": ["DEBIAN-CVE-2026-2"], "max_severity": "5.0"},        # fixed, below High
+                      {"ids": ["DEBIAN-CVE-2026-3"], "max_severity": ""}],          # fixed, unscored
+            [vuln("DEBIAN-CVE-2019-1010022", None, "unimportant"), vuln("DEBIAN-CVE-2026-97399", {"Debian:14": "2.43-7"}),
+             vuln("DEBIAN-CVE-2026-6", fixed13, "unimportant"), vuln("DEBIAN-CVE-2026-2", fixed13),
+             vuln("DEBIAN-CVE-2026-3", fixed13)]),
+        pkg("curl", [{"ids": ["DEBIAN-CVE-2026-4"], "max_severity": "7.0"}],
+            [vuln("DEBIAN-CVE-2026-4", {"Debian:13": "8.14.1-2+deb13u2"}, name="curl")])]}]}
+    found = osv_findings(report)
+    assert [x["id"] for x in found] == ["CVE-2026-1", "DEBIAN-CVE-2026-4"], found
+    assert found[0]["fixed"] == "2.41-12+deb13u5" and found[1]["fixed"] == "8.14.1-2+deb13u2", found
     f = Fake()
     assert osv_summary(report, f, f.issues, "o/r") and len(f.issues) == 1 and f.issues[0]["labels"] == OSV_LABELS
-    assert "CVE-2026-2" not in f.issues[0]["body"] and "DEBIAN-CVE-2026-3" not in f.issues[0]["body"]
+    body = f.issues[0]["body"]
+    assert body.count("| 9.8 |") == 1, "one row per advisory, not per binary package"
+    for absent in ("DEBIAN-CVE-2019-1010022", "DEBIAN-CVE-2026-97399", "DEBIAN-CVE-2026-6", "DEBIAN-CVE-2026-2",
+                   "DEBIAN-CVE-2026-3"):
+        assert absent not in body, absent
+    assert "2.41-12+deb13u5" in body, "the row names the fixed version"
     f.issues[0]["state"] = "CLOSED"
     assert osv_summary(report, f, f.issues, "o/r") == [], "findings already reported, even in a closed issue"
     # OSV adds an alias that sorts first: still the same, already reported finding.
     report["results"][0]["packages"][0]["groups"][0]["ids"].append("AAA-2026-1")
     assert osv_summary(report, f, f.issues, "o/r") == [], "a reported group matched on any of its ids"
-    report["results"][0]["packages"][1]["groups"].append({"ids": ["CVE-2026-5"], "max_severity": "8.1"})
-    assert osv_summary(report, f, f.issues, "o/r") and "CVE-2026-5" in f.issues[1]["body"]
-    assert "CVE-2026-4" not in f.issues[1]["body"], "only the new finding is listed"
+    report["results"][0]["packages"][3]["groups"].append({"ids": ["DEBIAN-CVE-2026-5"], "max_severity": "8.1"})
+    report["results"][0]["packages"][3]["vulnerabilities"].append(
+        vuln("DEBIAN-CVE-2026-5", {"Debian:13": "8.14.1-2+deb13u3"}, name="curl"))
+    assert osv_summary(report, f, f.issues, "o/r") and "DEBIAN-CVE-2026-5" in f.issues[1]["body"]
+    assert "DEBIAN-CVE-2026-4" not in f.issues[1]["body"], "only the new finding is listed"
+    # The report's own spelling may differ from the advisory's: a bare "Debian" ecosystem, or a binary
+    # package name where Debian advisories name the source package. Neither drops the finding.
+    odd = {"results": [{"packages": [
+        {"package": {"name": "libc6", "version": "2.41-12", "ecosystem": "Debian"},
+         "groups": [{"ids": ["DEBIAN-CVE-2026-7"], "max_severity": "9.1"}],
+         "vulnerabilities": [vuln("DEBIAN-CVE-2026-7", fixed13)]}]}]}
+    assert [x["id"] for x in osv_findings(odd)] == ["DEBIAN-CVE-2026-7"], osv_findings(odd)
+    # The same CVE in two different source packages (a library and a copy bundled elsewhere) stays
+    # two findings, each with its own fixed version.
+    two = {"results": [{"packages": [
+        pkg("curl", [{"ids": ["CVE-2026-8"], "max_severity": "8.0"}], [{**vuln("CVE-2026-8", {"Debian:13": "1-1"}, name="curl")}]),
+        pkg("libcurl-bundler", [{"ids": ["CVE-2026-8"], "max_severity": "8.0"}],
+            [vuln("CVE-2026-8", {"Debian:13": "9-9"}, name="libcurl-bundler")])]}]}
+    assert sorted((x["package"], x["fixed"]) for x in osv_findings(two)) == [("curl", "1-1"), ("libcurl-bundler", "9-9")]
+    # Only AlpacaBridge's own runtime dependencies count: the .deb's Depends, mapped to their Debian
+    # source packages (dpkg-query in the scan image); the base system's packages are dropped.
+    depends = "libc6 (>= 2.38), libcurl4t64 (>= 7.16.2), libgphoto2-6t64 (>= 2.5.10), libhidapi-hidraw0, adduser"
+    sources_txt = "libc6 glibc\nlibcurl4t64 curl\nlibgphoto2-6t64 libgphoto2\nlibhidapi-hidraw0 hidapi\nutil-linux util-linux\n"
+    direct = direct_sources(depends + ", libstdc++6 (>= 14), libgcc-s1", sources_txt + "libstdc++6 gcc-14\nlibgcc-s1 gcc-14\n")
+    assert direct == {"curl", "libgphoto2", "hidapi", "adduser"}, \
+        "the C/C++ runtime (glibc, gcc-N) is excluded: no application can act on it"
+    scoped = {"results": [{"packages": [
+        pkg("util-linux", [{"ids": ["DEBIAN-CVE-2026-9"], "max_severity": "9.0"}],
+            [vuln("DEBIAN-CVE-2026-9", {"Debian:13": "2.41-5+deb13u1"}, name="util-linux")]),
+        pkg("curl", [{"ids": ["DEBIAN-CVE-2026-10"], "max_severity": "9.0"}],
+            [vuln("DEBIAN-CVE-2026-10", {"Debian:13": "8.14.1-2+deb13u2"}, name="curl")])]}]}
+    assert [x["package"] for x in osv_findings(scoped, direct)] == ["curl"], "a base-system package opens no issue"
+    assert len(osv_findings(scoped)) == 2, "without a direct set every package counts (unchanged default)"
+    # The code-scanning upload is filtered the same way, and drops what Debian rates unimportant.
+    def result(pkg_name, vid):
+        return {"ruleId": vid, "message": {"text": f"Package '{pkg_name}@1.0' is vulnerable to '{vid}'."}}
+    sarif = {"runs": [{"tool": {"driver": {"name": "osv-scanner", "rules": [
+        {"id": v} for v in ("DEBIAN-CVE-2026-9", "DEBIAN-CVE-2026-10", "DEBIAN-CVE-2019-1010022", "DEBIAN-CVE-2026-11",
+                            "DEBIAN-CVE-2026-12")]}},
+        "results": [result("util-linux", "DEBIAN-CVE-2026-9"), result("curl", "DEBIAN-CVE-2026-10"),
+                    result("glibc", "DEBIAN-CVE-2019-1010022"), result("libgphoto2", "DEBIAN-CVE-2026-11"),
+                    result("curl", "DEBIAN-CVE-2026-12")]}]}
+    sarif_report = {"results": [{"packages": [
+        pkg("glibc", [{"ids": ["DEBIAN-CVE-2019-1010022"], "max_severity": "9.8"}],
+            [vuln("DEBIAN-CVE-2019-1010022", None, "unimportant")]),
+        pkg("libgphoto2", [{"ids": ["DEBIAN-CVE-2026-11"], "max_severity": "8.8"}],
+            [vuln("DEBIAN-CVE-2026-11", None, "not yet assigned", name="libgphoto2")]),
+        # Unimportant in one of the .deb's own dependencies: still dropped from code scanning.
+        pkg("curl", [{"ids": ["DEBIAN-CVE-2026-12"], "max_severity": "5.3"}],
+            [vuln("DEBIAN-CVE-2026-12", None, "unimportant", name="curl")])]}]}
+    kept = filter_sarif(sarif, sarif_report, direct)
+    texts = [r["message"]["text"] for r in kept["runs"][0]["results"]]
+    assert texts == ["Package 'curl@1.0' is vulnerable to 'DEBIAN-CVE-2026-10'.",
+                     "Package 'libgphoto2@1.0' is vulnerable to 'DEBIAN-CVE-2026-11'."], texts
+    assert len(kept["runs"][0]["tool"]["driver"]["rules"]) == 5, "rules stay: results refer to them by index"
+    assert len(sarif["runs"][0]["results"]) == 5, "the input SARIF is not modified"
+    # Every alternative of an "a | b" dependency counts: the image may have installed either.
+    assert direct_sources("libcurl4t64 | libcurl3t64-gnutls, adduser",
+                          "libcurl4t64 curl\nlibcurl3t64-gnutls curl-gnutls\n") == {"curl", "curl-gnutls", "adduser"}
+    # The --filter-sarif CLI: scoped output written; and if osv-scanner's SARIF wording changes so no
+    # result can be read, it fails loudly instead of uploading an empty, quiet code-scanning result.
+    with tempfile.TemporaryDirectory() as tmp:
+        t = Path(tmp)
+        (t / "deps").write_text(depends)
+        (t / "src").write_text(sources_txt)
+        (t / "report.json").write_text(json.dumps(sarif_report))
+        (t / "in.sarif").write_text(json.dumps(sarif))
+        args = ["--filter-sarif", str(t / "in.sarif"), "--report", str(t / "report.json"), "--output",
+                str(t / "out.sarif"), "--direct-depends", str(t / "deps"), "--direct-sources", str(t / "src")]
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert main(args) == 0
+        assert len(json.loads((t / "out.sarif").read_text())["runs"][0]["results"]) == 2
+        reworded = json.loads(json.dumps(sarif))
+        for r in reworded["runs"][0]["results"]:
+            r["message"]["text"] = r["message"]["text"].replace("is vulnerable to", "has advisory")
+        (t / "in.sarif").write_text(json.dumps(reworded))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            assert main(args) == 1
+        assert "message format" in err.getvalue(), err.getvalue()
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                main(["--filter-sarif", str(t / "in.sarif")])
+        except SystemExit as e:
+            assert e.code == 2, "--filter-sarif without --report/--output/--direct-* is a usage error"
+        else:
+            raise AssertionError("--filter-sarif alone must be refused")
+    # The summary's scope relies on the JSON naming Debian source packages, as the SARIF does. If no
+    # package that has findings is named like a direct dependency (binary names, say), fail loudly.
+    # The check is on naming, not on findings: a scan where only base-system packages have findings
+    # (direct dependencies clean) is a legitimate result, not an error.
+    assert osv_scope_unreadable(scoped, sources_txt) is False
+    base_only = {"results": [{"packages": [scoped["results"][0]["packages"][0]]}]}
+    assert osv_scope_unreadable(base_only, sources_txt) is False, "clean direct dependencies are not a scope error"
+    binary_named = {"results": [{"packages": [
+        pkg("libcurl4t64", [{"ids": ["DEBIAN-CVE-2026-10"], "max_severity": "9.0"}],
+            [vuln("DEBIAN-CVE-2026-10", {"Debian:13": "8.14.1-2+deb13u2"}, name="curl")])]}]}
+    assert osv_scope_unreadable(binary_named, sources_txt) is True
+    assert osv_scope_unreadable({"results": []}, sources_txt) is False
+    with tempfile.TemporaryDirectory() as tmp:  # the --osv-summary CLI refuses before touching issues
+        t = Path(tmp)
+        (t / "deps").write_text(depends)
+        (t / "src").write_text(sources_txt)
+        (t / "osv.json").write_text(json.dumps(binary_named))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            assert main(["--osv-summary", str(t / "osv.json"), "--direct-depends", str(t / "deps"),
+                         "--direct-sources", str(t / "src")]) == 1
+        assert "binary name" in err.getvalue(), err.getvalue()
+    # A marker from the first summary format (kind "osv", #1135) does not suppress a finding.
+    g = Fake()
+    g.issues.append({"number": 1, "title": "old", "state": "CLOSED",
+                     "body": marker({"kind": "osv", "ids": ["CVE-2026-1", "DEBIAN-CVE-2026-1"]})})
+    assert osv_summary(report, g, g.issues, "o/r") and "CVE-2026-1" in g.issues[-1]["body"]
     # --- SDK and document providers ---
     assert decode_body(gzip.compress(b"page"), "gzip") == b"page" and decode_body(b"page", "") == b"page"
     # A connection that drops mid-body (http.client.IncompleteRead) is a broken source too, and
@@ -786,16 +1160,87 @@ def self_test() -> int:
     closed = [i for i in f.issues if "indi-x" in i["title"]][0]["closing_comment"]
     assert "baseline now matches" in closed and "b" * 13 not in closed, closed
 
+    # --- Debian-provided libraries tracked against their upstream (gphoto: libgphoto2, LibRaw) ---
+    pages["https://api.github.com/repos/gphoto/libgphoto2/releases/latest"] = json.dumps({"tag_name": "v2.5.34"})
+    pages["https://api.github.com/repos/gphoto/gphoto2/releases/latest"] = json.dumps({"tag_name": "v2.5.32"})
+    lib_table = {"sdks": [], "system_libraries": [
+        {"name": "libgphoto2", "repo": "gphoto/libgphoto2", "debian": "libgphoto2", "baseline": "2.5.31"}],
+        "documents": [{"name": "gphoto2-cli", "check": {"provider": "github-release", "repo": "gphoto/gphoto2"},
+                       "baseline": "2.5.32"}]}
+    ts, manual = targets({"manifests": {}}, lib_table)
+    by_key = {t["key"]: t for t in ts}
+    assert manual == [] and set(by_key) == {"libgphoto2", "doc:gphoto2-cli"}, by_key
+    lib = check(by_key["libgphoto2"], get)
+    assert lib["latest"] == "v2.5.34" and differs(lib) and lib["system"], lib
+    cli = check(by_key["doc:gphoto2-cli"], get)
+    assert cli["latest"] == "v2.5.32" and not differs(cli), cli
+    f = Fake()
+    reconcile([lib], f, f.issues)
+    assert f.issues[0]["title"] == "Update libgphoto2 2.5.31 -> v2.5.34" and f.issues[0]["labels"] == UPDATE_LABELS
+    assert "Debian" in f.issues[0]["body"] and "baseline" in f.issues[0]["body"], "says it is Debian-provided"
+
+    # Issue tables have a real header row: an empty "| | |" header renders as a blank row (#1134).
+    for body in (update_body({**lib, "system": False, "where": "w"}), system_body(lib),
+                 document_body({**lib, "document": True, "path": "p"})):
+        assert "| | |" not in body and "| Field | Value |\n|---|---|\n" in body, body
+
+    # --- Changelogs in issues ---
+    pages["https://api.github.com/repos/gphoto/libgphoto2/releases/tags/v2.5.34"] = json.dumps(
+        {"html_url": "https://github.com/gphoto/libgphoto2/releases/tag/v2.5.34",
+         "body": "* Nikon Z8 support @someone\n* fix ```fence``` #12\n" + "x" * 9000})
+    notes = changelog_for(lib, get)
+    assert "https://github.com/gphoto/libgphoto2/releases/tag/v2.5.34" in notes and "Nikon Z8 support" in notes
+    assert notes.count("```") == 2, "upstream text sits in one code block; its own fences are neutralised"
+    assert len(notes) < 5000, "long release notes are cut"
+    f = Fake()
+    reconcile([lib], f, f.issues, notes=lambda r: changelog_for(r, get))
+    assert "Nikon Z8 support" in f.issues[0]["body"] and "## Changelog" in f.issues[0]["body"]
+    # No release notes (tag only): a compare link; a failing lookup: no section, the issue still opens.
+    tag_only = {**lib, "latest": "v9.9.9"}
+    assert "compare/v2.5.31...v9.9.9" in changelog_for(tag_only, get), "the baseline takes upstream's v prefix"
+    f = Fake()
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        reconcile([tag_only], f, f.issues, notes=lambda r: 1 / 0)
+    assert len(f.issues) == 1 and "## Changelog" not in f.issues[0]["body"]
+    assert "no changelog for libgphoto2" in err.getvalue(), "a failed changelog lookup is logged, not silent"
+    # A changed INDI file links the commits between the baseline and upstream.
+    doc = {"key": "doc:indi-x", "name": "indi-x", "current": "a" * 40, "latest": "b" * 40, "document": True,
+           "compare": "equal", "check": ("github-file", "indilib/indi", "drivers/x.cpp"), "source": "s"}
+    assert "https://github.com/indilib/indi/compare/" + "a" * 40 + "..." + "b" * 40 in changelog_for(doc, get)
+    # Changelog links that come from the table, through targets(): a json SDK's changelog_field
+    # (ZWO's software_update_log_url, from the matching entry only) and a static changelog URL.
+    pages["https://zwo.test/cl"] = json.dumps([{"acf": {"software_downloads": [
+        {"software_download_title": "CAA SDK", "software_version": "V1.6.0", "software_update_log_url": "https://zwo.test/caa-log"},
+        {"software_download_title": "EAF SDK", "software_version": "V1.8.1", "software_update_log_url": "https://zwo.test/eaf-log"}]}}])
+    pages["https://q.test/sdk"] = "sdk_linux_arm64_26.07.28.tar.gz"
+    cl_table = {"sdks": [
+        {"name": "zwo-eaf-sdk", "version": "1.7.7",
+         "updates": {"provider": "json", "url": "https://zwo.test/cl", "path": "0.acf.software_downloads",
+                     "match": {"software_download_title": "EAF SDK"}, "field": "software_version",
+                     "changelog_field": "software_update_log_url"}},
+        {"name": "qhy-sdk", "version": "26.06.04",
+         "updates": {"provider": "release-page", "url": "https://q.test/sdk",
+                     "pattern": r"sdk_linux_arm64_(\d+\.\d+\.\d+)\.tar\.gz", "changelog": "https://q.test/log_en.md"}}]}
+    cl = {t["key"]: check(t, get) for t in targets({"manifests": {}}, cl_table)[0]}
+    zwo_notes = changelog_for(cl["zwo-eaf-sdk"], get)
+    assert "https://zwo.test/eaf-log" in zwo_notes and "caa-log" not in zwo_notes, zwo_notes
+    assert "https://q.test/log_en.md" in changelog_for(cl["qhy-sdk"], get)
+    # A source with a static changelog URL in its table entry links it.
+    qhy = {"key": "qhy-sdk", "name": "qhy-sdk", "current": "1", "latest": "2", "compare": "version",
+           "check": ("page", "u", "p"), "changelog": "https://www.qhyccd.com/html/prepub/log_en.md", "source": "u"}
+    assert "log_en.md" in changelog_for(qhy, get)
+
     # A large first scan: the issue body stays under GitHub's 65536-character limit, and the
     # findings it could not list stay unreported for the next run instead of failing every day.
-    big = {"results": [{"packages": [{"package": {"name": f"lib{n}", "version": "1"},
-                                      "groups": [{"ids": [f"CVE-2026-{n:05d}"], "max_severity": "8.0"}]}
+    big = {"results": [{"packages": [pkg(f"lib{n}", [{"ids": [f"DEBIAN-CVE-2026-{n:05d}"], "max_severity": "8.0"}],
+                                         [vuln(f"DEBIAN-CVE-2026-{n:05d}", fixed13, name=f"lib{n}")])
                                      for n in range(5000)]}]}
     f = Fake()
     osv_summary(big, f, f.issues, "o/r")
     assert len(f.issues) == 1 and len(f.issues[0]["body"]) < 65536, len(f.issues[0]["body"])
     listed = read_marker(f.issues[0]["body"])["ids"]
-    assert 0 < len(listed) < 5000 and f"CVE-2026-{0:05d}" in listed, len(listed)
+    assert 0 < len(listed) < 5000 and f"DEBIAN-CVE-2026-{0:05d}" in listed, len(listed)
     osv_summary(big, f, f.issues, "o/r")
     assert len(f.issues) == 2 and not set(listed) & set(read_marker(f.issues[1]["body"])["ids"])
 
@@ -832,19 +1277,50 @@ def self_test() -> int:
     return 0
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--osv-summary", metavar="FILE")
-    a = ap.parse_args()
+    ap.add_argument("--filter-sarif", metavar="SARIF", help="write the code-scanning SARIF scoped to --direct-*")
+    ap.add_argument("--report", metavar="FILE", help="osv-scanner JSON, for --filter-sarif")
+    ap.add_argument("--output", metavar="FILE", help="filtered SARIF, for --filter-sarif")
+    ap.add_argument("--direct-depends", metavar="FILE", help="the .deb's Depends field (dpkg-deb -f DEB Depends)")
+    ap.add_argument("--direct-sources", metavar="FILE", help="'binary source' lines from dpkg-query in the image")
+    a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
+    direct = None
+    if a.direct_depends and a.direct_sources:
+        direct = direct_sources(Path(a.direct_depends).read_text(encoding="utf-8"),
+                                Path(a.direct_sources).read_text(encoding="utf-8"))
+    if a.filter_sarif:
+        if direct is None or not a.report or not a.output:
+            ap.error("--filter-sarif needs --report, --output, --direct-depends and --direct-sources")
+        sarif = json.loads(Path(a.filter_sarif).read_text(encoding="utf-8"))
+        report = json.loads(Path(a.report).read_text(encoding="utf-8"))
+        total, unreadable = sarif_unreadable(sarif)
+        if total and unreadable == total:
+            print(f"error: none of the {total} SARIF results matches the expected message format "
+                  f"({SARIF_PACKAGE_RE.pattern!r}); has osv-scanner changed it? Not uploading an empty result.",
+                  file=sys.stderr)
+            return 1
+        out = filter_sarif(sarif, report, direct)
+        Path(a.output).write_text(json.dumps(out), encoding="utf-8")
+        before = sum(len(r.get("results") or []) for r in sarif.get("runs") or [])
+        after = sum(len(r.get("results") or []) for r in out.get("runs") or [])
+        print(f"code scanning: {after} of {before} findings are in the .deb's direct dependencies "
+              f"({', '.join(sorted(direct))}) and not rated unimportant")
+        return 0
     issues = GhIssues(a.dry_run)
     if a.osv_summary:
         report = json.loads(Path(a.osv_summary).read_text(encoding="utf-8"))
+        if direct is not None and osv_scope_unreadable(report, Path(a.direct_sources).read_text(encoding="utf-8")):
+            print("error: osv-scanner's JSON names packages by binary name, not Debian source package; the "
+                  "direct-dependency scope would match nothing. Not opening a misleading summary.", file=sys.stderr)
+            return 1
         repo = os.environ.get("GH_REPO", "open-astro/AlpacaBridge")
-        log = osv_summary(report, issues, issues.list("all"), repo)
+        log = osv_summary(report, issues, issues.list("all"), repo, direct)
         print("\n".join(log) or "no new High/Critical findings")
         return 0
     snap = snapshot.build_snapshot(ROOT, "0" * 40, "refs/heads/main", "local", "1970-01-01T00:00:00Z")
@@ -858,7 +1334,7 @@ def main() -> int:
         print(f"| {r['name']} | {short(r['current'])} | {short(r['latest'] or '-')} | {status} |")
     for name in manual:
         print(f"| {name} | - | - | manual check (no `updates` source) |")
-    log = reconcile(results, issues, issues.list("all"))
+    log = reconcile(results, issues, issues.list("all"), notes=lambda r: changelog_for(r, http_get))
     print("\n" + ("\n".join(f"- {line}" for line in log) or "- no issue changes"))
     return 1 if any(line.startswith("FAILED") for line in log) else 0
 

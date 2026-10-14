@@ -494,7 +494,14 @@ def check_coverage(root: Path, table: dict) -> list[str]:
     protocol folder, vendor driver or pinned workflow tool cannot arrive without an update check."""
     errors = []
     documents = table.get("documents", [])
-    names = {e["name"] for e in table["sdks"]} | {d["name"] for d in documents}
+    libraries = table.get("system_libraries", [])
+    names = {e["name"] for e in table["sdks"]} | {d["name"] for d in documents} | {lib["name"] for lib in libraries if lib.get("name")}
+    # Debian-provided libraries need an upstream to compare and the baseline Debian ships.
+    for lib in libraries:
+        missing = [k for k in ("name", "repo", "baseline") if not lib.get(k)]
+        if missing:
+            errors.append(f"{TABLE}: system_libraries entry {lib.get('name', '?')!r} has no {', '.join(missing)}: "
+                          "give its GitHub repo (owner/name) and the version Debian trixie ships as baseline")
     # Rule 1: every SDK has an update source.
     for e in table["sdks"]:
         if not (e.get("updates") or {}).get("provider"):
@@ -659,6 +666,13 @@ def self_test() -> int:
         assert len(errs) == 1 and "acme" in errs[0] and "vendors" in errs[0], errs
         assert drift_with(vendors={"acme": {"tracked": ["a-sdk"]}}) == []
         assert drift_with(vendors={"acme": {"no_upstream": "reads a user-configured feed"}}) == []
+        # A Debian-provided library tracked against its upstream is a valid vendors name; an entry
+        # without its upstream repository or baseline is not checkable and fails.
+        lib = {"name": "libacme", "repo": "acme/libacme", "debian": "libacme", "baseline": "1.0"}
+        assert drift_with(system_libraries=[lib], vendors={"acme": {"tracked": ["libacme"]}}) == []
+        errs = drift_with(system_libraries=[{k: v for k, v in lib.items() if k != "repo"}],
+                          vendors={"acme": {"tracked": ["libacme"]}})
+        assert len(errs) == 1 and "libacme" in errs[0] and "repo" in errs[0], errs
         errs = drift_with(vendors={"acme": {"tracked": ["gone-sdk"]}})
         assert len(errs) == 1 and "gone-sdk" in errs[0], errs
         errs = drift_with(vendors={"acme": {"tracked": ["a-sdk"]}, "old": {"tracked": ["a-sdk"]}})
