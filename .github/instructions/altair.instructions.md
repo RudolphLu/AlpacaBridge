@@ -56,11 +56,13 @@ of Altair's download is vendored. The SDK ships no static library.
   two libraries.
 - **USB vendor ids.** The ALTAIR178M3 enumerates as `16d0:0d82`. On the dev
   board (2026-10-05) libaltaircam listed it and libtoupcam 59.30701 did not, so
-  an Altair camera never appears under the ToupTek vendor. The reverse is
-  unconfirmed (TODO: needs a ToupTek camera): `99-altaircam.rules` also grants
-  `0547` / `04b4`, ToupTek's ids, so libaltaircam may list a ToupTek camera
-  too. Configure each camera under exactly one vendor; the web UI says so
-  beside the Altair camera index.
+  an Altair camera never appears under the ToupTek vendor. The reverse holds
+  too: with an ALTAIR662M2 (`16d0:12c7`) and a ToupTek GPCMOS01200KPF
+  (`0547:1334`) on the same host (dev VM, 2026-10-14) each library listed only
+  its own camera; index 1 under either vendor refused the connect with
+  `Camera index out of range`, even though `99-altaircam.rules` also grants
+  `0547` / `04b4`, ToupTek's ids. Configure each camera under exactly one
+  vendor; the web UI says so beside the Altair camera index.
 - **OrangePi 3 LTS (Allwinner H6): use a USB 2 port.** On that board's USB 3
   port the ALTAIR178M3 (`16d0:0d82`) loses full frames with no SDK or kernel
   error: `WaitImageV4` just times out. Measured 2026-10-05 against raw
