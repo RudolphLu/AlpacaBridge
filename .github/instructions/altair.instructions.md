@@ -95,3 +95,7 @@ Validated: ALTAIR178M3 (IMX178, mono, uncooled) on a USB 2 port of the
 OrangePi 3 LTS dev board, ConformU 4.5.1 (build 54507) run on the board,
 2026-10-05: 0 errors, 0 issues, 0 timing issues
 (`AlpacaCore/conformu/Altair/ALTAIR178M3/Linux-arm64.txt`).
+ALTAIR662M2 (IMX662, mono, uncooled) on an arm64 dev VM with a ToupTek
+GPCMOS01200KPF attached, ConformU 4.5.1 (build 54507) over localhost,
+2026-10-14: 0 errors, 0 issues, 0 timing issues
+(`AlpacaCore/conformu/Altair/ALTAIR662M2/Linux-arm64.txt`).

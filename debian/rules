@@ -109,6 +109,9 @@ override_dh_auto_install:
 	install -m 644 \
 	  $(CURDIR)/AlpacaCore/external/ToupTek/toupcamsdk.20260128/linux/udev/99-toupcam.rules \
 	  $(STAGING)/usr/lib/udev/rules.d/
+	# 99-altaircam.rules also grants ToupTek's 0547/04b4 ids, duplicating
+	# 99-toupcam.rules. Keep both: each vendor's rule is installed on its own
+	# and neither is expected to cover the other.
 	install -m 644 \
 	  $(CURDIR)/AlpacaCore/external/Altair/altaircamsdk.20260531/linux/udev/99-altaircam.rules \
 	  $(STAGING)/usr/lib/udev/rules.d/
